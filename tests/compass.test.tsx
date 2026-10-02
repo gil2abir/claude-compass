@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { bodyOf, leadOf, moveIn, wordWrap, boardOf, crumb, gist, peerKey, plain, frontierOf, mergeGrill, parseLoose, parseMap, senderOf } from '../hooks/register'
+import { bodyOf, isDecided, leadOf, moveIn, wordWrap, boardOf, crumb, gist, peerKey, plain, frontierOf, mergeGrill, parseLoose, parseMap, senderOf } from '../hooks/register'
 
 const MAP = {
   goal: 'Build compass mod',
@@ -595,7 +595,7 @@ test('a fork shows the planned path and one branch; taking the branch steers and
   await $.turn.start({ text: 'more', turnId: 't2' } as never)
   await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't2', reason: 'answer' } as never)
   await clock.advance(1500)
-  expect(prompts[prompts.length - 1]).toMatch(/turned down.*ship as a skill/)
+  expect(prompts[prompts.length - 1]).toMatch(/already decided.*ship as a skill/)
   expect(await ui.find({ text: /two ways on/ })).toBeUndefined()
   await ui.unmount()
 })
@@ -625,5 +625,90 @@ test('the fork stays until the user picks, even when the next chart offers no br
     await clock.advance(1500)
     expect(await ui.find({ text: /two ways on/ })).toBeDefined()
   }
+  await ui.unmount()
+})
+
+test('a fork the user decided is not offered again while the work waits, not the same branch nor its reverse', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  mock.env(on, { HOME: '/nonexistent' })
+  const BRANCH = { label: 'wait for prod deploy', why: 'verify on real traffic', steps: ['watch deploy logs', 'rerun benchmark after deploy'] }
+  // after the pick the model keeps reporting the same fork: once as before, once reversed, once reworded
+  const replies = [
+    { ...MAP, alt: BRANCH },
+    { ...MAP, alt: BRANCH },
+    { ...MAP, alt: { label: 'run tests now', why: 'skip waiting', steps: ['run tests', 'publish'] } },
+    { ...MAP, alt: { label: 'wait for the prod deploy first', why: '', steps: ['watch the deploy logs'] } },
+  ]
+  let n = 0
+  on('model.fork', () => ({ value: { isAnswered: true, text: JSON.stringify(replies[Math.min(n++, replies.length - 1)]), usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }) as never)
+  on('session.id', () => ({ value: 'sess' }))
+  on('fs.read', () => { throw new Error('none') })
+  on('session.messages', () => ({ value: [] }) as never)
+  on('session.usage', () => ({ value: { startedAt: 1_000_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }) as never)
+  on('turn.complete', (_$, e) => ({ text: e.answer }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('ui.toast', () => ({ value: undefined }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
+  const turn = async (i: number) => {
+    await $.turn.start({ text: `turn ${i}`, turnId: `t${i}` } as never)
+    await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: `t${i}`, reason: 'answer' } as never)
+    await clock.advance(1500)
+  }
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  await turn(1)
+  expect(await ui.find({ text: /two ways on/ })).toBeDefined()
+  await ui.press({ key: 'pick:branch' })
+  await clock.advance(9000)
+  for (const i of [2, 3, 4]) {
+    await turn(i)
+    expect(await ui.find({ text: /two ways on/ })).toBeUndefined()
+  }
+  await ui.unmount()
+})
+
+test('isDecided matches the same fork, reworded or reversed', async () => {
+  const decided = ['wait for prod deploy', 'watch deploy logs rerun benchmark after deploy', 'run tests publish']
+  expect(isDecided({ label: 'wait for the prod deploy first', why: '', steps: ['watch logs'] }, decided)).toBe(true)
+  expect(isDecided({ label: 'run tests now', why: '', steps: ['run tests', 'publish'] }, decided)).toBe(true)
+  expect(isDecided({ label: 'rewrite in rust', why: '', steps: ['port the parser'] }, decided)).toBe(false)
+})
+
+test('a grill question can be dismissed: it settles, the agent hears it, and it is not asked again', async ($, on) => {
+  mock.clock(on, { now: 1_000_000 })
+  mock.env(on, { HOME: '/nonexistent' })
+  on('session.id', () => ({ value: 'sess' }))
+  on('fs.read', () => { throw new Error('none') })
+  on('session.messages', () => ({ value: [] }) as never)
+  on('session.usage', () => ({ value: { startedAt: 1_000_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('ui.toast', () => ({ value: undefined }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
+  let context: readonly string[] = []
+  on('prompt.submit', (_$, e) => {
+    context = (e as { context?: readonly string[] }).context ?? []
+    return { text: (e as { text: string }).text } as never
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  const post = (id: string, title: string) =>
+    $.tool.call({ tool: 'mcp__compass__grill', topic: 'release', questions: [{ id, title, body: `${title}?`, options: ['yes', 'no'], recommendation: 'yes' }] } as never)
+  await post('r1', 'Wait for prod deploy')
+  await post('r2', 'Bump the major version')
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  await ui.press({ key: 'tab:grill' })
+  expect(await ui.find({ key: 'gdrop:r1' })).toBeDefined()
+  await ui.press({ key: 'gdrop:r1' })
+  expect(await ui.find({ key: 'gopt:r1:0' })).toBeUndefined()
+  expect(await ui.find({ key: 'gopt:r2:0' })).toBeDefined()
+  // re-posted under a new id, it stays dismissed
+  await post('r9', 'Wait for prod deploy')
+  expect(await ui.find({ key: 'gopt:r9:0' })).toBeUndefined()
+  await $.prompt.submit({ text: 'go on' } as never)
+  expect(context.join('\n')).toMatch(/Dismissed grill question Q1 "Wait for prod deploy"/)
   await ui.unmount()
 })

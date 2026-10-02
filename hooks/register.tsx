@@ -430,7 +430,9 @@ export const frontierOf = (items: CompassGrillQ[]) => {
 /** Adds or re-asks questions by id; a re-asked question keeps its number and follow-ups. */
 export const mergeGrill = (items: CompassGrillQ[], drafts: GrillDraft[], topic: string, source: 'agent' | 'map', at: number) => {
   let list = [...items]
+  const dismissed = items.filter(q => q.answer === 'dismissed').map(q => q.title.toLowerCase())
   for (const d of drafts) {
+    if (dismissed.includes(d.title.toLowerCase())) continue
     const same = list.find(q => q.id === d.id) ?? (source === 'map' ? list.find(q => q.title.toLowerCase() === d.title.toLowerCase()) : undefined)
     if (same) {
       if (source === 'map') continue
@@ -493,7 +495,9 @@ const mapPrompt = (
     userTasks.length ? `User-added tasks (by "user"): ${JSON.stringify(userTasks)}` : '',
     steers.length ? `User steering directives, newest last — reflect them in pending steps: ${JSON.stringify(steers)}` : '',
     btw.length ? `User /btw side questions this session (kind aside): ${JSON.stringify(btw)}` : '',
-    prev?.declined?.length ? `Alternatives the user turned down, do not offer again: ${JSON.stringify(prev.declined)}` : '',
+    prev?.declined?.length
+      ? `Forks the user already decided (both the chosen and the other side): never offer these, or their reverse, as alt again, even while the work waits on an event or a decision: ${JSON.stringify(prev.declined)}`
+      : '',
     grill.length ? `Grill list already tracked (do not repeat): ${JSON.stringify(grill.map(q => [q.id, q.title, q.state]))}` : '',
     inbox.length ? `Messages received from other agents/sessions (sender: text): ${JSON.stringify(inbox.slice(-8).map(m => `${m.peer}: ${m.text.slice(0, 160)}`))}` : '',
   ]
@@ -762,7 +766,7 @@ async function refresh($: EngineInterface) {
     const declined = prevMap?.declined ?? []
     const sameMilestone = prevMap && locate(prevMap).milestone?.id === locate(next).milestone?.id
     const kept = !next.alt && sameMilestone && prevMap.alt && !prevMap.altPick ? prevMap.alt : null
-    const alt = (next.alt && !declined.includes(next.alt.label) ? next.alt : null) ?? kept
+    const alt = (next.alt && !isDecided(next.alt, declined) ? next.alt : null) ?? kept
     await update($, mapA, () => ({ ...next, alt, declined, turns: turnsAt }))
     // the chart now includes the request the turn started on
     await update($, incomingA, inc => (inc && (isAfterTurn || inc.at <= startedAt) ? null : inc))
@@ -862,6 +866,21 @@ async function moveAction($: EngineInterface, id: string, dir: -1 | 1) {
   await update($, actionsA, list => moveIn(list, id, dir))
 }
 
+const words = (t: string) => new Set(t.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(w => w.length > 2))
+
+/** Whether two ways read as the same one: most of their words in common. */
+export const isSameWay = (a: string, b: string) => {
+  const x = words(a)
+  const y = words(b)
+  if (!x.size || !y.size) return a.trim().toLowerCase() === b.trim().toLowerCase()
+  const shared = [...x].filter(w => y.has(w)).length
+  return shared / Math.min(x.size, y.size) >= 0.6
+}
+
+/** A new branch that repeats a fork the user already decided (either side of it) is no branch. */
+export const isDecided = (alt: CompassAlt, decided: string[]) =>
+  decided.some(d => isSameWay(alt.label, d) || isSameWay(alt.steps.join(' '), d))
+
 /** At a fork: stay on the planned path (a quiet note) or take the branch (a steer, redrawn at once). */
 async function pickTrajectory($: EngineInterface, way: 'main' | 'branch') {
   const stored = await read($, mapA)
@@ -870,15 +889,18 @@ async function pickTrajectory($: EngineInterface, way: 'main' | 'branch') {
   if (!map || !alt) return
   const { milestone } = locate(map)
   if (way === 'main') {
-    await editMap($, mp => ({ ...mp, altPick: 'main', declined: [...(mp.declined ?? []), alt.label].slice(-8) }))
+    const planned = milestone?.steps.filter(s => s.state === 'pending').map(s => s.label).join(' ') ?? ''
+    await editMap($, mp => ({ ...mp, altPick: 'main', declined: [...(mp.declined ?? []), alt.label, alt.steps.join(' '), ...(planned ? [planned] : [])].slice(-16) }))
     const next = milestone?.steps.filter(s => s.state === 'pending').map(s => s.label) ?? []
     await queueNote($, `Stay on the planned course${next.length ? `: ${next.join(' → ')}` : ''}; not "${alt.label}"`)
     return
   }
-  const before = JSON.stringify({ id: milestone?.id ?? '', steps: milestone?.steps ?? [] })
+  const before = JSON.stringify({ id: milestone?.id ?? '', steps: milestone?.steps ?? [], declined: map.declined ?? [] })
+  const planned = milestone?.steps.filter(s => s.state === 'pending').map(s => s.label).join(' ') ?? ''
   await editMap($, mp => ({
     ...mp,
     altPick: 'branch',
+    declined: [...(mp.declined ?? []), alt.label, alt.steps.join(' '), ...(planned ? [planned] : [])].slice(-16),
     milestones: mp.milestones.map(ms =>
       ms.id !== milestone?.id
         ? ms
@@ -907,8 +929,8 @@ async function removeAction($: EngineInterface, id: string) {
   if (a.ref.startsWith('u')) await update($, userTasksA, list => list.filter(u => u.id !== a.ref))
   if (a.ref === 'alt') {
     try {
-      const was = JSON.parse(a.prev) as { id: string; steps: CompassStep[] }
-      await editMap($, mp => ({ ...mp, altPick: undefined, milestones: mp.milestones.map(ms => (ms.id === was.id ? { ...ms, steps: was.steps } : ms)) }))
+      const was = JSON.parse(a.prev) as { id: string; steps: CompassStep[]; declined?: string[] }
+      await editMap($, mp => ({ ...mp, altPick: undefined, declined: was.declined, milestones: mp.milestones.map(ms => (ms.id === was.id ? { ...ms, steps: was.steps } : ms)) }))
     } catch {
       // nothing to restore
     }
@@ -1060,6 +1082,17 @@ async function sendRound($: EngineInterface) {
   await update($, grillA, list => list.map((q): CompassGrillQ => (ids.has(q.id) ? { ...q, state: q.state === 'followup' ? 'sent' : 'settled' } : q)))
   await update($, grillRoundA, r => r + 1)
   await update($, selectedA, () => null)
+}
+
+/** Drops a question that no longer matters; the agent hears it with the next prompt, and it is not asked again. */
+async function dismissGrill($: EngineInterface, id: string) {
+  const q = (await read($, grillA)).find(x => x.id === id)
+  if (!q || q.state === 'settled') return
+  await update($, grillA, list => list.map((x): CompassGrillQ => (x.id === id ? { ...x, state: 'settled', answer: 'dismissed' } : x)))
+  await queueNote($, `Dismissed grill question Q${q.n} "${q.title}": no longer relevant, drop it`)
+  const { ask, handled } = frontierOf(await read($, grillA))
+  await update($, selectedA, () => (ask[0] ? `g:${ask[0].id}` : null))
+  if (!ask.length && handled.length) await sendRound($)
 }
 
 /** Records an answer (or a follow-up, when it starts with "?"); a fully handled frontier goes out. */
@@ -2100,7 +2133,10 @@ export const register: Register = on => {
                 ? Q{q.n} · {q.title}
               </Text>
             </Box>
-            <Text dimColor>{q.mode}</Text>
+            <Box columnGap={1} flexShrink={0}>
+              <Text dimColor>{q.mode}</Text>
+              <Button key={`gdrop:${q.id}`} plain dimColor label="✕" onPress={() => void dismissGrill($, q.id)} />
+            </Box>
           </Box>
           {q.topic || q.from ? (
             <Text wrap="wrap">
@@ -2156,13 +2192,15 @@ export const register: Register = on => {
       const collapsed = (q: CompassGrillQ, mark: string, color: string | undefined, tail: string) => (
         <Box key={`gq:${q.id}`} flexDirection="column">
           {(() => {
-            const w = wrapped(`gsel:${q.id}`, `Q${q.n} ${q.title}${tail}`, width - 2, () => update($, selectedA, () => `g:${q.id}`), { dim: q.state !== 'open' })
+            const w = wrapped(`gsel:${q.id}`, `Q${q.n} ${q.title}${tail}`, width - 5, () => update($, selectedA, () => `g:${q.id}`), { dim: q.state !== 'open' })
             return [
               <Box key={`gqrow:${q.id}`}>
                 <Text color={color} bold>
                   {mark}{' '}
                 </Text>
                 {w.head}
+                <Box flexGrow={1} />
+                {q.state !== 'settled' && <Button key={`gdrop:${q.id}`} plain dimColor label=" ✕" onPress={() => void dismissGrill($, q.id)} />}
               </Box>,
               w.tail,
             ]
