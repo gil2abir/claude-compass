@@ -34,6 +34,8 @@ const PAST_KEEP = 2
 const FUTURE_KEEP = 3
 const GRILL_TOOL = 'mcp__compass__grill'
 const GOLD = '#E8B53A'
+/** How long a new item waits in the outbox, while idle, so it can still be reordered or removed. */
+const SEND_GRACE_MS = 5000
 
 const EMPTY_STATS: CompassStats = {
   startedAt: 0,
@@ -797,7 +799,7 @@ async function reject($: EngineInterface, a: CompassAction, err: unknown) {
 async function enqueue($: EngineInterface, kind: CompassAction['kind'], label: string, text: string, ref = '', prev = '') {
   const t = text.trim()
   if (!t) return
-  const a: CompassAction = { id: `a${Date.now()}${Math.floor(Math.random() * 1e4)}`, kind, label: clip(label.trim() || t, 80), text: t, status: 'queued', route: '', reason: '', at: Date.now(), ref, prev }
+  const a: CompassAction = { id: `a${Date.now()}${Math.floor(Math.random() * 1e4)}`, kind, label: clip(label.trim() || t, 80), text: t, status: 'queued', route: '', reason: '', at: await $.clock.now(), ref, prev }
   await update($, actionsA, list => [...list, a].slice(-40))
   const isBusy = await read($, busyA)
   if (kind === 'steer' && isBusy) return appendNow($, a)
@@ -807,7 +809,7 @@ async function enqueue($: EngineInterface, kind: CompassAction['kind'], label: s
     return
   }
   await setAction($, a.id, { route: 'new turn' })
-  $.ui.toast(isBusy ? `⋯ queued · goes out when this turn ends · ${clip(a.label, 40)}` : `↗ sending as a new turn · ${clip(a.label, 44)}`)
+  $.ui.toast(isBusy ? `⋯ queued · goes out when this turn ends · ${clip(a.label, 40)}` : `⋯ sending in ${SEND_GRACE_MS / 1000}s as a new turn · ${clip(a.label, 40)} · ✕ in the pane cancels`)
 }
 
 /** ⚡ send now: into the running turn, or as a turn of its own when idle. */
@@ -824,10 +826,45 @@ async function forceAction($: EngineInterface, id: string) {
   }
 }
 
+/** The outbox's two queues: a new turn of its own, or context riding the user's next prompt. */
+export const queueOf = (a: CompassAction) => (a.route === 'next prompt' ? 'prompt' : 'turn')
+
+/** Swaps a queued item with its neighbour in the same queue: the order they are sent in. */
+export const moveIn = (list: CompassAction[], id: string, dir: -1 | 1) => {
+  const i = list.findIndex(a => a.id === id)
+  const a = list[i]
+  if (!a || a.status !== 'queued') return list
+  let j = i + dir
+  while (j >= 0 && j < list.length && !(list[j]!.status === 'queued' && queueOf(list[j]!) === queueOf(a))) j += dir
+  if (j < 0 || j >= list.length) return list
+  const next = [...list]
+  next[i] = list[j]!
+  next[j] = a
+  return next
+}
+
+async function moveAction($: EngineInterface, id: string, dir: -1 | 1) {
+  await update($, actionsA, list => moveIn(list, id, dir))
+}
+
+/** Drops a queued item before it is sent, undoing what the pane did for it. */
+async function removeAction($: EngineInterface, id: string) {
+  const a = (await read($, actionsA)).find(x => x.id === id)
+  if (!a || a.status !== 'queued') return
+  await update($, actionsA, list => list.filter(x => x.id !== id))
+  if (a.ref && (LANES as readonly string[]).includes(a.prev)) {
+    await editMap($, mp => ({ ...mp, tasks: mp.tasks.map(x => (x.id === a.ref ? { ...x, lane: a.prev as CompassLane } : x)) }))
+  }
+  if (a.ref.startsWith('u')) await update($, userTasksA, list => list.filter(u => u.id !== a.ref))
+  if (a.kind === 'steer') await update($, steersA, list => list.filter(x => x.text !== a.label))
+  $.ui.toast(`✕ removed · ${clip(a.label, 50)}`)
+}
+
 /** The poller's job: queued steers and turns go out together once the session is idle. */
 async function flushOutbox($: EngineInterface) {
   if (await read($, busyA)) return
-  const due = (await read($, actionsA)).filter(a => a.status === 'queued' && a.kind !== 'note')
+  const t = await $.clock.now()
+  const due = (await read($, actionsA)).filter(a => a.status === 'queued' && a.kind !== 'note' && t - a.at >= SEND_GRACE_MS)
   if (!due.length) return
   const ids = new Set(due.map(a => a.id))
   await update($, actionsA, list => list.map((a): CompassAction => (ids.has(a.id) ? { ...a, status: 'sent', route: 'new turn', at: Date.now() } : a)))
@@ -945,8 +982,9 @@ async function chatSend($: EngineInterface, peer: string, text: string) {
 async function addUserTask($: EngineInterface, text: string) {
   const t = text.trim()
   if (!t) return
-  await update($, userTasksA, list => [...list, { id: `u${Date.now()}`, text: clip(t, 70), at: Date.now() }])
-  await queueNote($, `New task added by the user — prioritize it next: ${t}`)
+  const id = `u${Date.now()}`
+  await update($, userTasksA, list => [...list, { id, text: clip(t, 70), at: Date.now() }])
+  await queueNote($, `New task added by the user — prioritize it next: ${t}`, id)
 }
 
 /** Packs the handled questions into one round; the poller sends it when the agent is idle. */
@@ -2215,32 +2253,90 @@ export const register: Register = on => {
       )
     }
 
-    // activity strip: what the pane sent the agent, and where each one stands
-    const live = actions.filter(a => a.status === 'queued')
-    const recent = [...live, ...actions.filter(a => a.status !== 'queued' && now - a.at < 120_000).reverse()]
-    const shown = isOpen('activity') ? recent.slice(0, 12) : recent.slice(0, 3)
-    const hue = { queued: 'yellow', sent: 'green', rejected: 'red' } as const
-    const activity = recent.length > 0 && (
-      <Box flexDirection="column" key="activity" marginTop={1}>
-        <Text dimColor>{'┄'.repeat(width)}</Text>
-        {shown.map(a => (
-          <Box key={`act:${a.id}`}>
-            <Text color={hue[a.status]} bold>
-              {ROUTE_GLYPH[a.status]}{' '}
+    // the outbox: everything the pane will put into the session, grouped by when it goes,
+    // each reorderable, sendable now or removable; then what already went, folded
+    const queuedTurn = actions.filter(a => a.status === 'queued' && queueOf(a) === 'turn')
+    const queuedPrompt = actions.filter(a => a.status === 'queued' && queueOf(a) === 'prompt')
+    const done = actions.filter(a => a.status !== 'queued' && now - a.at < 600_000).reverse()
+    const KIND = { steer: '↪', turn: '✉', note: '☐' } as const
+    const outRow = (a: CompassAction, i: number, n: number) => {
+      const key = `ob:${a.id}`
+      const isPreview = isOpen(key)
+      const label = wrapped(`obl:${a.id}`, `${KIND[a.kind]} ${a.label}`, width - 15, () => toggleIn($, key), { indent: 3 })
+      return (
+        <Box key={key} flexDirection="column">
+          <Box>
+            <Text color="yellow" bold>
+              {`${i + 1}`.padStart(2)}{' '}
             </Text>
-            <Box flexGrow={1}>
-              <Text wrap="wrap" dimColor={a.status === 'sent'}>
-                {a.label}
+            <Box flexGrow={1}>{label.head}</Box>
+            <Box columnGap={1} flexShrink={0}>
+              <Button key={`up:${a.id}`} plain dimColor label="▲" onPress={() => void moveAction($, a.id, -1)} />
+              <Button key={`down:${a.id}`} plain dimColor label="▼" onPress={() => void moveAction($, a.id, 1)} />
+              <Button key={`force:${a.id}`} plain label="⚡" onPress={() => void forceAction($, a.id)} />
+              <Button key={`drop:${a.id}`} plain label="✕" onPress={() => void removeAction($, a.id)} />
+            </Box>
+          </Box>
+          {label.tail}
+          {isPreview && (
+            <Box paddingLeft={3} flexDirection="column">
+              <Text dimColor>sends exactly:</Text>
+              <Text wrap="wrap">{a.text}</Text>
+            </Box>
+          )}
+        </Box>
+      )
+    }
+    const hue = { queued: 'yellow', sent: 'green', rejected: 'red' } as const
+    const activity = (queuedTurn.length > 0 || queuedPrompt.length > 0 || done.length > 0) && (
+      <Box flexDirection="column" key="activity" marginTop={1}>
+        <Text dimColor>
+          {'┄ outbox '}
+          {'┄'.repeat(Math.max(0, width - 9))}
+        </Text>
+        {queuedTurn.length > 0 && (
+          <Box flexDirection="column">
+            <Text bold wrap="wrap">
+              <Text color="yellow">⏭ </Text>
+              {isBusy ? 'when this turn ends' : `in a few seconds`}
+              <Text dimColor> · one new turn, in this order</Text>
+            </Text>
+            {queuedTurn.map((a, i) => outRow(a, i, queuedTurn.length))}
+          </Box>
+        )}
+        {queuedPrompt.length > 0 && (
+          <Box flexDirection="column" marginTop={queuedTurn.length ? 1 : 0}>
+            <Text bold wrap="wrap">
+              <Text color="yellow">✎ </Text>
+              with your next prompt
+              <Text dimColor> · added as context</Text>
+            </Text>
+            {queuedPrompt.map((a, i) => outRow(a, i, queuedPrompt.length))}
+          </Box>
+        )}
+        {(queuedTurn.length > 0 || queuedPrompt.length > 0) && <Text dimColor>↪ steer · ✉ message · ☐ task — click to preview · ▲▼ order · ⚡ now · ✕ remove</Text>}
+        {done.length > 0 &&
+          fold(
+            'activity',
+            `✓ ${done.filter(a => a.status === 'sent').length} sent${done.some(a => a.status === 'rejected') ? ` · ✗ ${done.filter(a => a.status === 'rejected').length} failed` : ''} · last 10m`,
+          )}
+        {isOpen('activity') &&
+          done.map(a => (
+            <Box key={`act:${a.id}`}>
+              <Text color={hue[a.status]} bold>
+                {ROUTE_GLYPH[a.status]}{' '}
+              </Text>
+              <Box flexGrow={1} flexShrink={1}>
+                <Text wrap="wrap" dimColor={a.status === 'sent'}>
+                  {a.label}
+                </Text>
+              </Box>
+              <Text dimColor wrap="wrap">
+                {' '}
+                {a.status === 'sent' ? `${a.route} · ${ago(now - a.at)}` : a.reason}
               </Text>
             </Box>
-            <Text dimColor>
-              {' '}
-              {a.status === 'queued' ? (a.route === 'next prompt' ? 'next prompt' : isBusy ? 'after turn' : 'sending') : a.status === 'sent' ? `${a.route} ${ago(now - a.at)}` : clip(a.reason, 14)}
-            </Text>
-            {a.status === 'queued' && <Button key={`force:${a.id}`} plain label=" ⚡" onPress={() => void forceAction($, a.id)} />}
-          </Box>
-        ))}
-        {recent.length > 3 && fold('activity', isOpen('activity') ? 'fewer' : `${recent.length - 3} more`)}
+          ))}
       </Box>
     )
 
