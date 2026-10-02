@@ -37,6 +37,7 @@ const GRILL_TOOL = 'mcp__compass__grill'
 const GOLD = '#E8B53A'
 /** How long every new item waits in the outbox, so it can still be reordered or removed. */
 const SEND_GRACE_MS = 8000
+let lastDiag = ''
 
 const EMPTY_STATS: CompassStats = {
   startedAt: 0,
@@ -760,7 +761,9 @@ async function refresh($: EngineInterface) {
     const { grill: inferred, ...next } = map
     const prevMap = isCurrent(stored) ? stored : null
     const declined = prevMap?.declined ?? []
-    const alt = next.alt && !declined.includes(next.alt.label) ? next.alt : null
+    const sameMilestone = prevMap && locate(prevMap).milestone?.id === locate(next).milestone?.id
+    const kept = !next.alt && sameMilestone && prevMap.alt && !prevMap.altPick ? prevMap.alt : null
+    const alt = (next.alt && !declined.includes(next.alt.label) ? next.alt : null) ?? kept
     await update($, mapA, () => ({ ...next, alt, declined, turns: turnsAt }))
     // the chart now includes the request the turn started on
     await update($, incomingA, inc => (inc && (isAfterTurn || inc.at <= startedAt) ? null : inc))
@@ -2461,6 +2464,13 @@ export const register: Register = on => {
     const footH = footRows.length
     const scroll = e.props.scroll
     const footTop = Math.max(0, scroll.offset + scroll.bodyRows - footH)
+    const diag = JSON.stringify({ scroll, viewport: e.viewport ?? null, placement: e.props.placement, bodyColumns: e.props.bodyColumns, footH, footTop, surface: e.surface })
+    if (diag !== lastDiag) {
+      lastDiag = diag
+      void sessionDir($)
+        .then(dir => $.fs.write(`${dir}/compass/pane-diag.json`, JSON.stringify({ at: Date.now(), ...(JSON.parse(diag) as object) })))
+        .catch(() => undefined)
+    }
     const activity = (
       <Box key="activity" position="absolute" top={footTop} left={0} width={width} flexDirection="column" overflow="hidden">
         {footRows}
