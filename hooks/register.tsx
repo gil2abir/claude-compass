@@ -3,6 +3,7 @@ import type { EngineInterface, ModelForkResult, Register } from 'claude-code'
 
 import type {
   CompassAction,
+  CompassAlt,
   CompassChatMsg,
   CompassPeer,
   CompassAgentTodo,
@@ -307,7 +308,10 @@ export const parseMap = (text: string, at: number): (CompassMap & { grill: Grill
       by: t.by === 'user' ? 'user' : 'agent',
       from: str(t.from, 30),
     }))
-  return { goal: str(o.goal, 60), milestones, tasks, recap: strs(o.recap, 7, 140), at, grill: grillDrafts(o.grill, 'work') }
+  const a = o.alt && typeof o.alt === 'object' ? (o.alt as Record<string, unknown>) : null
+  const altSteps = a ? strs(a.steps, 4, 40) : []
+  const alt: CompassAlt | null = a && str(a.label, 40) && altSteps.length ? { label: str(a.label, 40), why: str(a.why, 80), steps: altSteps } : null
+  return { goal: str(o.goal, 60), milestones, tasks, recap: strs(o.recap, 7, 140), at, alt, grill: grillDrafts(o.grill, 'work') }
 }
 
 /** The active milestone and its active (or blocked) step: the "you are here". */
@@ -366,6 +370,7 @@ export const gist = (map: CompassMap | null, asks: number, queued: number, budge
   const needs = (isShort: boolean): GistPart[] => [
     ...(isBlocked ? [{ text: isShort ? '!' : '! needs you', tone: 'need' as const }] : []),
     ...(asks ? [{ text: isShort ? `?${asks}` : `? ${asks} to answer`, tone: 'ask' as const }] : []),
+    ...(map?.alt && !map.altPick ? [{ text: isShort ? '⑂' : '⑂ 2 ways', tone: 'ask' as const }] : []),
     ...(queued && !isShort ? [{ text: `${queued} queued`, tone: 'queue' as const }] : []),
   ]
   // every label is shown whole or not at all: a cut label reads as noise, a dropped one is still on the map
@@ -471,7 +476,7 @@ const mapPrompt = (
   [
     'You are COMPASS, a silent observer of this session. Do NOT continue the task, call tools, or address the user.',
     'Reply with ONLY one minified JSON object (no prose, no fence). Be terse: the whole reply must stay under 2500 characters.',
-    '{"goal":s,"milestones":[{"id":s,"label":s,"state":"done|active|pending|abandoned","why":s,"steps":[{"id":s,"label":s,"kind":"step|attempt|decision|aside","state":"done|active|pending|abandoned|blocked","why":s}]}],"tasks":[{"id":s,"text":s,"lane":"now|next|later|done","by":"agent|user","from":s}],"recap":[s],"grill":[{"id":s,"title":s,"body":s,"options":[s],"recommendation":s,"dependsOn":[s],"from":s}]}',
+    '{"goal":s,"milestones":[{"id":s,"label":s,"state":"done|active|pending|abandoned","why":s,"steps":[{"id":s,"label":s,"kind":"step|attempt|decision|aside","state":"done|active|pending|abandoned|blocked","why":s}]}],"tasks":[{"id":s,"text":s,"lane":"now|next|later|done","by":"agent|user","from":s}],"recap":[s],"alt":{"label":s,"why":s,"steps":[s]}|null,"grill":[{"id":s,"title":s,"body":s,"options":[s],"recommendation":s,"dependsOn":[s],"from":s}]}',
     'Model = version tree + phase chunking:',
     '- goal: the session goal, ≤6 words.',
     '- milestones: 3-7 phases in order — done ones, exactly ONE active, then planned pending ones. abandoned = a dropped phase (why = reason ≤6 words).',
@@ -480,6 +485,7 @@ const mapPrompt = (
     '- every label ≤5 words, verb first, no punctuation. why ≤8 words or "".',
     '- tasks: the running task list. KEEP every previous task id; move finished work to done; add newly revealed work; lane now ≤3, next ≤5, later = deferred ideas/backlog/follow-ups. User-added tasks keep by "user" and go to now unless finished.',
     '- recap: 3-6 bullets, ≤18 words each, what happened and where things stand.',
+    '- alt: when the last turns show the work could go another way (a different goal, requirement or approach the user hinted at or the agent raised), the single most plausible OTHER trajectory from now: label ≤5 words, why ≤10 words (what it trades off), steps 2-4 labels ≤5 words, verb first. The main trajectory is the active milestone\'s pending steps. Otherwise null.',
     '- from: when a task or grill question originated in another agent\'s or session\'s message, that sender\'s name; else "".',
     '- grill: ONLY decisions the session is waiting on from the user that are NOT already in the grill list below (usually []). Frontier only: nothing that depends on an unanswered question. ≤3, each with a recommendation.',
     prev ? `Previous map — keep ids stable: ${JSON.stringify({ m: prev.milestones.map(m => [m.id, m.label, m.state]), t: prev.tasks.map(t => [t.id, t.text, t.lane, t.by]) })}` : '',
@@ -487,6 +493,7 @@ const mapPrompt = (
     userTasks.length ? `User-added tasks (by "user"): ${JSON.stringify(userTasks)}` : '',
     steers.length ? `User steering directives, newest last — reflect them in pending steps: ${JSON.stringify(steers)}` : '',
     btw.length ? `User /btw side questions this session (kind aside): ${JSON.stringify(btw)}` : '',
+    prev?.declined?.length ? `Alternatives the user turned down, do not offer again: ${JSON.stringify(prev.declined)}` : '',
     grill.length ? `Grill list already tracked (do not repeat): ${JSON.stringify(grill.map(q => [q.id, q.title, q.state]))}` : '',
     inbox.length ? `Messages received from other agents/sessions (sender: text): ${JSON.stringify(inbox.slice(-8).map(m => `${m.peer}: ${m.text.slice(0, 160)}`))}` : '',
   ]
@@ -751,7 +758,10 @@ async function refresh($: EngineInterface) {
       return
     }
     const { grill: inferred, ...next } = map
-    await update($, mapA, () => ({ ...next, turns: turnsAt }))
+    const prevMap = isCurrent(stored) ? stored : null
+    const declined = prevMap?.declined ?? []
+    const alt = next.alt && !declined.includes(next.alt.label) ? next.alt : null
+    await update($, mapA, () => ({ ...next, alt, declined, turns: turnsAt }))
     // the chart now includes the request the turn started on
     await update($, incomingA, inc => (inc && (isAfterTurn || inc.at <= startedAt) ? null : inc))
     if (inferred.length) {
@@ -850,6 +860,40 @@ async function moveAction($: EngineInterface, id: string, dir: -1 | 1) {
   await update($, actionsA, list => moveIn(list, id, dir))
 }
 
+/** At a fork: stay on the planned path (a quiet note) or take the branch (a steer, redrawn at once). */
+async function pickTrajectory($: EngineInterface, way: 'main' | 'branch') {
+  const stored = await read($, mapA)
+  const map = isCurrent(stored) ? stored : null
+  const alt = map?.alt
+  if (!map || !alt) return
+  const { milestone } = locate(map)
+  if (way === 'main') {
+    await editMap($, mp => ({ ...mp, altPick: 'main', declined: [...(mp.declined ?? []), alt.label].slice(-8) }))
+    const next = milestone?.steps.filter(s => s.state === 'pending').map(s => s.label) ?? []
+    await queueNote($, `Stay on the planned course${next.length ? `: ${next.join(' → ')}` : ''}; not "${alt.label}"`)
+    return
+  }
+  const before = JSON.stringify({ id: milestone?.id ?? '', steps: milestone?.steps ?? [] })
+  await editMap($, mp => ({
+    ...mp,
+    altPick: 'branch',
+    milestones: mp.milestones.map(ms =>
+      ms.id !== milestone?.id
+        ? ms
+        : {
+            ...ms,
+            steps: [
+              ...ms.steps.map((s): CompassStep => (s.state === 'pending' ? { ...s, state: 'abandoned', why: 'not chosen' } : s)),
+              ...alt.steps.map((label, i): CompassStep => ({ id: `alt${Date.now()}${i}`, label, kind: 'step', state: 'pending', why: '' })),
+            ],
+          },
+    ),
+  }))
+  const t = `Change direction: ${alt.label}${alt.why ? ` (${alt.why})` : ''}. Next: ${alt.steps.join(' → ')}`
+  await update($, steersA, list => [...list, { text: t, at: Date.now() }].slice(-20))
+  await enqueue($, 'steer', t, `🧭 [compass — steering from the user] ${t}\nRe-plan from here accordingly.`, 'alt', before)
+}
+
 /** Drops a queued item before it is sent, undoing what the pane did for it. */
 async function removeAction($: EngineInterface, id: string) {
   const a = (await read($, actionsA)).find(x => x.id === id)
@@ -859,7 +903,15 @@ async function removeAction($: EngineInterface, id: string) {
     await editMap($, mp => ({ ...mp, tasks: mp.tasks.map(x => (x.id === a.ref ? { ...x, lane: a.prev as CompassLane } : x)) }))
   }
   if (a.ref.startsWith('u')) await update($, userTasksA, list => list.filter(u => u.id !== a.ref))
-  if (a.kind === 'steer') await update($, steersA, list => list.filter(x => x.text !== a.label))
+  if (a.ref === 'alt') {
+    try {
+      const was = JSON.parse(a.prev) as { id: string; steps: CompassStep[] }
+      await editMap($, mp => ({ ...mp, altPick: undefined, milestones: mp.milestones.map(ms => (ms.id === was.id ? { ...ms, steps: was.steps } : ms)) }))
+    } catch {
+      // nothing to restore
+    }
+  }
+  if (a.kind === 'steer') await update($, steersA, list => list.filter(x => clip(x.text, 80) !== a.label))
   $.ui.toast(`✕ removed · ${clip(a.label, 50)}`)
 }
 
@@ -1337,7 +1389,7 @@ export const register: Register = on => {
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
     const held = new Set((await read($, actionsA)).filter(a => a.status === 'queued' && a.kind === 'steer').map(a => a.label))
-    const steers = (await read($, steersA)).filter(x => !held.has(x.text))
+    const steers = (await read($, steersA)).filter(x => !held.has(clip(x.text, 80)))
     const steering = steers.length
       ? `\n\n# Compass steering\nThe user steered this session via the compass pane. Honor these directives (newest wins):\n${steers.slice(-6).map(s => `- ${s.text}`).join('\n')}`
       : ''
@@ -1644,6 +1696,48 @@ export const register: Register = on => {
         }
         keep.forEach(s => rows.push(stepRow(s, false)))
         if (hereIdx >= 0) rows.push(stepRow(steps[hereIdx]!, false))
+        const alt = isActive && map?.alt && !map.altPick ? map.alt : null
+        if (alt) {
+          // the fork: the planned path on the left, the branch to the right; pick one to steer
+          const colW = Math.floor((width - 2) / 2)
+          const col = (key: string, title: string, color: string, why: string, items: string[], mark: string, pick: () => unknown, label: string) => (
+            <Box key={key} flexDirection="column" width={colW}>
+              {wordWrap(title, colW - 1).map((l, i) => (
+                <Text key={`${key}:t${i}`} color={color} bold>
+                  {l}
+                </Text>
+              ))}
+              {why
+                ? wordWrap(why, colW - 1).map((l, i) => (
+                    <Text key={`${key}:w${i}`} dimColor>
+                      {l}
+                    </Text>
+                  ))
+                : null}
+              {items.flatMap((it, i) =>
+                wordWrap(`${mark} ${it}`, colW - 1).map((l, j) => (
+                  <Text key={`${key}:s${i}:${j}`} dimColor={color !== 'cyan'}>
+                    {j ? `  ${l}` : l}
+                  </Text>
+                )),
+              )}
+              <Button key={`pick:${key}`} plain label={label} onPress={() => void pick()} />
+            </Box>
+          )
+          rows.push(
+            <Box key={`fork:${m.id}`} flexDirection="column">
+              <Text dimColor>
+                ├─┬{'─'.repeat(Math.max(0, colW - 3))}╮ <Text color="yellow">two ways on</Text>
+              </Text>
+              <Box>
+                <Text dimColor>│ </Text>
+                {col('main', '○ as planned', 'white', '', future.slice(0, FUTURE_KEEP + 1).map(s => s.label), '○', () => pickTrajectory($, 'main'), '▶ keep this')}
+                {col('branch', `◇ ${alt.label}`, 'cyan', alt.why, alt.steps, '◇', () => pickTrajectory($, 'branch'), '⤴ take this')}
+              </Box>
+            </Box>,
+          )
+          continue
+        }
         const shown = isOpen(`fut:${m.id}`) ? future : future.slice(0, FUTURE_KEEP)
         shown.forEach(s => rows.push(stepRow(s, true)))
         if (shown.length < future.length) {

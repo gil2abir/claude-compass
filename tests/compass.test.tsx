@@ -548,3 +548,54 @@ test('the outbox is pinned to the bottom of the pane window as it scrolls', asyn
     await ui.unmount()
   }
 })
+
+test('a fork shows the planned path and one branch; taking the branch steers and redraws, ✕ undoes it, keeping it is not offered again', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  mock.env(on, { HOME: '/nonexistent' })
+  const ALT = { ...MAP, alt: { label: 'ship as a skill', why: 'simpler install, no pane', steps: ['write SKILL md', 'drop the plugin'] } }
+  const prompts: string[] = []
+  on('model.fork', (_$, e) => {
+    prompts.push((e as { prompt: string }).prompt)
+    return { value: { isAnswered: true, text: JSON.stringify(ALT), usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } } as never
+  })
+  on('session.id', () => ({ value: 'sess' }))
+  on('fs.read', () => { throw new Error('none') })
+  on('session.messages', () => ({ value: [] }) as never)
+  on('session.usage', () => ({ value: { startedAt: 1_000_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }) as never)
+  on('turn.complete', (_$, e) => ({ text: e.answer }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('ui.toast', () => ({ value: undefined }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  await $.turn.start({ text: 'go', turnId: 't1' } as never)
+  await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+  await clock.advance(1500)
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  expect(await ui.find({ text: /two ways on/ })).toBeDefined()
+  expect(await ui.find({ text: /◇ ship as a skill/ })).toBeDefined()
+  expect(await ui.find({ key: 'pick:main' })).toBeDefined()
+
+  // take the branch: the planned step is dropped, the branch's steps are the new future, a steer waits
+  await ui.press({ key: 'pick:branch' })
+  expect(await ui.find({ text: /two ways on/ })).toBeUndefined()
+  expect(await ui.find({ text: /write SKILL md/ })).toBeDefined()
+  expect(await ui.find({ text: /run tests · not chosen/ })).toBeDefined()
+  expect(await ui.find({ text: /⇣ 1 queued/ })).toBeDefined()
+  // ✕ before it is sent puts the fork back
+  const id = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').find(k => k.startsWith('drop:'))!.slice(5)
+  await ui.press({ key: `drop:${id}` })
+  expect(await ui.find({ text: /two ways on/ })).toBeDefined()
+
+  // keep the plan: a note for the next prompt, and the next chart does not offer it again
+  await ui.press({ key: 'pick:main' })
+  expect(await ui.find({ text: /two ways on/ })).toBeUndefined()
+  await $.turn.start({ text: 'more', turnId: 't2' } as never)
+  await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't2', reason: 'answer' } as never)
+  await clock.advance(1500)
+  expect(prompts[prompts.length - 1]).toMatch(/turned down.*ship as a skill/)
+  expect(await ui.find({ text: /two ways on/ })).toBeUndefined()
+  await ui.unmount()
+})
