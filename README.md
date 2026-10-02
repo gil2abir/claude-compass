@@ -16,18 +16,23 @@ If it doesn't show up, restart Claude Code. From a local clone instead: `claude 
 
 ## Use
 
-Click the `🧭 goal › milestone › [step] → next` line under the prompt to open or close the pane, or type `/compass`.
+Click the gold `◈ compass` under the prompt to open or close the pane, or type `/compass`. Next to it, the status row shows `✓ last step › ● now › ○ next` and anything waiting on you (`? 2 to answer`, `! needs you`). Labels are shown whole or dropped when space is short, never cut mid-word.
+
+At the top of every tab:
+
+- **Sync line:** whether the chart has caught up with the session: `✓ in sync`, `⟳ charting your new message`, `◌ not charted yet: your message …`, `◌ N turns behind`, with `↻ update`.
+- **Outbox:** everything the pane will put into the session, grouped by when it goes: `⏭ when this turn ends` (one new turn) or `✎ with your next prompt` (added as context). Click an item to preview the exact text, `▲▼` to reorder, `⚡` to send now, `✕` to remove (a task move is rolled back). New items wait 5 s while idle so you can still change them. Sent and failed items fold into one line.
 
 | Tab | What it shows |
 | --- | --- |
 | `├ flow` | The session as a git-style flow chart: finished milestones folded, a fisheye around **now**, dead ends and side branches, decisions. Click a step for **go / skip / later / retry**. `key` explains every mark. |
 | `☑ tasks` | A Jira-style board: DOING (limit 3), TO DO, DONE, BACKLOG. Drag cards between lanes, or click one for move buttons. Add your own tasks; the agent takes them next turn. |
 | `? grill` | The agent's questions for you, asked in rounds using the grilling method: each with a recommendation, answer by option or free text, `?` for a follow-up. A round goes back to the agent as one turn. |
-| `⇄ chat` | Other Claude sessions and agents (via `ListAgents`), the Remote Control indicator, and message threads with each. |
+| `⇄ chat` | Other Claude sessions and agents (via `ListAgents`) and the Remote Control indicator. Each agent shows `● N new`, `◂in ▸out` counts and its last message; click one for a summary and its history, one line per message (`◂ in` / `▸ out`, age, first sentence), click a line to read it all. Messages the session's Claude sends with SendMessage are recorded too. |
 | `∑ stats` | Session time, turns, tools, errors, files, cost, context, progress, and compass's own token use. |
 | `≡ recap` | A short recap you can copy, plus your `/btw` side questions. |
 
-Everything you do in the pane shows its status: `⋯ queued`, `↗ sent`, or `✗ rejected` (with rollback), and `⚡` sends a queued item now.
+Long text wraps instead of being cut off.
 
 Commands: `/compass`, `/compass refresh`, `/compass steer <text>`, `/compass task <text>`.
 
@@ -39,7 +44,16 @@ Commands: `/compass`, `/compass refresh`, `/compass steer <text>`, `/compass tas
 
 ## Trust
 
-A mod runs on your machine with the same access Claude Code has. Read the source (`hooks/register.tsx`, `hooks/board.tsx`) before installing.
+A mod runs on your machine with the same access Claude Code has. Read the source (`hooks/register.tsx`, `hooks/board.tsx`, `hooks/brand.tsx`) before installing.
+
+## Update
+
+```
+claude plugin marketplace update claude-compass
+claude plugin update compass@claude-compass
+```
+
+From a clone: `git pull`. Then restart each session (`/exit`, `claude --continue`).
 
 ## Develop
 
