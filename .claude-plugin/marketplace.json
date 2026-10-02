@@ -1,0 +1,13 @@
+{
+  "name": "claude-compass",
+  "description": "compass: a live session map mod for Claude Code",
+  "owner": {
+    "name": "gil2abir"
+  },
+  "plugins": [
+    {
+      "name": "compass",
+      "source": "./"
+    }
+  ]
+}
