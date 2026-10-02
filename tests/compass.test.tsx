@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { boardOf, crumb, gist, plain, frontierOf, mergeGrill, parseLoose, parseMap } from '../hooks/register'
+import { bodyOf, boardOf, crumb, gist, peerKey, plain, frontierOf, mergeGrill, parseLoose, parseMap, senderOf } from '../hooks/register'
 
 const MAP = {
   goal: 'Build compass mod',
@@ -315,5 +315,62 @@ test('the hint line keeps the engine node under a prop-less Box', async ($, on) 
   const root = await ui.drawn()
   expect(JSON.stringify(root)).toMatch(/esc to interrupt/)
   expect((root as { props?: Record<string, unknown> }).props ?? {}).toEqual({})
+  await ui.unmount()
+})
+
+test('senderOf names a cross-session sender by from-name, keeping its address', async () => {
+  const text = '<cross-session-message from="uds:/tmp/cc-socks/40977.sock" from-name="Docs agent" from-mode="prompting">hi there</cross-session-message>'
+  expect(senderOf(text)).toEqual({ name: 'Docs agent', addr: 'uds:/tmp/cc-socks/40977.sock' })
+  expect(bodyOf(text)).toBe('hi there')
+  expect(senderOf('<x from="a84db9">y</x>')).toEqual({ name: 'a84db9', addr: 'a84db9' })
+})
+
+test('peerKey files outbound sends under the same thread as inbound', async () => {
+  const chat = [{ peer: 'Docs agent', dir: 'in' as const, text: 'hi', at: 1, status: 'received' as const, addr: 'uds:/tmp/cc-socks/40977.sock' }]
+  expect(peerKey('uds:/tmp/cc-socks/40977.sock', chat)).toBe('Docs agent')
+  expect(peerKey('Docs agent [2aa26b]', chat)).toBe('Docs agent')
+  expect(peerKey('other', chat)).toBe('other')
+})
+
+test('chat marks inbound/outbound, badges new messages, and opens a clickable history per agent', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  mock.env(on, { HOME: '/nonexistent' })
+  on('session.id', () => ({ value: 'sess' }))
+  on('fs.read', () => { throw new Error('none') })
+  on('tool.call', () => ({ result: {} as never, text: 'This session is me [abc123]\nLocal sessions (1):\n  Docs agent [2aa26b] · local · idle · 1m' }))
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
+  on('ui.panes', () => ({ value: [] }))
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  on('session.messages', () => ({ value: [] }) as never)
+  on('session.usage', () => ({ value: { startedAt: 500_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('session.receive', (_$, e) => ({ text: e.text }))
+  on('session.send', () => ({ isDelivered: true as const }))
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('ui.toast', () => ({ value: undefined }) as never)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  await $.session.receive({ origin: { kind: 'peer' }, text: '<cross-session-message from="uds:/tmp/cc-socks/1.sock" from-name="Docs agent" from-mode="prompting">can you run the benchmark?</cross-session-message>' })
+  await clock.advance(1000)
+  await $.session.send({ to: 'uds:/tmp/cc-socks/1.sock', text: 'running it now', origin: { kind: 'model' } } as never)
+
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  await ui.press({ key: 'tab:chat' })
+  expect(await ui.find({ key: 'tab:chat' })).toBeDefined()
+  expect((await ui.find({ key: 'tab:chat' }))?.props?.label).toMatch(/●1/)
+  expect(await ui.find({ text: /● 1 new/ })).toBeDefined()
+  expect(await ui.find({ text: /◂1/ })).toBeDefined()
+  await ui.press({ key: 'peer:Docs agent' })
+  expect(await ui.find({ text: /◂ 1 in/ })).toBeDefined()
+  expect(await ui.find({ text: /▸ 1 out/ })).toBeDefined()
+  expect(await ui.find({ text: /◂ in/ })).toBeDefined()
+  expect(await ui.find({ text: /▸ out/ })).toBeDefined()
+  const rows = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').filter(k => k.startsWith('b:m:Docs agent'))
+  expect(rows.length).toBe(2)
+  await ui.press({ key: rows[0]! })
+  expect(await ui.find({ text: /^can you run the benchmark\?$/ })).toBeDefined()
+  await ui.press({ key: 'peer:Docs agent' })
+  expect(await ui.find({ text: /● 1 new/ })).toBeUndefined()
+  expect((await ui.find({ key: 'tab:chat' }))?.props?.label).not.toMatch(/●/)
   await ui.unmount()
 })

@@ -73,7 +73,7 @@ export type CompassAction = {
 /** A session or agent ListAgents reports, this one excluded. */
 export type CompassPeer = { name: string; id: string; group: string; kind: string; status: string; since: string }
 
-export type CompassChatMsg = { peer: string; dir: 'in' | 'out'; text: string; at: number; status: 'sent' | 'rejected' | 'received' }
+export type CompassChatMsg = { peer: string; dir: 'in' | 'out'; text: string; at: number; status: 'sent' | 'rejected' | 'received'; addr?: string }
 
 export type CompassSteer = { text: string; at: number }
 
@@ -109,6 +109,8 @@ declare module 'claude-code' {
       selfName: string
       isRemoteOnline: boolean
       chat: CompassChatMsg[]
+      /** per peer: when its thread was last open; inbound after it counts as new */
+      chatSeen: Record<string, number>
       /** the request a turn just started on, until a chart made after it lands */
       incoming: { text: string; at: number } | null
       steers: CompassSteer[]

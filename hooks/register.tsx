@@ -62,6 +62,7 @@ const peersAtA = atom({ plugin: 'compass', key: 'peersAt' } as const, 0)
 const selfNameA = atom({ plugin: 'compass', key: 'selfName' } as const, '')
 const remoteA = atom({ plugin: 'compass', key: 'isRemoteOnline' } as const, false)
 const chatA = atom({ plugin: 'compass', key: 'chat' } as const, [])
+const chatSeenA = atom({ plugin: 'compass', key: 'chatSeen' } as const, {})
 const incomingA = atom({ plugin: 'compass', key: 'incoming' } as const, null)
 const steersA = atom({ plugin: 'compass', key: 'steers' } as const, [])
 const btwA = atom({ plugin: 'compass', key: 'btw' } as const, [])
@@ -858,6 +859,23 @@ export const parsePeers = (text: string) => {
   return { peers, self, isRemote }
 }
 
+/** Who sent an inbound delivery: its display name (from-name) and its reply address (from). */
+export const senderOf = (text: string) => {
+  const addr = /\bfrom="([^"]+)"/.exec(text)?.[1] ?? ''
+  const name = /\bfrom-name="([^"]+)"/.exec(text)?.[1] ?? ''
+  return { name: name || addr, addr }
+}
+
+/** The chat thread a recipient belongs to: "Name [id]" drops its id, a known address maps to its name. */
+export const peerKey = (to: string, chat: CompassChatMsg[]) => {
+  const t = to.trim()
+  const known = chat.find(m => m.addr && m.addr === t)
+  return known ? known.peer : t.replace(/\s*\[[0-9a-z_-]+\]\s*$/i, '')
+}
+
+/** The body of an inbound delivery, envelope tags stripped. */
+export const bodyOf = (text: string) => text.replace(/<[^>]+>/g, '').trim()
+
 async function refreshPeers($: EngineInterface) {
   await update($, peersAtA, () => Date.now())
   try {
@@ -878,7 +896,8 @@ async function chatSend($: EngineInterface, peer: string, text: string) {
   if (!t) return
   const at = Date.now()
   try {
-    const r = await $.session.send({ to: peer, text: t })
+    const addr = (await read($, chatA)).findLast(m => m.peer === peer && m.addr)?.addr
+    const r = await $.session.send({ to: addr ?? peer, text: t })
     const isOk = r.isDelivered === true
     await update($, chatA, list => [...list, { peer, dir: 'out' as const, text: t, at, status: isOk ? ('sent' as const) : ('rejected' as const) }].slice(-200))
     $.ui.toast(isOk ? `↗ sent to ${peer}` : `✗ not delivered to ${peer} · ${r.reason ?? ''}`)
@@ -1113,12 +1132,24 @@ export const register: Register = on => {
     const kind = e.origin.kind
     if (kind === 'bridge') await update($, remoteA, () => true)
     if (kind === 'peer' || kind === 'coordinator' || kind === 'peer-send-message' || kind === 'bridge') {
-      const peer =
-        ('teammate' in e.origin ? e.origin.teammate : '') || /from="([^"]+)"/.exec(e.text)?.[1] || (kind === 'bridge' ? 'remote control' : 'peer')
-      await update($, chatA, list => [...list, { peer, dir: 'in' as const, text: clip(e.text.replace(/<[^>]+>/g, '').trim(), 600), at: Date.now(), status: 'received' as const }].slice(-200))
-      if (kind !== 'bridge') $.ui.toast(`⇄ message from ${peer}`)
+      const from = senderOf(e.text)
+      const peer = ('teammate' in e.origin ? e.origin.teammate : '') || from.name || (kind === 'bridge' ? 'remote control' : 'peer')
+      const addr = from.addr && from.addr !== peer ? from.addr : undefined
+      await update($, chatA, list => [...list, { peer, dir: 'in' as const, text: clip(bodyOf(e.text), 600), at: Date.now(), status: 'received' as const, addr }].slice(-200))
+      if (kind !== 'bridge' || from.name) $.ui.toast(`◂ inbound from ${peer}`)
     }
     return next(e)
+  })
+
+  // the model's own SendMessage calls: the outbound half of each thread (the pane's sends log themselves)
+  on('session.send', async ($, e, next) => {
+    const sent = await next(e)
+    if (e.origin?.kind === 'model' && !e.agentId) {
+      const isOk = sent.isDelivered === true
+      await update($, chatA, list => [...list, { peer: peerKey(e.to, list), dir: 'out' as const, text: clip(e.text.trim(), 600), at: Date.now(), status: isOk ? ('sent' as const) : ('rejected' as const) }].slice(-200))
+      $.ui.toast(isOk ? `▸ outbound to ${peerKey(e.to, await read($, chatA))}` : `✗ not delivered to ${e.to} · ${sent.reason ?? ''}`)
+    }
+    return sent
   })
 
   // the board posts moves and selections; its data is input to validate
@@ -1291,7 +1322,10 @@ export const register: Register = on => {
         read($, busyA),
         read($, errorA),
       ])
-    const [peers, peersAt, selfName, isRemote, chat, incoming] = await Promise.all([read($, peersA), read($, peersAtA), read($, selfNameA), read($, remoteA), read($, chatA), read($, incomingA)])
+    const [peers, peersAt, selfName, isRemote, chat, incoming, chatSeen] = await Promise.all([read($, peersA), read($, peersAtA), read($, selfNameA), read($, remoteA), read($, chatA), read($, incomingA), read($, chatSeenA)])
+    const openPeer = tab === 'chat' && selected?.startsWith('p:') ? selected.slice(2) : null
+    const unreadOf = (name: string) => (name === openPeer ? 0 : chat.filter(m => m.peer === name && m.dir === 'in' && m.at > (chatSeen[name] ?? 0)).length)
+    const unreadAll = [...new Set(chat.map(m => m.peer))].reduce((n, p) => n + unreadOf(p), 0)
     const Client = 'Client' in els ? els.Client : null
     const map = isCurrent(stored) ? stored : null
     const now = await $.clock.now()
@@ -1349,7 +1383,7 @@ export const register: Register = on => {
         <Box flexWrap="wrap" columnGap={2} marginTop={1}>
           {TABS.map(t => {
             const isOn = t.id === tab
-            const badge = t.id === 'grill' && front.ask.length ? ` ${front.ask.length}` : ''
+            const badge = t.id === 'grill' && front.ask.length ? ` ${front.ask.length}` : t.id === 'chat' && unreadAll ? ` ●${unreadAll}` : ''
             return (
               <Box key={`tabbox:${t.id}`} flexDirection="column">
                 <Box>
@@ -1711,10 +1745,39 @@ export const register: Register = on => {
       )
     } else if (tab === 'chat') {
       const sel = selected?.startsWith('p:') ? selected.slice(2) : null
-      const unread = (name: string) => chat.filter(m => m.peer === name && m.dir === 'in').length
+      const tally = (name: string) => {
+        const msgs = chat.filter(m => m.peer === name)
+        return { inn: msgs.filter(m => m.dir === 'in').length, out: msgs.filter(m => m.dir === 'out').length, last: msgs[msgs.length - 1] }
+      }
+      const counts = (name: string) => {
+        const c = tally(name)
+        const fresh = unreadOf(name)
+        return (
+          <Text>
+            {fresh ? <Text color="yellow" bold> ● {fresh} new</Text> : null}
+            {c.inn ? <Text color="cyan"> ◂{c.inn}</Text> : null}
+            {c.out ? <Text color="green"> ▸{c.out}</Text> : null}
+          </Text>
+        )
+      }
+      const openThread = (name: string) => async () => {
+        const latest = (await read($, chatA)).reduce((t, m) => (m.peer === name ? Math.max(t, m.at) : t), 0)
+        await update($, chatSeenA, seen => ({ ...seen, [name]: Math.max(seen[name] ?? 0, latest) }))
+        await update($, selectedA, s => (s === `p:${name}` ? null : `p:${name}`))
+      }
+      const lastLine = (name: string) => {
+        const m = tally(name).last
+        return m ? (
+          <Text dimColor wrap="truncate-end">
+            {'  '}
+            {m.dir === 'in' ? '◂ ' : '▸ '}
+            {clip(plain(m.text), width - 6)}
+          </Text>
+        ) : null
+      }
       const others = [...new Set(chat.map(m => m.peer))].filter(n => !peers.some(p => p.name === n))
       const dot = (status: string) => (/busy|running|working/i.test(status) ? 'green' : /idle/i.test(status) ? 'yellow' : 'red')
-      const thread = sel ? chat.filter(m => m.peer === sel).slice(-12) : []
+      const thread = sel ? chat.filter(m => m.peer === sel).slice(-30) : []
       body = (
         <Box flexDirection="column" key="chat">
           <Box justifyContent="space-between">
@@ -1737,37 +1800,70 @@ export const register: Register = on => {
             <Box flexDirection="column" key={`peer:${p.id}`}>
               <Box>
                 <Text color={dot(p.status)}>● </Text>
-                <Button key={`peer:${p.name}`} plain label={clip(p.name, width - 18)} onPress={select(`p:${p.name}`)} />
+                <Button key={`peer:${p.name}`} plain label={clip(p.name, width - 18)} onPress={openThread(p.name)} />
                 <Text dimColor wrap="truncate-end">
                   {' '}
                   {p.kind}
                   {p.status ? ` · ${p.status}` : ''}
                 </Text>
-                {unread(p.name) > 0 && <Text color="cyan"> ◂{unread(p.name)}</Text>}
+                {counts(p.name)}
               </Box>
               {p.group && /remote/i.test(p.group) ? <Text dimColor>{'  '}{p.group}</Text> : null}
+              {lastLine(p.name)}
             </Box>
           ))}
           {others.map(n => (
-            <Box key={`peerx:${n}`}>
-              <Text dimColor>○ </Text>
-              <Button key={`peer:${n}`} plain dimColor label={clip(n, width - 6)} onPress={select(`p:${n}`)} />
+            <Box flexDirection="column" key={`peerx:${n}`}>
+              <Box>
+                <Text dimColor>○ </Text>
+                <Button key={`peer:${n}`} plain dimColor label={clip(n, width - 14)} onPress={openThread(n)} />
+                {counts(n)}
+              </Box>
+              {lastLine(n)}
             </Box>
           ))}
           {sel && (
             <Box flexDirection="column" key="thread" borderStyle="round" borderColor="cyan" paddingX={1} marginTop={1}>
               <Text color="cyan" bold wrap="truncate-end">
-                ⇄ {sel}
+                ⇄ {selfName ? `${clip(selfName, 18)} ⇄ ` : ''}
+                {sel}
               </Text>
-              {thread.length === 0 && <Text dimColor>no messages yet</Text>}
-              {thread.map((m, i) => (
-                <Box key={`msg:${i}`}>
-                  <Text color={m.dir === 'in' ? 'cyan' : m.status === 'rejected' ? 'red' : 'green'}>{m.dir === 'in' ? '◂ ' : m.status === 'rejected' ? '✗ ' : '▸ '}</Text>
-                  <Text wrap="wrap" dimColor={m.dir === 'out'}>
-                    {clip(m.text, 400)}
+              {(() => {
+                const all = chat.filter(m => m.peer === sel)
+                if (all.length === 0) return <Text dimColor>no messages yet</Text>
+                const c = tally(sel)
+                const failed = all.filter(m => m.status === 'rejected').length
+                return (
+                  <Text dimColor wrap="wrap">
+                    <Text color="cyan">◂ {c.inn} in</Text> · <Text color="green">▸ {c.out} out</Text>
+                    {failed ? <Text color="red"> · ✗ {failed} failed</Text> : null} · since {ago(now - all[0]!.at)} ago · last {ago(now - all[all.length - 1]!.at)} ago
                   </Text>
-                </Box>
-              ))}
+                )
+              })()}
+              {thread.length ? <Text dimColor>history · click a line to expand</Text> : null}
+              {thread.map(m => {
+                const key = `m:${sel}:${m.at}:${m.dir}`
+                const isFull = isOpen(key)
+                const isNew = m.dir === 'in' && m.at > (chatSeen[sel] ?? 0)
+                const arrow = m.dir === 'in' ? '◂ in ' : m.status === 'rejected' ? '✗ out' : '▸ out'
+                return (
+                  <Box key={key} flexDirection="column">
+                    <Box>
+                      <Text color={m.dir === 'in' ? 'cyan' : m.status === 'rejected' ? 'red' : 'green'} bold>
+                        {isNew ? '●' : ' '}
+                        {arrow}{' '}
+                      </Text>
+                      <Text dimColor>{ago(now - m.at).padStart(4)} </Text>
+                      <Button key={`b:${key}`} plain dimColor={m.dir === 'out'} label={`${isFull ? '▾' : '▸'} ${clip(plain(m.text), Math.max(10, width - 20))}`} onPress={() => toggleIn($, key)} />
+                    </Box>
+                    {isFull && (
+                      <Box paddingLeft={4}>
+                        <Text wrap="wrap">{m.text}</Text>
+                      </Box>
+                    )}
+                  </Box>
+                )
+              })}
               {input(`chat:${sel}`, `message ${clip(sel, 20)}…`, 'send', v => void chatSend($, sel, v))}
             </Box>
           )}
