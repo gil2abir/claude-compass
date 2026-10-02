@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { bodyOf, leadOf, wordWrap, boardOf, crumb, gist, peerKey, plain, frontierOf, mergeGrill, parseLoose, parseMap, senderOf } from '../hooks/register'
+import { bodyOf, leadOf, moveIn, wordWrap, boardOf, crumb, gist, peerKey, plain, frontierOf, mergeGrill, parseLoose, parseMap, senderOf } from '../hooks/register'
 
 const MAP = {
   goal: 'Build compass mod',
@@ -229,7 +229,7 @@ test('the agent posts a round, the user answers it, and the round goes back as o
   expect(await ui.find({ text: /Q3 · Name/ })).toBeDefined()
   expect(submitted.length).toBe(0)
   await ui.input({ key: 'gans:name', text: '?why not reuse the old one' })
-  await clock.advance(1100)
+  await clock.advance(5100)
   expect(submitted.length).toBe(1)
   expect(submitted[0]).toMatch(/Q1 \(store\) Where to store → disk/)
   expect(submitted[0]).toMatch(/FOLLOW-UP.*why not reuse/)
@@ -399,4 +399,58 @@ test('leadOf takes the first sentence whole and flags the rest', async () => {
   const long = leadOf(`${'word '.repeat(60)}end.`, 40)
   expect(long.lead.endsWith('word…')).toBe(true)
   expect(long.hasMore).toBe(true)
+})
+
+test('the outbox lists what goes to the session and when, and lets the user reorder, preview and remove', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  mock.env(on, { HOME: '/nonexistent' })
+  on('session.id', () => ({ value: 'sess' }))
+  on('fs.read', () => { throw new Error('none') })
+  on('tool.call', () => ({ result: {} as never, text: '' }))
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
+  on('ui.panes', () => ({ value: [] }))
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  on('session.messages', () => ({ value: [] }) as never)
+  on('session.usage', () => ({ value: { startedAt: 500_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('ui.toast', () => ({ value: undefined }) as never)
+  let context: readonly string[] = []
+  on('prompt.submit', (_$, e) => {
+    context = (e as { context?: readonly string[] }).context ?? []
+    return { text: (e as { text: string }).text } as never
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  await ui.press({ key: 'tab:tasks' })
+  for (const t of ['alpha task', 'beta task', 'gamma task']) await ui.input({ key: 'task', text: t })
+  expect(await ui.find({ text: /with your next prompt/ })).toBeDefined()
+  const ids = async () => (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').filter(k => k.startsWith('drop:')).map(k => k.slice(5))
+  const [a, b, c] = await ids()
+  // gamma up one: alpha, gamma, beta
+  await ui.press({ key: `up:${c}` })
+  expect(await ids()).toEqual([a, c, b])
+  // preview shows the exact text
+  await ui.press({ key: `obl:${b}` })
+  expect(await ui.find({ text: /sends exactly/ })).toBeDefined()
+  // remove alpha: its task leaves the board too
+  await ui.press({ key: `drop:${a}` })
+  expect(await ids()).toEqual([c, b])
+  await $.prompt.submit({ text: 'go on' } as never)
+  const note = context.join('\n')
+  expect(note).not.toMatch(/alpha task/)
+  expect(note.indexOf('gamma task') < note.indexOf('beta task')).toBe(true)
+  expect(await ui.find({ text: /with your next prompt/ })).toBeUndefined()
+  await clock.advance(10)
+  await ui.unmount()
+})
+
+test('moveIn swaps only within the same queue', async () => {
+  const mk = (id: string, route: 'new turn' | 'next prompt', status: 'queued' | 'sent' = 'queued') =>
+    ({ id, kind: 'note', label: id, text: id, status, route, reason: '', at: 0, ref: '', prev: '' }) as const
+  const list = [mk('t1', 'new turn'), mk('p1', 'next prompt'), mk('s', 'next prompt', 'sent'), mk('p2', 'next prompt')]
+  expect(moveIn([...list], 'p2', -1).map(a => a.id)).toEqual(['t1', 'p2', 's', 'p1'])
+  expect(moveIn([...list], 't1', 1).map(a => a.id)).toEqual(['t1', 'p1', 's', 'p2'])
 })
