@@ -37,7 +37,6 @@ const GRILL_TOOL = 'mcp__compass__grill'
 const GOLD = '#E8B53A'
 /** How long every new item waits in the outbox, so it can still be reordered or removed. */
 const SEND_GRACE_MS = 8000
-let lastDiag = ''
 
 const EMPTY_STATS: CompassStats = {
   startedAt: 0,
@@ -2464,13 +2463,6 @@ export const register: Register = on => {
     const footH = footRows.length
     const scroll = e.props.scroll
     const footTop = Math.max(0, scroll.offset + scroll.bodyRows - footH)
-    const diag = JSON.stringify({ scroll, viewport: e.viewport ?? null, placement: e.props.placement, bodyColumns: e.props.bodyColumns, footH, footTop, surface: e.surface })
-    if (diag !== lastDiag) {
-      lastDiag = diag
-      void sessionDir($)
-        .then(dir => $.fs.write(`${dir}/compass/pane-diag.json`, JSON.stringify({ at: Date.now(), ...(JSON.parse(diag) as object) })))
-        .catch(() => undefined)
-    }
     const activity = (
       <Box key="activity" position="absolute" top={footTop} left={0} width={width} flexDirection="column" overflow="hidden">
         {footRows}
