@@ -454,3 +454,44 @@ test('moveIn swaps only within the same queue', async () => {
   expect(moveIn([...list], 'p2', -1).map(a => a.id)).toEqual(['t1', 'p2', 's', 'p1'])
   expect(moveIn([...list], 't1', 1).map(a => a.id)).toEqual(['t1', 'p1', 's', 'p2'])
 })
+
+test('the sync line says whether the chart has caught up with the session', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  mock.env(on, { HOME: '/nonexistent' })
+  let isUp = true
+  on('model.fork', () =>
+    (isUp
+      ? { value: { isAnswered: true, text: JSON.stringify(MAP), usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }
+      : { value: { isAnswered: false, reason: 'busy' } }) as never)
+  on('session.id', () => ({ value: 'sess' }))
+  on('fs.read', () => { throw new Error('none') })
+  on('session.messages', () => ({ value: [] }) as never)
+  on('session.usage', () => ({ value: { startedAt: 1_000_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }) as never)
+  on('turn.complete', (_$, e) => ({ text: e.answer }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  expect(await ui.find({ text: /outbox · empty/ })).toBeDefined()
+
+  await $.turn.start({ text: 'build it', turnId: 't1' } as never)
+  await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+  await clock.advance(1500)
+  expect(await ui.find({ text: /in sync · includes your last message/ })).toBeDefined()
+
+  // the next chart fails: the pane says it is behind and offers ↻
+  isUp = false
+  await $.turn.start({ text: '<task-notification>done</task-notification>', turnId: 't2' } as never)
+  await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't2', reason: 'answer' } as never)
+  await clock.advance(1500)
+  expect(await ui.find({ text: /1 turn behind/ })).toBeDefined()
+  expect(await ui.find({ key: 'sync:refresh' })).toBeDefined()
+
+  // a new message mid-turn is named until a chart includes it
+  await $.turn.start({ text: 'fix the header', turnId: 't3' } as never)
+  expect(await ui.find({ text: /not charted yet: your message "fix the header"/ })).toBeDefined()
+  await ui.unmount()
+})

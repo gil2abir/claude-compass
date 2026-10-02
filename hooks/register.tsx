@@ -715,6 +715,8 @@ async function refresh($: EngineInterface) {
   inflight = true
   lastRefreshAt = await $.clock.now()
   const startedAt = Date.now() - 1500
+  // charted after its turn ended, a chart has the whole request in hand
+  const isAfterTurn = !(await read($, busyA))
   await update($, refreshingA, () => true)
   try {
     await loadBtw($)
@@ -729,6 +731,7 @@ async function refresh($: EngineInterface) {
       await read($, grillA),
       (await read($, chatA)).filter(m => m.dir === 'in'),
     )
+    const turnsAt = (await read($, statsA)).turns
     let reply = await $.model.fork({ prompt })
     await countOwn($, reply)
     let map = reply.isAnswered ? parseMap(reply.text, await $.clock.now()) : null
@@ -747,9 +750,9 @@ async function refresh($: EngineInterface) {
       return
     }
     const { grill: inferred, ...next } = map
-    await update($, mapA, () => next)
+    await update($, mapA, () => ({ ...next, turns: turnsAt }))
     // the chart now includes the request the turn started on
-    await update($, incomingA, inc => (inc && inc.at <= startedAt ? null : inc))
+    await update($, incomingA, inc => (inc && (isAfterTurn || inc.at <= startedAt) ? null : inc))
     if (inferred.length) {
       const at = await $.clock.now()
       await update($, grillA, list => mergeGrill(list, inferred, next.goal, 'map', at))
@@ -1470,7 +1473,6 @@ export const register: Register = on => {
             </Text>
           </Box>
           <Box columnGap={1}>
-            <Text dimColor>{isRefreshing ? '↻' : map ? ago(now - map.at) : ''}</Text>
             <Button
               key="legend"
               label="key"
@@ -2288,11 +2290,18 @@ export const register: Register = on => {
       )
     }
     const hue = { queued: 'yellow', sent: 'green', rejected: 'red' } as const
-    const activity = (queuedTurn.length > 0 || queuedPrompt.length > 0 || done.length > 0) && (
-      <Box flexDirection="column" key="activity" marginTop={1}>
-        <Text dimColor>
-          {'┄ outbox '}
-          {'┄'.repeat(Math.max(0, width - 9))}
+    const isQueueEmpty = queuedTurn.length === 0 && queuedPrompt.length === 0
+    const activity = (
+      <Box flexDirection="column" key="activity">
+        <Text wrap="wrap">
+          <Text color={isQueueEmpty ? undefined : 'yellow'} dimColor={isQueueEmpty} bold={!isQueueEmpty}>
+            ⇣ outbox
+          </Text>
+          <Text dimColor>
+            {isQueueEmpty
+              ? ' · empty · steers, tasks and answers you make here wait here first'
+              : ` · ${queuedTurn.length + queuedPrompt.length} waiting to go into the session`}
+          </Text>
         </Text>
         {queuedTurn.length > 0 && (
           <Box flexDirection="column">
@@ -2337,14 +2346,42 @@ export const register: Register = on => {
               </Text>
             </Box>
           ))}
+        {rule}
+      </Box>
+    )
+
+    // is the chart caught up with the session? one line, always on top
+    const behind = map && typeof map.turns === 'number' ? Math.max(0, stats.turns - map.turns) : 0
+    const unseen = map ? actions.filter(a => a.status === 'sent' && a.at > map.at).length : 0
+    const syncLine = (() => {
+      if (isRefreshing) return { glyph: '⟳', color: 'cyan', text: incoming ? `charting your new message: ${incoming.text}` : 'updating the chart…', canRefresh: false }
+      if (!map) return { glyph: '◌', color: 'yellow', text: stats.turns ? 'no chart yet' : 'charting starts after the first turn', canRefresh: stats.turns > 0 }
+      if (incoming) return { glyph: '◌', color: 'yellow', text: `not charted yet: your message "${incoming.text}"${isBusy ? ' · charts when the turn ends' : ''}`, canRefresh: !isBusy }
+      if (behind) return { glyph: '◌', color: 'yellow', text: `${behind} turn${behind > 1 ? 's' : ''} behind the session`, canRefresh: true }
+      if (unseen) return { glyph: '◌', color: 'yellow', text: `${unseen} of your pane updates went in after this chart`, canRefresh: !isBusy }
+      return { glyph: '✓', color: 'green', text: `in sync · includes your last message and updates`, canRefresh: false }
+    })()
+    const sync = (
+      <Box key="sync" justifyContent="space-between">
+        <Box flexShrink={1}>
+          <Text wrap="wrap">
+            <Text color={syncLine.color} bold>
+              {syncLine.glyph}{' '}
+            </Text>
+            <Text dimColor={syncLine.glyph === '✓'}>{syncLine.text}</Text>
+            {map ? <Text dimColor> · charted {ago(now - map.at)} ago</Text> : null}
+          </Text>
+        </Box>
+        {syncLine.canRefresh && <Button key="sync:refresh" plain label=" ↻ update" onPress={() => wantRefresh()} />}
       </Box>
     )
 
     return (
       <Box flexDirection="column" width={width}>
         {header}
-        {body}
+        {sync}
         {activity}
+        {body}
         {lastError && (
           <Text color="yellow" dimColor>
             △ {lastError}

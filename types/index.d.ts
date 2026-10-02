@@ -22,6 +22,8 @@ export type CompassMap = {
   tasks: CompassTask[]
   recap: string[]
   at: number
+  /** completed turns the chart was made from: fewer than stats.turns means it is behind */
+  turns?: number
 }
 
 /**
