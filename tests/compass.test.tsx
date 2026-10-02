@@ -229,7 +229,7 @@ test('the agent posts a round, the user answers it, and the round goes back as o
   expect(await ui.find({ text: /Q3 · Name/ })).toBeDefined()
   expect(submitted.length).toBe(0)
   await ui.input({ key: 'gans:name', text: '?why not reuse the old one' })
-  await clock.advance(5100)
+  await clock.advance(8100)
   expect(submitted.length).toBe(1)
   expect(submitted[0]).toMatch(/Q1 \(store\) Where to store → disk/)
   expect(submitted[0]).toMatch(/FOLLOW-UP.*why not reuse/)
@@ -426,7 +426,7 @@ test('the outbox lists what goes to the session and when, and lets the user reor
   const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
   await ui.press({ key: 'tab:tasks' })
   for (const t of ['alpha task', 'beta task', 'gamma task']) await ui.input({ key: 'task', text: t })
-  expect(await ui.find({ text: /with your next prompt/ })).toBeDefined()
+  expect(await ui.find({ text: /⇣ 3 queued/ })).toBeDefined()
   const ids = async () => (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').filter(k => k.startsWith('drop:')).map(k => k.slice(5))
   const [a, b, c] = await ids()
   // gamma up one: alpha, gamma, beta
@@ -434,7 +434,7 @@ test('the outbox lists what goes to the session and when, and lets the user reor
   expect(await ids()).toEqual([a, c, b])
   // preview shows the exact text
   await ui.press({ key: `obl:${b}` })
-  expect(await ui.find({ text: /sends exactly/ })).toBeDefined()
+  expect(await ui.find({ text: /│ .*beta task/ })).toBeDefined()
   // remove alpha: its task leaves the board too
   await ui.press({ key: `drop:${a}` })
   expect(await ids()).toEqual([c, b])
@@ -442,7 +442,7 @@ test('the outbox lists what goes to the session and when, and lets the user reor
   const note = context.join('\n')
   expect(note).not.toMatch(/alpha task/)
   expect(note.indexOf('gamma task') < note.indexOf('beta task')).toBe(true)
-  expect(await ui.find({ text: /with your next prompt/ })).toBeUndefined()
+  expect(await ui.find({ text: /queue empty/ })).toBeDefined()
   await clock.advance(10)
   await ui.unmount()
 })
@@ -475,7 +475,7 @@ test('the sync line says whether the chart has caught up with the session', asyn
   on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
   const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
-  expect(await ui.find({ text: /outbox · empty/ })).toBeDefined()
+  expect(await ui.find({ text: /queue empty/ })).toBeDefined()
 
   await $.turn.start({ text: 'build it', turnId: 't1' } as never)
   await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' } as never)
@@ -494,4 +494,57 @@ test('the sync line says whether the chart has caught up with the session', asyn
   await $.turn.start({ text: 'fix the header', turnId: 't3' } as never)
   expect(await ui.find({ text: /not charted yet: your message "fix the header"/ })).toBeDefined()
   await ui.unmount()
+})
+
+test('a steer waits in the outbox with a countdown, can be cancelled, and otherwise goes into the running turn', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  mock.env(on, { HOME: '/nonexistent' })
+  on('model.fork', () => ({ value: { isAnswered: false, reason: 'busy' } }) as never)
+  on('session.id', () => ({ value: 'sess' }))
+  on('fs.read', () => { throw new Error('none') })
+  on('session.messages', () => ({ value: [] }) as never)
+  on('session.usage', () => ({ value: { startedAt: 1_000_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  // the kit has no session.append for a plugin's own append: a toast names each attempt either way
+  const toasts: string[] = []
+  on('ui.toast', (_$, e) => {
+    toasts.push((e as { text: string }).text)
+    return { value: undefined } as never
+  })
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
+  const attempts = (label: string) => toasts.filter(t => t.includes(label) && /running turn|session\.append/.test(t)).length
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  await $.turn.start({ text: 'work', turnId: 't1' } as never)
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+
+  await ui.input({ key: 'steer', text: 'drop the cache idea' })
+  await clock.advance(2000)
+  expect(await ui.find({ text: /^[67]s $/ })).toBeDefined()
+  const id = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').find(k => k.startsWith('drop:'))!.slice(5)
+  await ui.press({ key: `drop:${id}` })
+  await clock.advance(10_000)
+  expect(attempts('drop the cache idea')).toBe(0)
+
+  await ui.input({ key: 'steer', text: 'use the T4 runtime' })
+  await clock.advance(9000)
+  expect(attempts('use the T4 runtime')).toBe(1)
+  expect(await ui.find({ text: /queue empty/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the outbox is pinned to the bottom of the pane window as it scrolls', async ($, on) => {
+  mock.clock(on, { now: 1_000_000 })
+  mock.env(on, { HOME: '/nonexistent' })
+  on('session.id', () => ({ value: 'sess' }))
+  on('fs.read', () => { throw new Error('none') })
+  for (const offset of [0, 7]) {
+    const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE, props: { ...PANE.props, scroll: { offset, bodyRows: 30 } } })
+    const foot = await ui.find({ key: 'activity' })
+    // a rule and the "queue empty" row: two rows, ending on the window's last row
+    expect(foot?.props?.top).toBe(offset + 30 - 2)
+    await ui.unmount()
+  }
 })
