@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { bodyOf, boardOf, crumb, gist, peerKey, plain, frontierOf, mergeGrill, parseLoose, parseMap, senderOf } from '../hooks/register'
+import { bodyOf, leadOf, wordWrap, boardOf, crumb, gist, peerKey, plain, frontierOf, mergeGrill, parseLoose, parseMap, senderOf } from '../hooks/register'
 
 const MAP = {
   goal: 'Build compass mod',
@@ -78,7 +78,7 @@ test('pane draws the git-flow map, folds, and task board', async ($, on) => {
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ plugin: 'compass', surface, ...PANE })
-    expect(await ui.find({ text: /\[write register\]/ })).toBeDefined()
+    expect(await ui.find({ key: 'node:s4' })).toBeDefined()
     expect(await ui.find({ key: 'node:s4' })).toBeDefined()
     expect(await ui.find({ key: 'node:s5' })).toBeDefined()
     // done milestone is folded to one row
@@ -126,7 +126,8 @@ test('the hint line carries a clickable compass that opens the pane', async ($, 
     return { value: { isPlaced: true } } as never
   })
   const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', component: 'PromptHint', props: { isDraft: false, isWorking: false, hint: '? for shortcuts' } })
-  expect((await ui.find({ key: 'compass-crumb' }))?.text).toMatch(/compass/)
+  expect(await ui.find({ text: /^◈ compass$/ })).toBeDefined()
+  expect((await ui.find({ text: /^◈ compass$/ }))?.props?.color).toBe('#E8B53A')
   await ui.press({ key: 'compass-crumb' })
   expect(opened).toBe(1)
   await ui.unmount()
@@ -162,10 +163,10 @@ test('a compass present from the first turn charts once there is history, and /c
   await $.turn.start({ text: 'go', turnId: 't1' } as never)
   await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' } as never)
   await clock.advance(1500)
-  expect(await ui.find({ text: /\[write register\]/ })).toBeDefined()
+  expect(await ui.find({ key: 'node:s4' })).toBeDefined()
 
   await $.session.end({ reason: 'clear', sessionId: 'sess' } as never)
-  expect(await ui.find({ text: /\[write register\]/ })).toBeUndefined()
+  expect(await ui.find({ key: 'node:s4' })).toBeUndefined()
   await ui.unmount()
 })
 
@@ -287,7 +288,7 @@ test('a resumed session reopens its chart from the session folder without charti
 test('the status gist is the active cut, fits its budget, and uses plain glyphs only', async () => {
   const map = parseMap(JSON.stringify(MAP), 1)
   const full = gist(map, 2, 1, 200).map(p => p.text).join('')
-  expect(full).toBe('compass  ✓ adopt IBIS model › ● write register › ○ run tests  ? 2 to answer  1 queued')
+  expect(full).toBe('◈ compass  ✓ adopt IBIS model › ● write register › ○ run tests  ? 2 to answer  1 queued')
   const odd = parseMap(JSON.stringify({ ...MAP, milestones: [{ id: 'm', label: 'Ship 🎉 it', state: 'active', steps: [
     { id: 'a', label: 'naïve café 👩‍💻 groundwork that is long', kind: 'step', state: 'done' },
     { id: 'b', label: 'a very long active step label here', kind: 'step', state: 'blocked' },
@@ -297,15 +298,23 @@ test('the status gist is the active cut, fits its budget, and uses plain glyphs 
     const text = gist(odd, 3, 0, budget).map(p => p.text).join('')
     expect(Array.from(text).length <= budget).toBe(true)
     expect(text).not.toMatch(/\uFFFD|[\uD800-\uDFFF]|\p{Extended_Pictographic}/u)
-    expect(text).toMatch(/[^\x20-\x7E\u00C0-\u024F✓●○›…!?]/u.test(text) ? /^$/ : /compass/)
-    expect(text).toMatch(budget < 60 ? /!/ : /needs you/)
+    expect(text).toMatch(/[^\x20-\x7E\u00C0-\u024F◈✓●○›…!?/]/u.test(text) ? /^$/ : /compass/)
+    expect(text).toMatch(/!/)
+    // labels are whole or absent, never cut mid-word
+    expect(text).not.toMatch(/…/)
+    for (const label of ['a very long active step label here', 'the following step which is long']) {
+      const at = text.indexOf(label.split(' ')[0]!)
+      if (at >= 0 && text.slice(at).startsWith(label.slice(0, 8))) expect(text.includes(label)).toBe(true)
+    }
   }
+  expect(gist(odd, 3, 0, 120).map(p => p.text).join('')).toMatch(/a very long active step label here/)
+  expect(gist(odd, 3, 0, 30).map(p => p.text).join('')).toMatch(/step 2\/3/)
 })
 
 test('a new request is "now" in the gist the moment its turn starts', async () => {
   const map = parseMap(JSON.stringify(MAP), 1)
   const text = gist(map, 0, 0, 200, 'fix the status line').map(p => p.text).join('')
-  expect(text).toBe('compass  ✓ write register › ● fix the status line › ○ updating…')
+  expect(text).toBe('◈ compass  ✓ write register › ● fix the status line › ○ updating…')
 })
 
 test('the hint line keeps the engine node under a prop-less Box', async ($, on) => {
@@ -350,7 +359,7 @@ test('chat marks inbound/outbound, badges new messages, and opens a clickable hi
   on('ui.status', () => ({ value: undefined }) as never)
   on('ui.toast', () => ({ value: undefined }) as never)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
-  await $.session.receive({ origin: { kind: 'peer' }, text: '<cross-session-message from="uds:/tmp/cc-socks/1.sock" from-name="Docs agent" from-mode="prompting">can you run the benchmark?</cross-session-message>' })
+  await $.session.receive({ origin: { kind: 'peer' }, text: '<cross-session-message from="uds:/tmp/cc-socks/1.sock" from-name="Docs agent" from-mode="prompting">can you run the benchmark? Use the faster runner and send me the per-file timings when it finishes.</cross-session-message>' })
   await clock.advance(1000)
   await $.session.send({ to: 'uds:/tmp/cc-socks/1.sock', text: 'running it now', origin: { kind: 'model' } } as never)
 
@@ -367,10 +376,26 @@ test('chat marks inbound/outbound, badges new messages, and opens a clickable hi
   expect(await ui.find({ text: /▸ out/ })).toBeDefined()
   const rows = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').filter(k => k.startsWith('b:m:Docs agent'))
   expect(rows.length).toBe(2)
+  expect(await ui.find({ key: rows[0]!, text: /can you run the benchmark\? ▸$/ })).toBeDefined()
   await ui.press({ key: rows[0]! })
-  expect(await ui.find({ text: /^can you run the benchmark\?$/ })).toBeDefined()
+  expect(await ui.find({ text: /per-file timings/ })).toBeDefined()
   await ui.press({ key: 'peer:Docs agent' })
   expect(await ui.find({ text: /● 1 new/ })).toBeUndefined()
   expect((await ui.find({ key: 'tab:chat' }))?.props?.label).not.toMatch(/●/)
   await ui.unmount()
+})
+
+test('wordWrap breaks between words and keeps every word', async () => {
+  const rows = wordWrap('rename the session crumb so the hint line reads clearly', 16)
+  expect(rows.every(r => Array.from(r).length <= 16)).toBe(true)
+  expect(rows.join(' ')).toBe('rename the session crumb so the hint line reads clearly')
+  expect(wordWrap('supercalifragilistic', 8)).toEqual(['supercal', 'ifragili', 'stic'])
+})
+
+test('leadOf takes the first sentence whole and flags the rest', async () => {
+  expect(leadOf('Done. Tests pass and the PR is up.')).toEqual({ lead: 'Done.', hasMore: true })
+  expect(leadOf('just one line')).toEqual({ lead: 'just one line', hasMore: false })
+  const long = leadOf(`${'word '.repeat(60)}end.`, 40)
+  expect(long.lead.endsWith('word…')).toBe(true)
+  expect(long.hasMore).toBe(true)
 })

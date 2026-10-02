@@ -33,6 +33,7 @@ const TITLE = '🧭 compass'
 const PAST_KEEP = 2
 const FUTURE_KEEP = 3
 const GRILL_TOOL = 'mcp__compass__grill'
+const GOLD = '#E8B53A'
 
 const EMPTY_STATS: CompassStats = {
   startedAt: 0,
@@ -158,6 +159,38 @@ export const plain = (text: string) =>
     .replace(/\p{Extended_Pictographic}/gu, '')
     .replace(/\s+/g, ' ')
     .trim()
+
+/** Rows of at most `width` cells, broken between words; only a word wider than a row is split. */
+export const wordWrap = (text: string, width: number): string[] => {
+  const w = Math.max(4, width)
+  const rows: string[] = []
+  let row = ''
+  for (const word of text.split(/\s+/).filter(Boolean)) {
+    const g = graphemes(word)
+    if (g.length > w) {
+      if (row) rows.push(row)
+      for (let i = 0; i < g.length; i += w) rows.push(g.slice(i, i + w).join(''))
+      row = rows.pop() ?? ''
+      continue
+    }
+    const next = row ? `${row} ${word}` : word
+    if (graphemes(next).length > w) {
+      rows.push(row)
+      row = word
+    } else row = next
+  }
+  if (row) rows.push(row)
+  return rows.length ? rows : ['']
+}
+
+/** A message's lead: its first sentence or line, whole; long ones end at a word with "…". */
+export const leadOf = (text: string, max = 140) => {
+  const flat = plain(text)
+  const first = /^(.+?[.!?])(\s|$)/.exec(flat)?.[1] ?? flat
+  if (graphemes(first).length <= max) return { lead: first, hasMore: first.length < flat.length }
+  const cut = wordWrap(first, max - 1)[0] ?? ''
+  return { lead: `${cut}…`, hasMore: true }
+}
 
 const ago = (ms: number) => {
   const s = Math.max(0, Math.round(ms / 1000))
@@ -307,13 +340,13 @@ const glen = (t: string) => graphemes(t).length
  * the step next — then only what needs the user. Fits `budget` cells exactly; plain glyphs only.
  */
 export const gist = (map: CompassMap | null, asks: number, queued: number, budget: number, incoming: string | null = null): GistPart[] => {
-  const brand: GistPart = { text: 'compass', tone: 'brand' }
+  const brand: GistPart = { text: '◈ compass', tone: 'brand' }
   if (!map && !incoming) return [brand, { text: '  charting…', tone: 'past' }]
   if (!map) map = { goal: '', milestones: [], tasks: [], recap: [], at: 0 }
   const { milestone, step, next } = locate(map)
-  const steps = milestone?.steps ?? []
+  const steps = (milestone?.steps ?? []).filter(s => s.kind !== 'aside')
   const here = step ? steps.indexOf(step) : -1
-  const pastStep = [...(here >= 0 ? steps.slice(0, here) : steps)].reverse().find(s => s.state === 'done' && s.kind !== 'aside')
+  const pastStep = [...(here >= 0 ? steps.slice(0, here) : steps)].reverse().find(s => s.state === 'done')
   const pastMilestone = [...map.milestones].reverse().find(m => m.state === 'done')
   const isBlocked = step?.state === 'blocked'
   let past = plain(pastStep?.label ?? pastMilestone?.label ?? '')
@@ -325,36 +358,38 @@ export const gist = (map: CompassMap | null, asks: number, queued: number, budge
     now = plain(incoming)
     ahead = 'updating…'
   }
-  // what needs the user, in words when there is room, in a glyph when there is not
-  const isTight = budget < 60
-  const right: GistPart[] = []
-  if (isBlocked) right.push({ text: isTight ? '!' : '! needs you', tone: 'need' })
-  if (asks) right.push({ text: isTight ? `?${asks}` : `? ${asks} to answer`, tone: 'ask' })
-  if (queued && !isTight) right.push({ text: `${queued} queued`, tone: 'queue' })
-  const rightLen = right.reduce((n, r) => n + glen(r.text) + 2, 0)
-  // "compass  ✓ past › ● now › ○ next" — 9 cells of frame per shown step
-  const room = () => budget - 7 - rightLen - (past ? 4 + 3 : 0) - (now ? 4 : 0) - (ahead ? 3 + 2 : 0)
-  const fits = () => glen(past) + glen(now) + glen(ahead) <= room()
-  const shrink = (t: string, floor: number) => (glen(t) > floor ? clip(t, Math.max(floor, glen(t) - 1)) : t)
-  while (!fits() && (glen(past) > 8 || glen(ahead) > 8)) {
-    if (glen(past) >= glen(ahead)) past = shrink(past, 8)
-    else ahead = shrink(ahead, 8)
+  const progress = here >= 0 && steps.length > 1 ? `step ${here + 1}/${steps.length}` : ''
+  // what needs the user: words when they fit, a glyph when they do not
+  const needs = (isShort: boolean): GistPart[] => [
+    ...(isBlocked ? [{ text: isShort ? '!' : '! needs you', tone: 'need' as const }] : []),
+    ...(asks ? [{ text: isShort ? `?${asks}` : `? ${asks} to answer`, tone: 'ask' as const }] : []),
+    ...(queued && !isShort ? [{ text: `${queued} queued`, tone: 'queue' as const }] : []),
+  ]
+  // every label is shown whole or not at all: a cut label reads as noise, a dropped one is still on the map
+  const build = (showPast: boolean, nowText: string, showAhead: boolean, isShort: boolean) => {
+    const parts: GistPart[] = [brand, { text: '  ', tone: 'sep' }]
+    if (showPast && past) parts.push({ text: `✓ ${past}`, tone: 'past' }, { text: ' › ', tone: 'sep' })
+    if (nowText) parts.push({ text: `● ${nowText}`, tone: isBlocked ? 'blocked' : 'now' })
+    if (showAhead && ahead) parts.push({ text: ' › ', tone: 'sep' }, { text: `○ ${ahead}`, tone: 'next' })
+    for (const r of needs(isShort)) parts.push({ text: '  ', tone: 'sep' }, r)
+    return parts
   }
-  if (!fits()) past = ''
-  if (!fits()) ahead = ''
-  if (!fits()) now = clip(now, Math.max(4, room()))
-  const parts: GistPart[] = [brand, { text: '  ', tone: 'sep' }]
-  if (past) parts.push({ text: `✓ ${past}`, tone: 'past' }, { text: ' › ', tone: 'sep' })
-  if (now) parts.push({ text: `● ${now}`, tone: isBlocked ? 'blocked' : 'now' })
-  if (ahead) parts.push({ text: ' › ', tone: 'sep' }, { text: `○ ${ahead}`, tone: 'next' })
-  for (const r of right) parts.push({ text: '  ', tone: 'sep' }, r)
-  // last guard: never wider than the budget, cut from the active step's label
-  const over = parts.reduce((n, p) => n + glen(p.text), 0) - budget
-  if (over > 0) {
-    const i = parts.findIndex(p => p.tone === 'now' || p.tone === 'blocked')
-    if (i >= 0) parts[i] = { ...parts[i]!, text: clip(parts[i]!.text, Math.max(3, glen(parts[i]!.text) - over)) }
+  const size = (parts: GistPart[]) => parts.reduce((n, p) => n + glen(p.text), 0)
+  const tries: [boolean, string, boolean, boolean][] = [
+    [true, now, true, false],
+    [false, now, true, false],
+    [false, now, false, false],
+    [true, now, true, true],
+    [false, now, true, true],
+    [false, now, false, true],
+    [false, progress, false, true],
+    [false, '', false, true],
+  ]
+  for (const t of tries) {
+    const parts = build(...t)
+    if (size(parts) <= budget) return parts
   }
-  return parts
+  return [brand]
 }
 
 /** Tasks the board shows: the agent's list, plus user tasks it has not picked up yet. */
@@ -1266,7 +1301,7 @@ export const register: Register = on => {
     const incoming = await read($, incomingA)
     const parts = gist(map, asks, queued, budget, incoming?.text ?? null)
     const tone = {
-      brand: { color: 'cyan', bold: true },
+      brand: { color: GOLD, bold: true },
       past: { color: 'green', dim: true },
       now: { color: 'cyan', bold: true },
       blocked: { color: 'red', bold: true },
@@ -1281,15 +1316,18 @@ export const register: Register = on => {
     return (
       <Box>
         <Box flexShrink={0}>
-          <Button key="compass-crumb" plain label={parts[0]!.text} onPress={() => void togglePane($)} />
-          {parts.slice(1).map((p, i) => {
+          {parts.map((p, i) => {
             const t: { color?: string; bold?: boolean; dim?: boolean } = tone[p.tone]
+            // a Button draws one colour: the gold brand stays Text, the step it names is what you click
+            const isHandle = p.tone === 'now' || p.tone === 'blocked' || (p.tone === 'past' && !parts.some(x => x.tone === 'now' || x.tone === 'blocked'))
+            if (isHandle) return <Button key="compass-crumb" plain label={p.text} onPress={() => void togglePane($)} />
             return (
               <Text key={`g:${i}`} color={t.color} bold={t.bold} dimColor={t.dim} wrap="truncate-end">
                 {p.text}
               </Text>
             )
           })}
+          {!parts.some(x => x.tone === 'now' || x.tone === 'blocked' || x.tone === 'past') && <Button key="compass-crumb" plain dimColor label=" ▸" onPress={() => void togglePane($)} />}
         </Box>
         <Text dimColor>{'   '}</Text>
         {engine}
@@ -1357,13 +1395,34 @@ export const register: Register = on => {
       <Button key={`fold:${key}`} plain dimColor label={`${isOpen(key) ? '▾' : '▸'} ${label}`} onPress={() => toggleIn($, key)} />
     )
 
+    // a clickable label that wraps between words instead of being cut: the first row is the
+    // button, the rest follow under it, so every word stays readable
+    const wrapped = (key: string, text: string, room: number, onPress: () => unknown, opts: { dim?: boolean; indent?: number } = {}) => {
+      const [first = '', ...rest] = wordWrap(text, room)
+      return {
+        head: <Button key={key} plain dimColor={opts.dim} label={first} onPress={() => void onPress()} />,
+        tail: rest.length ? (
+          <Box key={`${key}:more`} flexDirection="column" paddingLeft={opts.indent ?? 2}>
+            {rest.map((r, i) => (
+              <Text key={`${key}:r${i}`} dimColor={opts.dim}>
+                {r}
+              </Text>
+            ))}
+          </Box>
+        ) : null,
+      }
+    }
+
     // ── header ──
     const header = (
       <Box flexDirection="column" key="head">
         <Box justifyContent="space-between">
-          <Text bold color="cyan" wrap="truncate-end">
-            ◈ {map?.goal ? clip(map.goal, width - 14) : 'compass'}
-          </Text>
+          <Box flexShrink={1}>
+            <Text bold wrap="wrap">
+              <Text color={GOLD}>◈ </Text>
+              <Text color="cyan">{map?.goal || 'compass'}</Text>
+            </Text>
+          </Box>
           <Box columnGap={1}>
             <Text dimColor>{isRefreshing ? '↻' : map ? ago(now - map.at) : ''}</Text>
             <Button
@@ -1454,6 +1513,7 @@ export const register: Register = on => {
       const why = (s.state === 'abandoned' || s.kind === 'decision') && s.why ? ` · ${s.why}` : ''
       const room = width - rail.length - 3 - (isNow ? 6 : 0)
       const label = s.kind === 'aside' ? `btw ${s.label}` : s.label
+      const node = wrapped(`node:${s.id}`, `${label}${why}`, room, select(s.id), { dim: s.state === 'done' || s.state === 'abandoned' || s.kind === 'aside', indent: rail.length + 2 })
       return (
         <Box flexDirection="column" key={`step:${s.id}`}>
           <Box>
@@ -1461,19 +1521,14 @@ export const register: Register = on => {
             <Text color={m.color} dimColor={m.dim} bold={isNow}>
               {m.glyph}{' '}
             </Text>
-            <Button
-              key={`node:${s.id}`}
-              plain
-              dimColor={s.state === 'done' || s.state === 'abandoned' || s.kind === 'aside'}
-              label={clip(`${label}${why}`, room)}
-              onPress={select(s.id)}
-            />
+            {node.head}
             {isNow && (
               <Text color={s.state === 'blocked' ? 'red' : 'cyan'} bold>
                 {' '}◀ now
               </Text>
             )}
           </Box>
+          {node.tail}
           {selected === s.id && detail(s.id, s.label, s.why, s.state)}
         </Box>
       )
@@ -1491,18 +1546,22 @@ export const register: Register = on => {
         const mk = STEP_MARK[m.state]
         const isUnfolded = isActive || isOpen(`m:${m.id}`)
         const count = m.steps.length
+        const msRow = wrapped(
+          `msbtn:${m.id}`,
+          `${m.label}${m.state === 'abandoned' && m.why ? ` · ${m.why}` : ''}${!isActive && count ? `  ${isUnfolded ? '▾' : `+${count}`}` : ''}`,
+          width - 3,
+          () => (isActive ? undefined : toggleIn($, `m:${m.id}`)),
+          { dim: m.state === 'done' || m.state === 'abandoned' || m.state === 'pending' },
+        )
         rows.push(
-          <Box key={`ms:${m.id}`}>
-            <Text color={mk.color} dimColor={mk.dim} bold>
-              {mk.glyph}{' '}
-            </Text>
-            <Button
-              key={`msbtn:${m.id}`}
-              plain
-              dimColor={m.state === 'done' || m.state === 'abandoned' || m.state === 'pending'}
-              label={clip(`${m.label}${m.state === 'abandoned' && m.why ? ` · ${m.why}` : ''}${!isActive && count ? `  ${isUnfolded ? '▾' : `+${count}`}` : ''}`, width - 3)}
-              onPress={() => (isActive ? undefined : toggleIn($, `m:${m.id}`))}
-            />
+          <Box key={`ms:${m.id}`} flexDirection="column">
+            <Box>
+              <Text color={mk.color} dimColor={mk.dim} bold>
+                {mk.glyph}{' '}
+              </Text>
+              {msRow.head}
+            </Box>
+            {msRow.tail}
           </Box>,
         )
         if (!isUnfolded) continue
@@ -1554,7 +1613,7 @@ export const register: Register = on => {
                       {c.hue}
                     </Text>
                   </Box>
-                  <Text wrap="truncate-end">{c.text}</Text>
+                  <Text wrap="wrap">{c.text}</Text>
                 </Box>
               ))}
             </Box>
@@ -1564,7 +1623,7 @@ export const register: Register = on => {
               <Text color="cyan" bold>
                 ●{' '}
               </Text>
-              <Text color="cyan" wrap="truncate-end">
+              <Text color="cyan" wrap="wrap">
                 {incoming.text}
               </Text>
               <Text dimColor> · charting</Text>
@@ -1583,43 +1642,45 @@ export const register: Register = on => {
             )
           ) : (
             <Box flexDirection="column">
-              <Text color="cyan" wrap="truncate-start">
-                {crumb(map, width)}
-              </Text>
-              {rule}
               {rows}
             </Box>
           )}
           {(q || board.now.length > 0) && rule}
           {q && (
-            <Box key="flow:q">
-              <Text color="yellow" bold>
-                ?{' '}
-              </Text>
-              <Button
-                key="flow:qbtn"
-                plain
-                label={clip(`Q${q.n} ${q.from ? `⇄${q.from} ` : ''}${q.title}${front.ask.length > 1 ? `  +${front.ask.length - 1} more` : ''}`, width - 2)}
-                onPress={async () => {
+            <Box key="flow:q" flexDirection="column">
+              {(() => {
+                const w = wrapped('flow:qbtn', `Q${q.n} ${q.from ? `⇄${q.from} ` : ''}${q.title}${front.ask.length > 1 ? `  +${front.ask.length - 1} more` : ''}`, width - 2, async () => {
                   await update($, selectedA, () => `g:${q.id}`)
                   await update($, tabA, () => 'grill')
-                }}
-              />
+                })
+                return [
+                  <Box key="flow:qrow">
+                    <Text color="yellow" bold>
+                      ?{' '}
+                    </Text>
+                    {w.head}
+                  </Box>,
+                  w.tail,
+                ]
+              })()}
             </Box>
           )}
           {board.now.length > 0 && (
-            <Box key="flow:t">
-              <Text color="cyan">☐ </Text>
-              <Button
-                key="flow:tbtn"
-                plain
-                label={clip(`now: ${board.now[0]!.from ? `⇄${board.now[0]!.from} ` : ''}${board.now[0]!.text}${board.next.length ? ` · next ${board.next.length}` : ''}${board.later.length ? ` · later ${board.later.length}` : ''}`, width - 2)}
-                onPress={() => update($, tabA, () => 'tasks')}
-              />
+            <Box key="flow:t" flexDirection="column">
+              {(() => {
+                const w = wrapped('flow:tbtn', `now: ${board.now[0]!.from ? `⇄${board.now[0]!.from} ` : ''}${board.now[0]!.text}${board.next.length ? ` · next ${board.next.length}` : ''}${board.later.length ? ` · later ${board.later.length}` : ''}`, width - 2, () => update($, tabA, () => 'tasks'))
+                return [
+                  <Box key="flow:trow">
+                    <Text color="cyan">☐ </Text>
+                    {w.head}
+                  </Box>,
+                  w.tail,
+                ]
+              })()}
             </Box>
           )}
           {step?.state === 'blocked' && <Text color="red">! waiting on you</Text>}
-          {steers.length > 0 && <Text dimColor wrap="truncate-end">↪ {steers[steers.length - 1]!.text}</Text>}
+          {steers.length > 0 && <Text dimColor wrap="wrap">↪ {steers[steers.length - 1]!.text}</Text>}
           {input('steer', '↪ steer the course…', 'steer', v => void steer($, v))}
         </Box>
       )
@@ -1631,18 +1692,18 @@ export const register: Register = on => {
         const color = isDone ? 'green' : t.lane === 'now' ? 'cyan' : undefined
         return (
           <Box flexDirection="column" key={`task:${t.id}`}>
-            <Box>
-              <Text color={color} dimColor={t.lane === 'later'}>
-                {glyph}{' '}
-              </Text>
-              <Button
-                key={`tbtn:${t.id}`}
-                plain
-                dimColor={isDone || t.lane === 'later'}
-                label={clip(`${t.by === 'user' ? '★ ' : ''}${t.from ? `⇄${t.from} ` : ''}${isDone ? `~${t.text}~` : t.text}${t.isQueued ? '  ⋯' : ''}`, width - 2)}
-                onPress={select(`t:${t.id}`)}
-              />
-            </Box>
+            {(() => {
+              const w = wrapped(`tbtn:${t.id}`, `${t.by === 'user' ? '★ ' : ''}${t.from ? `⇄${t.from} ` : ''}${isDone ? `~${t.text}~` : t.text}${t.isQueued ? '  ⋯' : ''}`, width - 2, select(`t:${t.id}`), { dim: isDone || t.lane === 'later' })
+              return [
+                <Box key={`trow:${t.id}`}>
+                  <Text color={color} dimColor={t.lane === 'later'}>
+                    {glyph}{' '}
+                  </Text>
+                  {w.head}
+                </Box>,
+                w.tail,
+              ]
+            })()}
             {selected === `t:${t.id}` && (
               <Box paddingLeft={2} columnGap={1} flexWrap="wrap" key={`tact:${t.id}`}>
                 {(['now', 'next', 'later', 'done'] as const)
@@ -1690,7 +1751,7 @@ export const register: Register = on => {
             />
             {picked && (
               <Box flexDirection="column" key="picked" borderStyle="round" borderDimColor paddingX={1}>
-                <Text wrap="truncate-end" bold>
+                <Text wrap="wrap" bold>
                   {picked.by === 'user' ? '★ yours' : picked.from ? `⇄ from ${picked.from}` : '◆ agent'} · {LANE_NAME[picked.lane]}
                 </Text>
                 <Text>{picked.text}</Text>
@@ -1768,10 +1829,10 @@ export const register: Register = on => {
       const lastLine = (name: string) => {
         const m = tally(name).last
         return m ? (
-          <Text dimColor wrap="truncate-end">
+          <Text dimColor wrap="wrap">
             {'  '}
             {m.dir === 'in' ? '◂ ' : '▸ '}
-            {clip(plain(m.text), width - 6)}
+            {leadOf(m.text, 80).lead}
           </Text>
         ) : null
       }
@@ -1792,7 +1853,7 @@ export const register: Register = on => {
               <Button key="peers-refresh" plain label="↻" onPress={() => void refreshPeers($)} />
             </Box>
           </Box>
-          {selfName ? <Text dimColor wrap="truncate-end">this session: {selfName}</Text> : null}
+          {selfName ? <Text dimColor wrap="wrap">this session: {selfName}</Text> : null}
           {!isRemote && <Text dimColor>local sessions only · run /remote-control to reach your other machines</Text>}
           {rule}
           {peers.length === 0 && others.length === 0 && art('chat', 'no other agents or sessions right now')}
@@ -1800,8 +1861,8 @@ export const register: Register = on => {
             <Box flexDirection="column" key={`peer:${p.id}`}>
               <Box>
                 <Text color={dot(p.status)}>● </Text>
-                <Button key={`peer:${p.name}`} plain label={clip(p.name, width - 18)} onPress={openThread(p.name)} />
-                <Text dimColor wrap="truncate-end">
+                <Button key={`peer:${p.name}`} plain label={p.name} onPress={openThread(p.name)} />
+                <Text dimColor wrap="wrap">
                   {' '}
                   {p.kind}
                   {p.status ? ` · ${p.status}` : ''}
@@ -1816,7 +1877,7 @@ export const register: Register = on => {
             <Box flexDirection="column" key={`peerx:${n}`}>
               <Box>
                 <Text dimColor>○ </Text>
-                <Button key={`peer:${n}`} plain dimColor label={clip(n, width - 14)} onPress={openThread(n)} />
+                <Button key={`peer:${n}`} plain dimColor label={n} onPress={openThread(n)} />
                 {counts(n)}
               </Box>
               {lastLine(n)}
@@ -1824,8 +1885,8 @@ export const register: Register = on => {
           ))}
           {sel && (
             <Box flexDirection="column" key="thread" borderStyle="round" borderColor="cyan" paddingX={1} marginTop={1}>
-              <Text color="cyan" bold wrap="truncate-end">
-                ⇄ {selfName ? `${clip(selfName, 18)} ⇄ ` : ''}
+              <Text color="cyan" bold wrap="wrap">
+                ⇄ {selfName ? `${selfName} ⇄ ` : ''}
                 {sel}
               </Text>
               {(() => {
@@ -1840,27 +1901,28 @@ export const register: Register = on => {
                   </Text>
                 )
               })()}
-              {thread.length ? <Text dimColor>history · click a line to expand</Text> : null}
+              {thread.some(m => leadOf(m.text).hasMore) ? <Text dimColor>▸ click a message to read it all</Text> : null}
               {thread.map(m => {
                 const key = `m:${sel}:${m.at}:${m.dir}`
                 const isFull = isOpen(key)
                 const isNew = m.dir === 'in' && m.at > (chatSeen[sel] ?? 0)
                 const arrow = m.dir === 'in' ? '◂ in ' : m.status === 'rejected' ? '✗ out' : '▸ out'
+                const { lead, hasMore } = leadOf(m.text)
+                const stamp = `${isNew ? '●' : ' '}${arrow} ${ago(now - m.at).padStart(4)} `
+                const w = wrapped(`b:${key}`, `${isFull ? plain(m.text) : lead}${hasMore ? (isFull ? ' ▾' : ' ▸') : ''}`, width - glen(stamp) - 2, () => (hasMore ? toggleIn($, key) : undefined), {
+                  dim: m.dir === 'out',
+                  indent: glen(stamp),
+                })
                 return (
                   <Box key={key} flexDirection="column">
                     <Box>
                       <Text color={m.dir === 'in' ? 'cyan' : m.status === 'rejected' ? 'red' : 'green'} bold>
-                        {isNew ? '●' : ' '}
-                        {arrow}{' '}
+                        {stamp.slice(0, -6)}
                       </Text>
-                      <Text dimColor>{ago(now - m.at).padStart(4)} </Text>
-                      <Button key={`b:${key}`} plain dimColor={m.dir === 'out'} label={`${isFull ? '▾' : '▸'} ${clip(plain(m.text), Math.max(10, width - 20))}`} onPress={() => toggleIn($, key)} />
+                      <Text dimColor>{stamp.slice(-6)}</Text>
+                      {w.head}
                     </Box>
-                    {isFull && (
-                      <Box paddingLeft={4}>
-                        <Text wrap="wrap">{m.text}</Text>
-                      </Box>
-                    )}
+                    {w.tail}
                   </Box>
                 )
               })}
@@ -1876,13 +1938,15 @@ export const register: Register = on => {
       const card = (q: CompassGrillQ) => (
         <Box key={`card:${q.id}`} flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1}>
           <Box justifyContent="space-between">
-            <Text color="yellow" bold wrap="truncate-end">
-              ? Q{q.n} · {clip(q.title, inner - 14)}
-            </Text>
+            <Box flexShrink={1}>
+              <Text color="yellow" bold wrap="wrap">
+                ? Q{q.n} · {q.title}
+              </Text>
+            </Box>
             <Text dimColor>{q.mode}</Text>
           </Box>
           {q.topic || q.from ? (
-            <Text wrap="truncate-end">
+            <Text wrap="wrap">
               {q.from ? <Text color="cyan">⇄ {q.from} </Text> : null}
               <Text dimColor>{q.topic}</Text>
             </Text>
@@ -1906,9 +1970,17 @@ export const register: Register = on => {
               )
             })}
             {q.rec && (
-              <Box marginTop={q.options.length ? 1 : 0}>
-                <Text color="green">➡ </Text>
-                <Button key={`grec:${q.id}`} plain label={clip(q.rec, inner - 3)} onPress={() => void answerGrill($, q.id, q.rec)} />
+              <Box marginTop={q.options.length ? 1 : 0} flexDirection="column">
+                {(() => {
+                  const w = wrapped(`grec:${q.id}`, q.rec, inner - 3, () => answerGrill($, q.id, q.rec))
+                  return [
+                    <Box key={`grecrow:${q.id}`}>
+                      <Text color="green">➡ </Text>
+                      {w.head}
+                    </Box>,
+                    w.tail,
+                  ]
+                })()}
               </Box>
             )}
           </Box>
@@ -1925,11 +1997,19 @@ export const register: Register = on => {
         </Box>
       )
       const collapsed = (q: CompassGrillQ, mark: string, color: string | undefined, tail: string) => (
-        <Box key={`gq:${q.id}`}>
-          <Text color={color} bold>
-            {mark}{' '}
-          </Text>
-          <Button key={`gsel:${q.id}`} plain dimColor={q.state !== 'open'} label={clip(`Q${q.n} ${q.title}${tail}`, width - 2)} onPress={() => update($, selectedA, () => `g:${q.id}`)} />
+        <Box key={`gq:${q.id}`} flexDirection="column">
+          {(() => {
+            const w = wrapped(`gsel:${q.id}`, `Q${q.n} ${q.title}${tail}`, width - 2, () => update($, selectedA, () => `g:${q.id}`), { dim: q.state !== 'open' })
+            return [
+              <Box key={`gqrow:${q.id}`}>
+                <Text color={color} bold>
+                  {mark}{' '}
+                </Text>
+                {w.head}
+              </Box>,
+              w.tail,
+            ]
+          })()}
         </Box>
       )
       const pending = actions.some(a => a.status === 'queued' && a.kind === 'turn')
@@ -1993,10 +2073,10 @@ export const register: Register = on => {
               {isOpen('gsettled') &&
                 front.settled.map(q => (
                   <Box key={`gs:${q.id}`} flexDirection="column">
-                    <Text wrap="truncate-end">
+                    <Text wrap="wrap">
                       <Text color="magenta">◆ </Text>Q{q.n} {q.title}
                     </Text>
-                    <Text dimColor wrap="truncate-end">
+                    <Text dimColor wrap="wrap">
                       {'  ⇒ '}
                       {q.answer}
                     </Text>
@@ -2078,10 +2158,10 @@ export const register: Register = on => {
           ))}
           <Box marginTop={1} flexDirection="column">
             <Text dimColor>{'┄'.repeat(width)}</Text>
-            <Text dimColor wrap="truncate-end">
+            <Text dimColor wrap="wrap">
               ◈ compass itself: {own.calls} map calls · {kfmt(own.input + own.cacheWrite)} in · {kfmt(own.cacheRead)} cached · {kfmt(own.output)} out
             </Text>
-            <Text dimColor wrap="truncate-end">
+            <Text dimColor wrap="wrap">
               {own.calls ? `≈ ${Math.round((own.cacheRead / Math.max(1, own.input + own.cacheRead + own.cacheWrite)) * 100)}% served from cache` : 'no map calls yet'}
             </Text>
           </Box>
@@ -2118,7 +2198,7 @@ export const register: Register = on => {
                 <Text color="magenta" dimColor>
                   ◌{' '}
                 </Text>
-                <Text dimColor wrap="truncate-end">
+                <Text dimColor wrap="wrap">
                   {b}
                 </Text>
               </Box>
@@ -2141,7 +2221,7 @@ export const register: Register = on => {
               {ROUTE_GLYPH[a.status]}{' '}
             </Text>
             <Box flexGrow={1}>
-              <Text wrap="truncate-end" dimColor={a.status === 'sent'}>
+              <Text wrap="wrap" dimColor={a.status === 'sent'}>
                 {a.label}
               </Text>
             </Box>
