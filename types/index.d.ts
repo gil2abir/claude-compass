@@ -113,6 +113,8 @@ declare module 'claude-code' {
       chat: CompassChatMsg[]
       /** per peer: when its thread was last open; inbound after it counts as new */
       chatSeen: Record<string, number>
+      /** bumped each second while an outbox item counts down, so the countdown redraws */
+      tick: number
       /** the request a turn just started on, until a chart made after it lands */
       incoming: { text: string; at: number } | null
       steers: CompassSteer[]

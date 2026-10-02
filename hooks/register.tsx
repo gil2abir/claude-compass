@@ -34,8 +34,8 @@ const PAST_KEEP = 2
 const FUTURE_KEEP = 3
 const GRILL_TOOL = 'mcp__compass__grill'
 const GOLD = '#E8B53A'
-/** How long a new item waits in the outbox, while idle, so it can still be reordered or removed. */
-const SEND_GRACE_MS = 5000
+/** How long every new item waits in the outbox, so it can still be reordered or removed. */
+const SEND_GRACE_MS = 8000
 
 const EMPTY_STATS: CompassStats = {
   startedAt: 0,
@@ -66,6 +66,7 @@ const selfNameA = atom({ plugin: 'compass', key: 'selfName' } as const, '')
 const remoteA = atom({ plugin: 'compass', key: 'isRemoteOnline' } as const, false)
 const chatA = atom({ plugin: 'compass', key: 'chat' } as const, [])
 const chatSeenA = atom({ plugin: 'compass', key: 'chatSeen' } as const, {})
+const tickA = atom({ plugin: 'compass', key: 'tick' } as const, 0)
 const incomingA = atom({ plugin: 'compass', key: 'incoming' } as const, null)
 const steersA = atom({ plugin: 'compass', key: 'steers' } as const, [])
 const btwA = atom({ plugin: 'compass', key: 'btw' } as const, [])
@@ -805,14 +806,13 @@ async function enqueue($: EngineInterface, kind: CompassAction['kind'], label: s
   const a: CompassAction = { id: `a${Date.now()}${Math.floor(Math.random() * 1e4)}`, kind, label: clip(label.trim() || t, 80), text: t, status: 'queued', route: '', reason: '', at: await $.clock.now(), ref, prev }
   await update($, actionsA, list => [...list, a].slice(-40))
   const isBusy = await read($, busyA)
-  if (kind === 'steer' && isBusy) return appendNow($, a)
   if (kind === 'note') {
     await setAction($, a.id, { route: 'next prompt' })
-    $.ui.toast(`⋯ queued for your next prompt · ${clip(a.label, 44)} · ⚡ in the pane sends it now`)
+    $.ui.toast(`⋯ queued for your next prompt · ${clip(a.label, 44)}`)
     return
   }
-  await setAction($, a.id, { route: 'new turn' })
-  $.ui.toast(isBusy ? `⋯ queued · goes out when this turn ends · ${clip(a.label, 40)}` : `⋯ sending in ${SEND_GRACE_MS / 1000}s as a new turn · ${clip(a.label, 40)} · ✕ in the pane cancels`)
+  await setAction($, a.id, { route: kind === 'steer' && isBusy ? 'running turn' : 'new turn' })
+  $.ui.toast(`⋯ sends in ${SEND_GRACE_MS / 1000}s · ${clip(a.label, 44)} · ✕ in the pane cancels`)
 }
 
 /** ⚡ send now: into the running turn, or as a turn of its own when idle. */
@@ -865,9 +865,14 @@ async function removeAction($: EngineInterface, id: string) {
 
 /** The poller's job: queued steers and turns go out together once the session is idle. */
 async function flushOutbox($: EngineInterface) {
-  if (await read($, busyA)) return
   const t = await $.clock.now()
-  const due = (await read($, actionsA)).filter(a => a.status === 'queued' && a.kind !== 'note' && t - a.at >= SEND_GRACE_MS)
+  const waiting = (await read($, actionsA)).filter(a => a.status === 'queued' && a.kind !== 'note')
+  if (waiting.some(a => t - a.at < SEND_GRACE_MS)) await update($, tickA, n => n + 1)
+  if (await read($, busyA)) {
+    for (const a of waiting) if (a.route === 'running turn' && t - a.at >= SEND_GRACE_MS) await appendNow($, a)
+    return
+  }
+  const due = waiting.filter(a => t - a.at >= SEND_GRACE_MS)
   if (!due.length) return
   const ids = new Set(due.map(a => a.id))
   await update($, actionsA, list => list.map((a): CompassAction => (ids.has(a.id) ? { ...a, status: 'sent', route: 'new turn', at: Date.now() } : a)))
@@ -1228,6 +1233,13 @@ export const register: Register = on => {
     return sent
   })
 
+  // the pane's window moved: redraw so the outbox stays pinned to its bottom
+  on('ui.scroll', { requestId: PANE }, async ($, e, next) => {
+    const moved = await next(e)
+    await update($, tickA, n => n + 1)
+    return moved
+  })
+
   // the board posts moves and selections; its data is input to validate
   on('ui.message', async ($, e, next) => {
     if (e.element === 'compass-crumb') {
@@ -1324,7 +1336,8 @@ export const register: Register = on => {
   // The grilling guide and the user's steering ride in the system prompt, so they survive compaction.
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
-    const steers = await read($, steersA)
+    const held = new Set((await read($, actionsA)).filter(a => a.status === 'queued' && a.kind === 'steer').map(a => a.label))
+    const steers = (await read($, steersA)).filter(x => !held.has(x.text))
     const steering = steers.length
       ? `\n\n# Compass steering\nThe user steered this session via the compass pane. Honor these directives (newest wins):\n${steers.slice(-6).map(s => `- ${s.text}`).join('\n')}`
       : ''
@@ -2255,98 +2268,108 @@ export const register: Register = on => {
       )
     }
 
-    // the outbox: everything the pane will put into the session, grouped by when it goes,
-    // each reorderable, sendable now or removable; then what already went, folded
-    const queuedTurn = actions.filter(a => a.status === 'queued' && queueOf(a) === 'turn')
-    const queuedPrompt = actions.filter(a => a.status === 'queued' && queueOf(a) === 'prompt')
-    const done = actions.filter(a => a.status !== 'queued' && now - a.at < 600_000).reverse()
-    const KIND = { steer: '↪', turn: '✉', note: '☐' } as const
-    const outRow = (a: CompassAction, i: number, n: number) => {
-      const key = `ob:${a.id}`
-      const isPreview = isOpen(key)
-      const label = wrapped(`obl:${a.id}`, `${KIND[a.kind]} ${a.label}`, width - 15, () => toggleIn($, key), { indent: 3 })
-      return (
-        <Box key={key} flexDirection="column">
-          <Box>
-            <Text color="yellow" bold>
-              {`${i + 1}`.padStart(2)}{' '}
-            </Text>
-            <Box flexGrow={1}>{label.head}</Box>
-            <Box columnGap={1} flexShrink={0}>
-              <Button key={`up:${a.id}`} plain dimColor label="▲" onPress={() => void moveAction($, a.id, -1)} />
-              <Button key={`down:${a.id}`} plain dimColor label="▼" onPress={() => void moveAction($, a.id, 1)} />
-              <Button key={`force:${a.id}`} plain label="⚡" onPress={() => void forceAction($, a.id)} />
-              <Button key={`drop:${a.id}`} plain label="✕" onPress={() => void removeAction($, a.id)} />
-            </Box>
-          </Box>
-          {label.tail}
-          {isPreview && (
-            <Box paddingLeft={3} flexDirection="column">
-              <Text dimColor>sends exactly:</Text>
-              <Text wrap="wrap">{a.text}</Text>
-            </Box>
-          )}
-        </Box>
-      )
-    }
-    const hue = { queued: 'yellow', sent: 'green', rejected: 'red' } as const
-    const isQueueEmpty = queuedTurn.length === 0 && queuedPrompt.length === 0
-    const activity = (
-      <Box flexDirection="column" key="activity">
-        <Text wrap="wrap">
-          <Text color={isQueueEmpty ? undefined : 'yellow'} dimColor={isQueueEmpty} bold={!isQueueEmpty}>
-            ⇣ outbox
-          </Text>
-          <Text dimColor>
-            {isQueueEmpty
-              ? ' · empty · steers, tasks and answers you make here wait here first'
-              : ` · ${queuedTurn.length + queuedPrompt.length} waiting to go into the session`}
-          </Text>
+    // the outbox, pinned to the bottom of the pane: what goes into the session and when,
+    // one row each; every row is exactly one line, so its height is known
+    await read($, tickA)
+    const queued = actions.filter(a => a.status === 'queued')
+    const sent = actions.filter(a => a.status !== 'queued' && now - a.at < 600_000).reverse()
+    const WHEN = { 'running turn': ['↪', 'cyan'], 'new turn': ['⏭', 'yellow'], 'next prompt': ['✎', 'magenta'], '': ['⋯', 'yellow'] } as const
+    const pad = <Text key="pad" wrap="truncate-end">{' '.repeat(width)}</Text>
+    const footRows: ReturnType<typeof h>[] = []
+    footRows.push(
+      <Text key="f:rule" dimColor>
+        {'┄'.repeat(width)}
+      </Text>,
+    )
+    const groups = (['running turn', 'new turn', 'next prompt'] as const).filter(r => queued.some(a => a.route === r))
+    const groupName = { 'running turn': 'into this turn', 'new turn': isBusy ? 'after this turn' : 'as a new turn', 'next prompt': 'with your next prompt' } as const
+    const headLen = 12 + groups.reduce((n, r) => n + 4 + glen(groupName[r]), 0) + (sent.length ? 6 : 0)
+    const isLegendShort = headLen > width
+    footRows.push(
+      <Box key="f:head">
+        <Text bold={queued.length > 0} color={queued.length ? 'yellow' : undefined} dimColor={!queued.length}>
+          ⇣ {queued.length ? `${queued.length} queued` : 'queue empty'}
         </Text>
-        {queuedTurn.length > 0 && (
-          <Box flexDirection="column">
-            <Text bold wrap="wrap">
-              <Text color="yellow">⏭ </Text>
-              {isBusy ? 'when this turn ends' : `in a few seconds`}
-              <Text dimColor> · one new turn, in this order</Text>
+        {groups.map(r => (
+          <Text key={`f:g:${r}`} dimColor wrap="truncate-end">
+            {'  '}
+            <Text color={WHEN[r][1]}>{WHEN[r][0]}</Text>
+            {isLegendShort ? queued.filter(a => a.route === r).length : ` ${groupName[r]}`}
+          </Text>
+        ))}
+        <Box flexGrow={1} />
+        {sent.length > 0 && <Button key="fold:activity" plain dimColor label={`${isOpen('activity') ? '▾' : '▸'} ✓${sent.length}`} onPress={() => toggleIn($, 'activity')} />}
+        {pad}
+      </Box>,
+    )
+    for (const r of groups) {
+      const list = queued.filter(a => a.route === r)
+      list.forEach((a, i) => {
+        const left = Math.max(0, Math.ceil((a.at + SEND_GRACE_MS - now) / 1000))
+        const clock = r !== 'next prompt' && left > 0 ? `${left}s ` : ''
+        const ctl = (list.length > 1 ? 4 : 0) + 4
+        const lines = wordWrap(a.label, Math.max(8, width - 2 - glen(clock) - ctl - 1))
+        const isPreview = isOpen(`ob:${a.id}`)
+        footRows.push(
+          <Box key={`f:${a.id}`}>
+            <Text color={WHEN[r][1]} bold>
+              {WHEN[r][0]}{' '}
             </Text>
-            {queuedTurn.map((a, i) => outRow(a, i, queuedTurn.length))}
-          </Box>
-        )}
-        {queuedPrompt.length > 0 && (
-          <Box flexDirection="column" marginTop={queuedTurn.length ? 1 : 0}>
-            <Text bold wrap="wrap">
-              <Text color="yellow">✎ </Text>
-              with your next prompt
-              <Text dimColor> · added as context</Text>
-            </Text>
-            {queuedPrompt.map((a, i) => outRow(a, i, queuedPrompt.length))}
-          </Box>
-        )}
-        {(queuedTurn.length > 0 || queuedPrompt.length > 0) && <Text dimColor>↪ steer · ✉ message · ☐ task — click to preview · ▲▼ order · ⚡ now · ✕ remove</Text>}
-        {done.length > 0 &&
-          fold(
-            'activity',
-            `✓ ${done.filter(a => a.status === 'sent').length} sent${done.some(a => a.status === 'rejected') ? ` · ✗ ${done.filter(a => a.status === 'rejected').length} failed` : ''} · last 10m`,
-          )}
-        {isOpen('activity') &&
-          done.map(a => (
-            <Box key={`act:${a.id}`}>
-              <Text color={hue[a.status]} bold>
-                {ROUTE_GLYPH[a.status]}{' '}
+            {clock ? <Text dimColor>{clock}</Text> : null}
+            <Button key={`obl:${a.id}`} plain dimColor={r === 'next prompt'} label={lines[0] ?? ''} onPress={() => toggleIn($, `ob:${a.id}`)} />
+            <Box flexGrow={1} />
+            {list.length > 1 && <Button key={`up:${a.id}`} plain dimColor label=" ▲" onPress={() => void moveAction($, a.id, -1)} />}
+            {list.length > 1 && <Button key={`down:${a.id}`} plain dimColor label=" ▼" onPress={() => void moveAction($, a.id, 1)} />}
+            <Button key={`force:${a.id}`} plain label=" ⚡" onPress={() => void forceAction($, a.id)} />
+            <Button key={`drop:${a.id}`} plain label=" ✕" onPress={() => void removeAction($, a.id)} />
+            {pad}
+          </Box>,
+        )
+        lines.slice(1).forEach((l, j) =>
+          footRows.push(
+            <Box key={`f:${a.id}:${j}`}>
+              <Text>
+                {'  '}
+                {l}
               </Text>
-              <Box flexGrow={1} flexShrink={1}>
-                <Text wrap="wrap" dimColor={a.status === 'sent'}>
-                  {a.label}
+              {pad}
+            </Box>,
+          ),
+        )
+        if (isPreview)
+          wordWrap(a.text, width - 4).forEach((l, j) =>
+            footRows.push(
+              <Box key={`f:${a.id}:p${j}`}>
+                <Text dimColor>
+                  {'  │ '}
+                  {l}
                 </Text>
-              </Box>
-              <Text dimColor wrap="wrap">
-                {' '}
-                {a.status === 'sent' ? `${a.route} · ${ago(now - a.at)}` : a.reason}
-              </Text>
-            </Box>
-          ))}
-        {rule}
+                {pad}
+              </Box>,
+            ),
+          )
+        void i
+      })
+    }
+    if (isOpen('activity'))
+      for (const a of sent.slice(0, 6)) {
+        const tail = a.status === 'sent' ? ` ${ago(now - a.at)}` : ' ✗'
+        footRows.push(
+          <Box key={`f:s:${a.id}`}>
+            <Text color={a.status === 'sent' ? 'green' : 'red'}>{a.status === 'sent' ? '✓ ' : '✗ '}</Text>
+            <Text dimColor>{wordWrap(a.label, Math.max(8, width - 3 - glen(tail)))[0]}</Text>
+            <Box flexGrow={1} />
+            <Text dimColor>{tail}</Text>
+            {pad}
+          </Box>,
+        )
+      }
+    const footH = footRows.length
+    const scroll = e.props.scroll
+    const footTop = Math.max(0, scroll.offset + scroll.bodyRows - footH)
+    const activity = (
+      <Box key="activity" position="absolute" top={footTop} left={0} width={width} flexDirection="column" overflow="hidden">
+        {footRows}
       </Box>
     )
 
@@ -2377,16 +2400,18 @@ export const register: Register = on => {
     )
 
     return (
-      <Box flexDirection="column" width={width}>
-        {header}
-        {sync}
+      <Box flexDirection="column" width={width} minHeight={e.props.scroll.bodyRows}>
+        <Box flexDirection="column" paddingBottom={footH}>
+          {header}
+          {sync}
+          {body}
+          {lastError && (
+            <Text color="yellow" dimColor>
+              △ {lastError}
+            </Text>
+          )}
+        </Box>
         {activity}
-        {body}
-        {lastError && (
-          <Text color="yellow" dimColor>
-            △ {lastError}
-          </Text>
-        )}
       </Box>
     )
   })
