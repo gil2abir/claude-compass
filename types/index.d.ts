@@ -24,7 +24,15 @@ export type CompassMap = {
   at: number
   /** completed turns the chart was made from: fewer than stats.turns means it is behind */
   turns?: number
+  /** the most plausible other trajectory from now, when the last turns hint the work could diverge */
+  alt?: CompassAlt | null
+  /** what the user picked at the fork, until the next chart */
+  altPick?: 'main' | 'branch'
+  /** alternatives the user turned down: not offered again */
+  declined?: string[]
 }
+
+export type CompassAlt = { label: string; why: string; steps: string[] }
 
 /**
  * One node of the grilling design tree (mattpocock/skills `grilling`).

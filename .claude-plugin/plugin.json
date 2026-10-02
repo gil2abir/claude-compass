@@ -1,6 +1,6 @@
 {
   "name": "compass",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "A live map of your Claude Code session: a git-style flow chart, a drag-and-drop task board, async grill questions, agent chat, stats and recap, in a pane you can steer from.",
   "author": {
     "name": "gil2abir"
