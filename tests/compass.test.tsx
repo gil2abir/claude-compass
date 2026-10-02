@@ -126,9 +126,10 @@ test('the hint line carries a clickable compass that opens the pane', async ($, 
     return { value: { isPlaced: true } } as never
   })
   const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', component: 'PromptHint', props: { isDraft: false, isWorking: false, hint: '? for shortcuts' } })
-  expect(await ui.find({ text: /^◈ compass$/ })).toBeDefined()
-  expect((await ui.find({ text: /^◈ compass$/ }))?.props?.color).toBe('#E8B53A')
-  await ui.press({ key: 'compass-crumb' })
+  const brand = await ui.find({ key: 'compass-crumb' })
+  expect(brand?.type).toBe('Client')
+  await ui.pointer({ type: 'down', x: 2, y: 0, button: 'left', in: 'compass-crumb' })
+  await ui.pointer({ type: 'up', x: 2, y: 0, button: 'left', in: 'compass-crumb' })
   expect(opened).toBe(1)
   await ui.unmount()
 })

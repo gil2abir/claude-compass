@@ -1189,6 +1189,10 @@ export const register: Register = on => {
 
   // the board posts moves and selections; its data is input to validate
   on('ui.message', async ($, e, next) => {
+    if (e.element === 'compass-crumb') {
+      if ((e.data as { type?: unknown } | undefined)?.type === 'open') await togglePane($)
+      return {}
+    }
     if (e.element !== 'board') return next(e)
     const d = (e.data ?? {}) as { type?: unknown; id?: unknown; lane?: unknown }
     if (typeof d.id !== 'string') return {}
@@ -1289,7 +1293,9 @@ export const register: Register = on => {
   // ── the clickable compass in the hint line under the prompt ──
 
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
-    const { Box, Button, Text } = $.ui.resolve(e)
+    const els = $.ui.resolve(e)
+    const { Box, Button, Text } = els
+    const Client = 'Client' in els ? els.Client : null
     const stored = await read($, mapA)
     const map = isCurrent(stored) ? stored : null
     const asks = frontierOf(await read($, grillA)).ask.length
@@ -1316,18 +1322,20 @@ export const register: Register = on => {
     return (
       <Box>
         <Box flexShrink={0}>
-          {parts.map((p, i) => {
+          {/* a Button draws one engine colour: where a Client can be drawn, the gold brand is one and takes the click */}
+          {Client ? (
+            <Client key="compass-crumb" module="./brand.tsx" props={{ color: GOLD }} />
+          ) : (
+            <Button key="compass-crumb" plain label={parts[0]!.text} onPress={() => void togglePane($)} />
+          )}
+          {parts.slice(1).map((p, i) => {
             const t: { color?: string; bold?: boolean; dim?: boolean } = tone[p.tone]
-            // a Button draws one colour: the gold brand stays Text, the step it names is what you click
-            const isHandle = p.tone === 'now' || p.tone === 'blocked' || (p.tone === 'past' && !parts.some(x => x.tone === 'now' || x.tone === 'blocked'))
-            if (isHandle) return <Button key="compass-crumb" plain label={p.text} onPress={() => void togglePane($)} />
             return (
               <Text key={`g:${i}`} color={t.color} bold={t.bold} dimColor={t.dim} wrap="truncate-end">
                 {p.text}
               </Text>
             )
           })}
-          {!parts.some(x => x.tone === 'now' || x.tone === 'blocked' || x.tone === 'past') && <Button key="compass-crumb" plain dimColor label=" ▸" onPress={() => void togglePane($)} />}
         </Box>
         <Text dimColor>{'   '}</Text>
         {engine}
