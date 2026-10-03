@@ -2,9 +2,9 @@
 
 <p align="center"><b>Watch your Claude Code session think. Steer it while it works.</b></p>
 
-<p align="center"><img src="docs/demo.gif" alt="compass beside a Claude Code session: the sea chart, the plan as live milestones, Claude's questions in the grill, the outbox, a steer landing on the chart" width="900"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/gil2abir/claude-compass/media/demo.gif" alt="compass beside a Claude Code session: the sea chart, the plan as live milestones, Claude's questions in the grill, the live feed of tool calls, a steer landing on the chart" width="900"></p>
 
-<p align="center"><a href="docs/demo.mp4">Full-quality video (MP4)</a> · <a href="#install">Install</a> · <a href="#what-compass-reads-sends-runs-and-stores">What it can touch</a></p>
+<p align="center"><a href="https://raw.githubusercontent.com/gil2abir/claude-compass/media/demo.mp4">Full-quality video (MP4)</a> · <a href="#install">Install</a> · <a href="#what-compass-reads-sends-runs-and-stores">What it can touch</a></p>
 
 Give Claude a real task and it disappears for a few minutes. It reads files, makes a plan in its head, picks libraries, writes code, runs tests. You find out what it decided when it stops, and by then it has made a dozen calls you would have made differently.
 
@@ -12,13 +12,15 @@ compass is a mod that opens a pane next to the transcript and keeps it current w
 
 **You see the plan as it stands right now.** Milestones and steps, drawn as a flow chart with a marker on *now*, what is done, what is next, and where the work forked. It's redrawn as the session moves, so the chart shows the session as it is now, not the plan from twenty minutes ago.
 
+**You see what it's doing this second.** The live tab lists every tool call as it happens: the shell command, the file being written, the search, the monitor ticking away in the background, each with its result and how long it took. A sparkline shows the last ten minutes of activity, and the chart's current and next step sit above it, so you can read the work and where it's going on one screen. The flow tab keeps a two-line strip of whatever is running right now.
+
 **Claude asks, and the work doesn't stop.** Design choices land in the grill tab with Claude's pick already filled in. Click an option, type your own answer, or park the question and let Claude go with its recommendation. Your answers go back as one batch, and the next round of questions picks up from them.
 
 **You can steer without hitting Esc.** Type one sentence into the steer box, drag a task to DOING, add one of your own, or click a step to skip it. It lands in the running turn, and the chart redraws to show it took.
 
 **Nothing goes in blind.** Everything the pane sends sits in an outbox for 8 seconds. Click it to read the exact text Claude will get, reorder it, send it now, or cancel it.
 
-It costs one extra model call per update, which reuses the session's prompt cache. The stats tab shows exactly how much compass itself used.
+The chart costs one extra model call per update, which reuses the session's prompt cache; the live tab costs nothing, it reads the tool calls as they pass. The stats tab shows exactly how much compass itself used.
 
 It earns its keep on the long ones: a feature that spans a dozen files, a refactor with judgment calls in it, a planning session where you want the decisions out on the table instead of buried in the scrollback. For a two-line fix you won't miss it.
 
@@ -47,6 +49,7 @@ Pinned to the bottom of the pane, the **outbox**: everything the pane will put i
 | Tab | What it shows |
 | --- | --- |
 | `├ flow` | The session's milestones (numbered `M1`…, each with its own steps bar, overall progress on top), drawn as a git-style flow chart: finished milestones folded, a fisheye around **now**, dead ends and side branches, decisions. Click a step for **go / skip / later / retry**. `key` explains every mark. When the last turns show the work could go another way, the active milestone forks: **as planned** on the left, one **branch** on the right (`⑂ 2 ways` under the prompt). Once you pick a side, that fork (either side of it, reworded or reversed) isn't offered again, even while the work waits on an event or a decision. `▶ keep this` stays the course; `⤴ take this` steers the session there and redraws the flow at once (✕ in the outbox undoes it before it's sent). |
+| `↯ live` | Every tool call as it happens, newest on top: a spinner while it runs, `✓` / `✗` when it returns, how long it took; shells, monitors and agents started in the background stay as `◌ bg` until their notification comes back (or Claude stops them, `■`), and calls made inside a subagent are marked `↳`. On top: the chart's **now** and **next** step, counts (running, background, done, failed, calls per minute) and a sparkline of the last 10 minutes. The same running strip sits at the top of the flow tab, with `↯ live ▸` to jump here. Compass's own calls are left out. |
 | `☑ tasks` | A Jira-style board: DOING (limit 3), TO DO, DONE, BACKLOG. Drag cards between lanes, or click one for move buttons. Add your own tasks; the agent takes them next turn. |
 | `? grill` | A decision radar. Questions that need you land here as the session moves: Claude posts them while planning or at a choice, and after every turn compass looks for new goals, ideas, trade-offs and effects down the road you should decide or know about. Each says whether work waits on it (`⏸ blocking`) or goes on meanwhile (`▶`). Answer any, in any order, when you like (options, free text, or `?` for a follow-up); `⏸ park` one to let the work go on with Claude's recommendation; `✕` to drop it; bring parked ones back any time. The session hears every choice, the chart settles questions the conversation already answered, and the flow tab mirrors it all in a **decisions** block (waits on you · open while work goes on · answered · parked). |
 | `⇄ chat` | Other Claude sessions and agents (via `ListAgents`) and the Remote Control indicator. Each agent shows `● N new`, `◂in ▸out` counts and its last message; click one for a summary and its history, one line per message (`◂ in` / `▸ out`, age, first sentence), click a line to read it all. Messages the session's Claude sends with SendMessage are recorded too. |
@@ -76,13 +79,13 @@ A mod runs on your machine with the same access Claude Code has. Read the source
 **Tools it calls itself.** `ListAgents`, to list your other sessions and agents in the chat tab (when the pane opens and every 15 s while the chat tab is shown), and `SendMessage` (through `session.send`) when you send a message from the chat tab. It registers one tool of its own, `grill`, which the agent uses to post questions; compass's `tool.call` hook answers that tool and no other.
 
 **Hooks, and what each does.** All pass the event on unchanged unless noted:
-- `tool.call` (every tool): counts tools and errors for the stats tab, notes edited files, reads TodoWrite/TaskCreate for the task board, reads ListAgents results for the chat tab. Answers only its own `grill` tool.
+- `tool.call` (every tool): records the call's start and end for the live tab (tool name, a few words of its input, status, duration), counts tools and errors for the stats tab, notes edited files, reads TodoWrite/TaskCreate for the task board, reads ListAgents results for the chat tab. Answers only its own `grill` tool.
 - `command.run`: `/compass` is compass's own command (it answers it); `/btw` is recorded as a side question and passed on.
 - `prompt.submit`: adds your queued "with your next prompt" notes as context; records `/btw`.
 - `prompt.compose`: adds the grilling guide and the steers you sent to the system prompt.
 - `session.send` / `session.receive`: records chat messages to and from other sessions.
 - `session.start` / `session.end`, `turn.start` / `turn.complete`: keep the chart current; `/clear` starts the compass over.
-- `ui.render`, `ui.message`, `ui.scroll`: draw the pane and the row under the prompt.
+- `ui.render`, `ui.message`, `ui.scroll`: draw the pane and the row under the prompt. On transcript rows (`UserMessage`) it only reads a background task's notification to close its live-tab row, and draws nothing.
 
 **What it reads.** The session's messages and usage (`session.messages`, `session.usage`) for the chart and the stats. It reads no files, no environment variables and no credentials.
 
