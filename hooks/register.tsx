@@ -11,6 +11,7 @@ import type {
   CompassLane,
   CompassMap,
   CompassMilestone,
+  CompassPulse,
   CompassState,
   CompassStats,
   CompassStep,
@@ -268,10 +269,13 @@ const unfoldedA = atom({ plugin: 'compass', key: 'unfolded' } as const, [])
 const refreshingA = atom({ plugin: 'compass', key: 'isRefreshing' } as const, false)
 const busyA = atom({ plugin: 'compass', key: 'isBusy' } as const, false)
 const errorA = atom({ plugin: 'compass', key: 'lastError' } as const, null)
+const liveA = atom({ plugin: 'compass', key: 'live' } as const, [])
+const LIVE_KEEP = 200
 
 // Text-presentation symbols only (no emoji), one per tab subject.
 const TABS: { id: CompassTab; icon: string; label: string }[] = [
   { id: 'flow', icon: '├', label: 'flow' },
+  { id: 'live', icon: '↯', label: 'live' },
   { id: 'tasks', icon: '☑', label: 'tasks' },
   { id: 'grill', icon: '?', label: 'grill' },
   { id: 'chat', icon: '⇄', label: 'chat' },
@@ -301,6 +305,7 @@ const LEGEND: { glyph: string; color?: string; dim?: boolean; hue: string; text:
 // Empty-state art, one per tab subject.
 const ART: Record<CompassTab, string[]> = {
   flow: ['      N', '   ╲  │  ╱', ' W ── ◈ ── E', '   ╱  │  ╲', '      S'],
+  live: ['  ▁▂▅▂▁▇▁▃▁▁▆▂', '  ─────┼──────', '       now'],
   tasks: ['  ┌───────────┐', '  │ ☑ ─────── │', '  │ ☐ ─────   │', '  │ ☐ ────────│', '  └───────────┘'],
   grill: ['     ╭───╮', '  ┌──┤ ? ├──┐', '  ▼  ╰───╯  ▼', '  A   ➡     B'],
   stats: ['   ▁▃▅▇▅▆█▃', '  ─────────'],
@@ -326,6 +331,28 @@ const markOf = (kind: CompassStepKind, state: CompassState): Mark => {
 }
 
 // ── pure helpers ─────────────────────────────────────────────────────────
+
+/** A tool call in a few words for the live tab: the command, the file's name, the pattern, the task. */
+export const pulseWhat = (input: Record<string, unknown>): string => {
+  const s = (k: string) => (typeof input[k] === 'string' ? (input[k] as string) : '')
+  const base = (p: string) => p.split('/').filter(Boolean).pop() ?? p
+  const pick =
+    s('description') && (input.tool === 'Agent' || input.tool === 'Monitor' || input.tool === 'Bash' && !s('command')) ? s('description')
+    : s('command') ? s('command')
+    : s('file_path') ? base(s('file_path'))
+    : s('notebook_path') ? base(s('notebook_path'))
+    : s('pattern') ? s('pattern')
+    : s('url') ? s('url').replace(/^https?:\/\//, '')
+    : s('query') ? s('query')
+    : s('subject') ? s('subject')
+    : s('description') || s('prompt') || s('skill') || s('to') || ''
+  return pick.replace(/\s+/g, ' ').trim()
+}
+
+/** The background task id a tool's answer names (a shell's, a monitor's, an agent's), if any. */
+export const bgIdOf = (text: string): string | undefined =>
+  /(?:\bID|task[ _-]?id|agentId|shell[ _-]?id)\s*[:=]\s*["'`]?([A-Za-z0-9_-]{4,})/i.exec(text)?.[1] ?? /\(task ([A-Za-z0-9_-]{4,})\b/.exec(text)?.[1]
+
 
 /** User-perceived characters, so a cut never splits an emoji or an accent (no "�"). */
 const graphemes = (text: string): string[] => {
@@ -1650,6 +1677,7 @@ export const register: Register = on => {
       if (++ticks % 5 === 0) void quietly($, 'snapshot')
       if ((await read($, tabA)) === 'chat' && Date.now() - (await read($, peersAtA)) > 15_000) void refreshPeers($)
       void quietly($, 'flush')
+      if ((await read($, liveA)).some(p => p.status === 'running' || p.status === 'bg') && ['flow', 'live'].includes(await read($, tabA))) await update($, tickA, n => n + 1)
       if (inflight) return
       // during a long turn: chart once the new prompt is in, then every few minutes
       if (!isWanted && turnStartedAt && (await read($, busyA))) {
@@ -1736,6 +1764,7 @@ export const register: Register = on => {
       await update($, btwA, () => [])
       await update($, selectedA, () => null)
       await update($, errorA, () => null)
+      await update($, liveA, () => [])
       const now = await $.clock.now()
       await update($, statsA, () => ({ ...EMPTY_STATS, startedAt: now }))
     }
@@ -1843,6 +1872,8 @@ export const register: Register = on => {
     const done = await next(e)
     if (e.agentId !== undefined) return done
     const now = await $.clock.now()
+    // a main-loop call can't still be running once its turn is over (an interrupt cut it short)
+    await update($, liveA, list => (list.some(p => p.status === 'running' && !p.agent) ? list.map(p => (p.status === 'running' && !p.agent ? { ...p, status: 'error', end: now } : p)) : list))
     const u = e.usage
     await update($, busyA, () => false)
     await update($, statsA, s => ({
@@ -1858,9 +1889,29 @@ export const register: Register = on => {
   })
 
   on('tool.call', async ($, e, next) => {
-    const ran = await next(e)
-    const name = String(e.tool)
     const input = e as unknown as Record<string, unknown>
+    // the live tab: the call shows as running the moment it starts, and settles when it returns
+    const pulseId = typeof e.tool_use_id === 'string' && e.tool_use_id ? e.tool_use_id : `p${Date.now()}${Math.floor(Math.random() * 1e4)}`
+    const isBg = input.run_in_background === true || e.tool === 'Monitor'
+    // compass's own calls (its ListAgents poll) are not the session's work
+    if (next.origin.plugin === 'compass') return next(e)
+    const started: CompassPulse = { id: pulseId, tool: String(e.tool), what: clip(pulseWhat(input), 160), at: await $.clock.now(), status: 'running', ...(e.agentId ? { agent: e.agentId } : {}) }
+    await update($, liveA, list => [...list.filter(p => p.id !== pulseId), started].slice(-LIVE_KEEP))
+    const ran = await next(e).catch(async (err: unknown) => {
+      const at = await $.clock.now()
+      await update($, liveA, list => list.map(p => (p.id === pulseId ? { ...p, status: 'error' as const, end: at } : p)))
+      throw err
+    })
+    const endAt = await $.clock.now()
+    const failed = 'deny' in ran && typeof ran.deny === 'string' ? true : ran.isError === true
+    const bgId = isBg && !failed && typeof ran.text === 'string' ? bgIdOf(ran.text) : undefined
+    await update($, liveA, list =>
+      list.map(p => (p.id === pulseId ? { ...p, end: endAt, status: failed ? 'error' : isBg ? 'bg' : 'ok', ...(bgId ? { bgId } : {}) } : p)),
+    )
+    // Claude stopping a background task (TaskStop, KillShell) ends its row too
+    const stopId = !failed && (e.tool === 'TaskStop' || e.tool === 'KillShell') ? [input.task_id, input.shell_id, input.id].find(v => typeof v === 'string') : undefined
+    if (typeof stopId === 'string') await update($, liveA, list => list.map(p => (p.bgId === stopId && p.status === 'bg' ? { ...p, status: 'stopped', end: endAt } : p)))
+    const name = String(e.tool)
     const file = typeof input.file_path === 'string' ? input.file_path : null
     await update($, statsA, s => ({
       ...s,
@@ -1955,6 +2006,23 @@ export const register: Register = on => {
 
   // ── the pane ──
 
+  // a background task's notification row settles its call in the live tab
+  on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
+    const task = e.props.task
+    if (task && (task.id || task.toolUseId)) {
+      const isOk = !task.status || task.status === 'completed'
+      const list = await read($, liveA)
+      const hit = list.find(p => (p.status === 'bg' || p.status === 'running') && ((task.toolUseId && p.id === task.toolUseId) || (task.id && p.bgId === task.id)))
+      if (hit) {
+        const at = task.durationMs ? hit.at + task.durationMs : await $.clock.now()
+        // a drawing never writes: the settle goes out on the next tick
+        const settled = task.status === 'killed' ? 'stopped' : isOk ? 'bgdone' : 'bgfail'
+        $.clock.after(0, () => update($, liveA, all => all.map(p => (p.id === hit.id ? { ...p, status: settled, end: at } : p))))
+      }
+    }
+    return next(e)
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const els = $.ui.resolve(e)
     const { Box, Text, Button } = els
@@ -1980,6 +2048,7 @@ export const register: Register = on => {
         read($, errorA),
       ])
     const [peers, peersAt, selfName, isRemote, chat, incoming, chatSeen] = await Promise.all([read($, peersA), read($, peersAtA), read($, selfNameA), read($, remoteA), read($, chatA), read($, incomingA), read($, chatSeenA)])
+    const live = await read($, liveA)
     const openPeer = tab === 'chat' && selected?.startsWith('p:') ? selected.slice(2) : null
     const unreadOf = (name: string) => (name === openPeer ? 0 : chat.filter(m => m.peer === name && m.dir === 'in' && m.at > (chatSeen[name] ?? 0)).length)
     const unreadAll = [...new Set(chat.map(m => m.peer))].reduce((n, p) => n + unreadOf(p), 0)
@@ -2176,6 +2245,79 @@ export const register: Register = on => {
       )
     }
 
+    // ── the live feed: one row per tool call, and the strip of what is running right now ──
+    const isLive = (p: CompassPulse) => p.status === 'running' || p.status === 'bg'
+    const runningNow = live.filter(isLive).reverse()
+    const took = (ms: number) => (ms < 1000 ? `${(Math.max(0, ms) / 1000).toFixed(1)}s` : span(ms))
+    const PULSE: Record<CompassPulse['status'], { glyph: string; tone: Tone }> = {
+      running: { glyph: spin, tone: 'cyan' },
+      bg: { glyph: '◌', tone: 'cyan' },
+      ok: { glyph: '✓', tone: 'green' },
+      bgdone: { glyph: '✓', tone: 'green' },
+      error: { glyph: '✗', tone: 'red' },
+      bgfail: { glyph: '✗', tone: 'red' },
+      stopped: { glyph: '■', tone: 'dim' },
+    }
+    const toolTone = (t: string): Tone =>
+      t === 'Bash' || t === 'Monitor' ? 'yellow' : /^(Read|Grep|Glob|LS|WebFetch|WebSearch)$/.test(t) ? 'blue' : /^(Edit|Write|MultiEdit|NotebookEdit)$/.test(t) ? 'purple' : t === 'Agent' || t.startsWith('mcp__') ? 'cyan' : 'gray'
+    const toolName = (t: string) => (t.startsWith('mcp__') ? t.split('__').pop() ?? t : t)
+    const pulseRow = (p: CompassPulse, key: string) => {
+      const mk = PULSE[p.status]
+      const isOn = isLive(p)
+      const time = p.status === 'bg' ? `bg ${took(now - p.at)}` : took((p.end ?? now) - p.at)
+      return (
+        <Box key={key}>
+          <Box width={2} flexShrink={0}>
+            <Text color={TONE[mk.tone].fg} bold={isOn}>
+              {mk.glyph}
+            </Text>
+          </Box>
+          {p.agent ? <Text dimColor>↳ </Text> : null}
+          <Box width={11} flexShrink={0}>
+            <Text color={TONE[toolTone(p.tool)].fg} bold={isOn} wrap="truncate-end">
+              {clip(toolName(p.tool), 10)}
+            </Text>
+          </Box>
+          <Box flexGrow={1} flexShrink={1}>
+            <Text dimColor={!isOn} wrap="truncate-end">
+              {p.what || ' '}
+            </Text>
+          </Box>
+          <Box width={9} flexShrink={0} justifyContent="flex-end">
+            <Text color={isOn ? TONE.cyan.fg : undefined} dimColor={!isOn}>
+              {time}
+            </Text>
+          </Box>
+        </Box>
+      )
+    }
+    const liveStrip = (rows: number, onFlow: boolean) => {
+      const last = live[live.length - 1]
+      const fg = runningNow.filter(p => p.status === 'running').length
+      const bg = runningNow.length - fg
+      const state = runningNow.length
+        ? [fg ? `${fg} running` : '', bg ? `${bg} in background` : ''].filter(Boolean).join(' · ')
+        : last
+          ? `idle · last call ${span(now - (last.end ?? last.at))} ago`
+          : 'no tool calls yet'
+      return (
+        <Box key={`strip:${onFlow ? 'flow' : 'live'}`} flexDirection="column" marginBottom={1}>
+          <Box>
+            {pill('strip:now', `${runningNow.length ? spin : '↯'} now`, runningNow.length ? 'cyan' : 'dim', true)}
+            <Box flexGrow={1} flexShrink={1}>
+              <Text dimColor wrap="truncate-end">
+                {`  ${state}`}
+              </Text>
+            </Box>
+            {onFlow && pillBtn('strip:open', '↯ live ▸', 'dim', () => update($, tabA, () => 'live'))}
+          </Box>
+          {runningNow.slice(0, rows).map(p => pulseRow(p, `strip:${p.id}`))}
+          {runningNow.length > rows ? <Text dimColor>{`  +${runningNow.length - rows} more running`}</Text> : null}
+          {!runningNow.length && onFlow && last ? pulseRow(last, `strip:last:${last.id}`) : null}
+        </Box>
+      )
+    }
+
     // ── tabs ──
     let body: ReturnType<typeof h>
 
@@ -2327,6 +2469,7 @@ export const register: Register = on => {
               ))}
             </Box>
           )}
+          {ms.length > 0 && live.length > 0 && liveStrip(2, true)}
           {ms.length === 0 ? (
             // the sea chart fills the tab until the first chart lands
             (() => {
@@ -2459,6 +2602,68 @@ export const register: Register = on => {
               </Box>
             )
           })()}
+        </Box>
+      )
+    } else if (tab === 'live') {
+      const { step: here, upcoming } = locate(map)
+      const ok = live.filter(p => p.status === 'ok' || p.status === 'bgdone').length
+      const bad = live.filter(p => p.status === 'error' || p.status === 'bgfail').length
+      // calls per slice of the last 10 minutes, as a one-row sparkline: the session's pulse
+      const cells = Math.max(10, Math.min(48, width - 16))
+      const slice = 600_000 / cells
+      const counts = Array.from({ length: cells }, (_, i) => live.filter(p => p.at > now - 600_000 + i * slice && p.at <= now - 600_000 + (i + 1) * slice).length)
+      const peak = Math.max(1, ...counts)
+      const spark = counts.map(c => (c ? '▁▂▃▄▅▆▇█'[Math.min(7, Math.round((c / peak) * 7))]! : ' ')).join('')
+      const perMin = live.filter(p => now - p.at < 60_000).length
+      const recent = live.filter(p => !isLive(p)).reverse()
+      const SHOW = isOpen('live:all') ? 120 : 30
+      body = (
+        <Box flexDirection="column" key="live">
+          {map && (here || upcoming) ? (
+            <Box key="live:course" flexDirection="column" marginBottom={1}>
+              {here ? (
+                <Text wrap="truncate-end">
+                  <Text color={TONE.cyan.fg} bold>
+                    ◉ now{'  '}
+                  </Text>
+                  <Text>{here.label}</Text>
+                </Text>
+              ) : null}
+              {upcoming ? (
+                <Text wrap="truncate-end">
+                  <Text dimColor>○ next </Text>
+                  <Text dimColor>{upcoming}</Text>
+                </Text>
+              ) : null}
+            </Box>
+          ) : null}
+          {live.length === 0 ? (
+            art('live', 'every tool call shows here as it runs: shells, edits, searches, monitors, agents')
+          ) : (
+            <Box key="live:feed" flexDirection="column">
+              <Box key="live:counts" columnGap={1} flexWrap="wrap" marginBottom={1}>
+                {(() => {
+                  const n = runningNow.filter(p => p.status === 'running').length
+                  return pill('live:n:run', `${n ? spin : '●'} ${n} running`, n ? 'cyan' : 'dim')
+                })()}
+                {pill('live:n:bg', `◌ ${runningNow.filter(p => p.status === 'bg').length} background`, 'blue')}
+                {pill('live:n:ok', `✓ ${ok}`, 'green')}
+                {bad ? pill('live:n:bad', `✗ ${bad}`, 'red') : null}
+                {pill('live:n:rate', `${perMin}/min`, 'dim')}
+              </Box>
+              <Box key="live:spark">
+                <Text color={TONE.gold.fg} backgroundColor={TRACK}>
+                  {spark}
+                </Text>
+                <Text dimColor>{'  last 10m'}</Text>
+              </Box>
+              <Box key="live:gap" marginTop={1} />
+              {liveStrip(8, false)}
+              {rule}
+              {recent.slice(0, SHOW).map(p => pulseRow(p, `pulse:${p.id}`))}
+              {recent.length > 30 && fold('live:all', isOpen('live:all') ? 'show fewer' : `${Math.min(recent.length, 120) - 30} earlier`)}
+            </Box>
+          )}
         </Box>
       )
     } else if (tab === 'tasks') {

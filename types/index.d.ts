@@ -1,4 +1,22 @@
-export type CompassTab = 'flow' | 'tasks' | 'grill' | 'chat' | 'stats' | 'recap'
+export type CompassTab = 'flow' | 'live' | 'tasks' | 'grill' | 'chat' | 'stats' | 'recap'
+
+/** One tool call as the live tab shows it: started, then finished, failed, or handed to the background. */
+export type CompassPulse = {
+  /** the call's tool_use_id */
+  id: string
+  tool: string
+  /** the call in a few words: the command, the file, the pattern */
+  what: string
+  at: number
+  /** when the call returned (for a background one: when its notification came) */
+  end?: number
+  /** running → ok | error; bg (returned, still working) → bgdone | bgfail | stopped */
+  status: 'running' | 'ok' | 'error' | 'bg' | 'bgdone' | 'bgfail' | 'stopped'
+  /** the subagent whose loop made the call; absent on the main loop */
+  agent?: string
+  /** a background task's own id (shell, monitor, agent), as its notification names it */
+  bgId?: string
+}
 
 /** Lifecycle of a milestone or step (version-tree states). */
 export type CompassState = 'done' | 'active' | 'pending' | 'abandoned' | 'blocked'
@@ -141,6 +159,8 @@ declare module 'claude-code' {
       isRefreshing: boolean
       isBusy: boolean
       lastError: string | null
+      /** the live tab's feed, newest last, the last LIVE_KEEP calls */
+      live: CompassPulse[]
     }
   }
 }

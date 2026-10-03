@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { barText, bodyOf, dotsText, hintChips, isDecided, span, transcriptDigest, leadOf, moveIn, wordWrap, boardOf, crumb, gist, peerKey, plain, frontierOf, mergeGrill, parseLoose, parseMap, senderOf } from '../hooks/register'
+import { barText, bgIdOf, pulseWhat, bodyOf, dotsText, hintChips, isDecided, span, transcriptDigest, leadOf, moveIn, wordWrap, boardOf, crumb, gist, peerKey, plain, frontierOf, mergeGrill, parseLoose, parseMap, senderOf } from '../hooks/register'
 
 /** Clicks a control by key: a Button is pressed, a pill (a Client region) gets a pointer click. */
 const tap = async (mounted: unknown, key: string) => {
@@ -1028,5 +1028,87 @@ test('pane actions settle inside compass: an answer unblocks at once, a quick re
   await tap(ui, 'tab:recap')
   expect(await ui.find({ text: /reconciled with your answer/ })).toBeDefined()
   expect(forks).toBe(1)
+  await ui.unmount()
+})
+
+test('pulseWhat and bgIdOf put a call in a few words and find its background id', async () => {
+  expect(pulseWhat({ tool: 'Bash', command: 'npm   test\n  --watch' })).toBe('npm test --watch')
+  expect(pulseWhat({ tool: 'Read', file_path: '/a/b/register.tsx' })).toBe('register.tsx')
+  expect(pulseWhat({ tool: 'Agent', description: 'Explore hooks', prompt: 'long…' })).toBe('Explore hooks')
+  expect(pulseWhat({ tool: 'Grep', pattern: 'tool\\.call' })).toBe('tool\\.call')
+  expect(bgIdOf('Command running in background with ID: bash_7f3a. Output is being written to …')).toBe('bash_7f3a')
+  expect(bgIdOf('Async agent launched successfully. agentId: a1b2c3d4 (use SendMessage…)')).toBe('a1b2c3d4')
+  expect(bgIdOf('Monitor started (task bwl87patb, expires in 30m unless the source ends first')).toBe('bwl87patb')
+  expect(bgIdOf('done')).toBeUndefined()
+})
+
+test('the live tab shows a call running the moment it starts, settles it, and follows a background shell to its notification', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  mock.env(on, { HOME: '/nonexistent' })
+  on('model.fork', () => ({ value: { isAnswered: true, text: JSON.stringify(MAP), usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }) as never)
+  on('session.id', () => ({ value: 'sess' }))
+  on('session.messages', () => ({ value: [{ role: 'user', text: 'build a mod', toolUses: [] }] }) as never)
+  on('session.usage', () => ({ value: { startedAt: 1, context: { window: 1, percent: 1 }, rateLimits: [] } }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('ui.toast', () => ({ value: undefined }) as never)
+  on('ui.panes', () => ({ value: [] }))
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
+  on('ui.render', { component: 'UserMessage' }, () => ({ type: 'Box', props: {}, children: [] }) as never)
+  let release: () => void = () => {}
+  const gate = new Promise<void>(r => (release = r))
+  on('tool.call', async (_$, e) => {
+    const input = e as unknown as Record<string, unknown>
+    if (input.command === 'npm test') {
+      await gate
+      return { result: {} as never, text: 'ok' }
+    }
+    if (input.run_in_background === true) return { result: {} as never, text: 'Command running in background with ID: bash_42.' }
+    if (e.tool === 'Monitor') return { result: {} as never, text: 'Monitor started (task mon_9x, expires in 30m)' }
+    return { result: {} as never, text: 'ok' }
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  await clock.advance(1500)
+
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  await tap(ui, 'tab:live')
+  expect(await ui.find({ text: /every tool call shows here/ })).toBeDefined()
+
+  await $.tool.call({ tool: 'Read', tool_use_id: 'r1', file_path: '/src/register.tsx' } as never)
+  const running = $.tool.call({ tool: 'Bash', tool_use_id: 'b1', command: 'npm test' } as never)
+  await clock.advance(2000)
+  expect(await ui.find({ text: /1 running/ })).toBeDefined()
+  expect(await ui.find({ key: 'strip:b1' })).toBeDefined()
+  expect(await ui.find({ key: 'pulse:r1' })).toBeDefined()
+  // the chart's current step sits above the feed: where the session is headed
+  expect(await ui.find({ text: /write register/ })).toBeDefined()
+  release()
+  await running
+  expect(await ui.find({ key: 'strip:b1' })).toBeUndefined()
+  expect(await ui.find({ key: 'pulse:b1' })).toBeDefined()
+
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'b2', command: 'npm run dev', run_in_background: true } as never)
+  expect(await ui.find({ key: 'strip:b2' })).toBeDefined()
+  expect(await ui.find({ text: /1 in background/ })).toBeDefined()
+  // its notification row settles it
+  await $.ui.mount({ plugin: 'compass', surface: 'terminal', component: 'UserMessage', props: { task: { id: 'bash_42', status: 'completed' } } } as never)
+  await clock.advance(10)
+  expect(await ui.find({ key: 'strip:b2' })).toBeUndefined()
+  expect(await ui.find({ key: 'pulse:b2' })).toBeDefined()
+
+  // a monitor Claude stops with TaskStop leaves the running strip
+  await $.tool.call({ tool: 'Monitor', tool_use_id: 'm1', command: 'tail -f log', description: 'watch the log' } as never)
+  expect(await ui.find({ key: 'strip:m1' })).toBeDefined()
+  await $.tool.call({ tool: 'TaskStop', tool_use_id: 'k1', task_id: 'mon_9x' } as never)
+  expect(await ui.find({ key: 'strip:m1' })).toBeUndefined()
+  expect(await ui.find({ key: 'pulse:m1' })).toBeDefined()
+
+  // the flow tab carries the strip too, with a way into the live tab
+  await tap(ui, 'tab:flow')
+  expect(await ui.find({ text: /idle · last call/ })).toBeDefined()
+  await tap(ui, 'strip:open')
+  expect(await ui.find({ key: 'pulse:r1' })).toBeDefined()
   await ui.unmount()
 })
