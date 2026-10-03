@@ -1112,3 +1112,53 @@ test('the live tab shows a call running the moment it starts, settles it, and fo
   expect(await ui.find({ key: 'pulse:r1' })).toBeDefined()
   await ui.unmount()
 })
+
+test('a new request is on the chart in seconds even while a slow full chart is running, and that older chart does not undo it', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+  let release: () => void = () => {}
+  let forks = 0
+  on('model.fork', async () => {
+    forks += 1
+    // the second fork (the one charting the end of the first turn) is slow, as on a long session
+    if (forks === 2) await new Promise<void>(r => (release = r))
+    return { value: { isAnswered: true, text: JSON.stringify(MAP), usage } } as never
+  })
+  const quick: string[] = []
+  on('model.complete', (_$, e) => {
+    quick.push((e as { prompt: string }).prompt)
+    const withRequest = { ...MAP, milestones: [...MAP.milestones.map(m => ({ ...m, state: m.state === 'active' ? 'done' : m.state })), { id: 'm9', label: 'Write the docs', state: 'active', why: '', steps: [{ id: 's9', label: 'draft README', kind: 'step', state: 'active', why: '' }] }], moot: [] }
+    return { value: { isAnswered: true, text: JSON.stringify(withRequest), usage } } as never
+  })
+  on('session.id', () => ({ value: 'sess' }))
+  on('session.messages', () => ({ value: [] }) as never)
+  on('session.usage', () => ({ value: { startedAt: 1, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }) as never)
+  on('turn.complete', (_$, e) => ({ text: e.answer }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('ui.toast', () => ({ value: undefined }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  await $.turn.start({ text: 'build v2', turnId: 't1' } as never)
+  await clock.advance(5000)
+  await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+  await clock.advance(1500)
+  expect(forks).toBe(2)
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  // the user's next request arrives while that slow chart is still running
+  const before = quick.length
+  await $.turn.start({ text: 'now write the docs', turnId: 't2' } as never)
+  await clock.advance(1000)
+  expect(quick.length).toBe(before + 1)
+  expect(quick[quick.length - 1]).toMatch(/now write the docs/)
+  expect(await ui.find({ text: /Write the docs/ })).toBeDefined()
+  // the older chart lands without the request: it is dropped, and a fresh full chart follows
+  release()
+  await clock.advance(1000)
+  expect(await ui.find({ text: /Write the docs/ })).toBeDefined()
+  await clock.advance(5000)
+  expect(forks).toBe(3)
+  await ui.unmount()
+})
