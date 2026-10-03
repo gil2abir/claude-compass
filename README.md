@@ -43,6 +43,8 @@ Commands: `/compass`, `/compass refresh`, `/compass steer <text>`, `/compass tas
 
 ## How it works and what it costs
 
+- **Settles in the pane, syncs with the session.** What you do in the pane takes effect at once: answering, parking or dismissing a question unblocks the steps waiting on it. A couple of seconds after you pause, one small fast-model call (Haiku) brings the rest of the chart along (follow-on steps, settled questions, tasks), without inventing session progress; the sync line says `applying your changes`. At every session event the full chart, which sees the same actions, is the one that counts; a quick update that overlaps it is dropped, so the two never fight.
+
 - The map is made by one extra model call (`$.model.fork`) that reuses the session's prompt cache: 3 s after each prompt (so the first chart arrives while Claude is still working on your first request), again when each turn ends, and every 3 min during long turns. The stats tab shows compass's own token use.
 - The agent gets a `grill` tool and short instructions in its system prompt for asking you questions without blocking.
 - Recovering: a session you resume or come back to reopens its saved chart from the plugin's own store (`$.store`, the 12 most recent sessions) with no model call. If there is none (for example a session charted by an older compass), compass charts it right away from a compact digest of the saved conversation (its first request and the recent exchanges, about 12k characters) with the fast model; the next turn's end charts it again from the shared, cached context. The same digest is the fallback when a session is too long to fork (an API error or an empty reply), so a very long session still gets a chart.
