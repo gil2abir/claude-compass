@@ -169,7 +169,7 @@ test('a compass present from the first turn charts once there is history, and /c
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
   await clock.advance(1500)
   const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
-  expect(await ui.find({ text: /after the first turn/ })).toBeDefined()
+  expect(await ui.find({ text: /the first chart is drawn/ })).toBeDefined()
   expect(await ui.find({ text: /△/ })).toBeUndefined()
 
   hasHistory = true
