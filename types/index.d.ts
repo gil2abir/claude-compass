@@ -28,6 +28,8 @@ export type CompassMap = {
   alt?: CompassAlt | null
   /** what the user picked at the fork, until the next chart */
   altPick?: 'main' | 'branch'
+  /** when a quick reconcile last brought the chart in line with the user's pane actions */
+  reconciledAt?: number
   /** alternatives the user turned down: not offered again */
   declined?: string[]
 }

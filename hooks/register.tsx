@@ -777,6 +777,12 @@ let turnStartedAt = 0
 /** Set by any event; the session-long poller started in session.start does the work,
  *  because a hook's own dispatch may be abandoned before a model call finishes. */
 let isWanted = false
+/** When the user last acted in the pane: a quick reconcile follows once they pause. */
+let paneActedAt = 0
+/** Each full chart bumps this; a reconcile made across one is dropped. */
+let chartEpoch = 0
+let isReconciling = false
+const RECONCILE_AFTER_MS = 2_500
 let lastRefreshAt = 0
 // the first request of a turn is on the wire within a few seconds; the fork then sees the new prompt
 const MID_TURN_FIRST_MS = 3_000
@@ -1013,9 +1019,66 @@ export const transcriptDigest = (messages: readonly { role: string; text: string
   return first || lines.length ? `The session's first request: ${clip(plain(first), 800)}\nThe recent conversation, oldest first:\n${lines.join('\n')}` : ''
 }
 
+/** Marks a pane action: the chart is reconciled with it shortly, without waiting for the session. */
+async function paneActed($: EngineInterface) {
+  paneActedAt = await $.clock.now()
+}
+
+/** Instant, no model: steps waiting on a question the user just handled stop waiting. */
+async function unblockOn($: EngineInterface, n: number) {
+  const tag = new RegExp(`waiting on Q${n}\\b`)
+  await editMap($, mp => ({
+    ...mp,
+    milestones: mp.milestones.map(ms => ({
+      ...ms,
+      steps: ms.steps.map((st): CompassStep => (st.state === 'blocked' && tag.test(st.why) ? { ...st, state: 'pending', why: '' } : st)),
+    })),
+  }))
+}
+
+/**
+ * A quick reconcile (haiku, small prompt): brings the chart in line with what the user just did in
+ * the pane (answers, parks, dismissals, task moves, steers, fork picks), without inventing any
+ * session progress. Dropped if a full chart lands meanwhile: at every session event the full chart,
+ * which sees the same actions, is the one that counts.
+ */
+async function reconcile($: EngineInterface) {
+  const stored = await read($, mapA)
+  if (!isCurrent(stored) || inflight || isReconciling) return
+  isReconciling = true
+  const epoch = chartEpoch
+  try {
+    const grill = await read($, grillA)
+    const acts = (await read($, actionsA)).filter(a => a.at > stored.at - 1000).map(a => `${a.status === 'queued' ? 'queued' : 'sent'}: ${a.label}`)
+    const prompt = [
+      'You are COMPASS. Reply with ONLY one minified JSON object in the same shape as the chart below (goal, milestones, tasks, recap, alt, moot).',
+      'The user just acted in the compass pane (below). Update the chart to reflect ONLY what those actions imply: steps no longer waiting on a question that is answered, parked or dismissed; pending steps a steer or a chosen branch changes; tasks the user moved or added; grill questions the answers made moot (moot: their ids). Do NOT mark work done or add progress the session has not made. Keep every id.',
+      `The chart: ${JSON.stringify({ goal: stored.goal, milestones: stored.milestones, tasks: stored.tasks, recap: stored.recap, alt: stored.alt ?? null })}`,
+      `The grill ([id, Q, title, state, answer]): ${JSON.stringify(grill.map(q => [q.id, q.n, q.title, q.state, q.answer]))}`,
+      acts.length ? `The user's pane actions since this chart: ${JSON.stringify(acts)}` : '',
+    ].filter(Boolean).join('\n')
+    const reply = await $.model.complete({ model: 'haiku', system: 'You are COMPASS. Reply with ONLY one minified JSON object, no prose.', prompt, maxTokens: 2500, effort: 'low' })
+    await countOwn($, reply)
+    if (!reply.isAnswered || epoch !== chartEpoch) return
+    const map = parseMap(reply.text, await $.clock.now())
+    if (!map || !map.milestones.length) return
+    const { grill: _ignored, moot, ...charted } = map
+    void _ignored
+    const at = await $.clock.now()
+    await update($, mapA, m => (m && isCurrent(m) && epoch === chartEpoch ? { ...m, goal: charted.goal || m.goal, milestones: charted.milestones, tasks: charted.tasks, recap: charted.recap.length ? charted.recap : m.recap, reconciledAt: at } : m))
+    if (moot.length) await update($, grillA, list => list.map((q): CompassGrillQ => (moot.includes(q.id) && (q.state === 'open' || q.state === 'parked') ? { ...q, state: 'settled', answer: q.answer || 'settled by your answers' } : q)))
+  } catch {
+    // the next session event charts it in full
+  } finally {
+    isReconciling = false
+  }
+}
+
 async function refresh($: EngineInterface) {
   if (inflight) return
   inflight = true
+  chartEpoch += 1
+  paneActedAt = 0
   lastRefreshAt = await $.clock.now()
   const startedAt = Date.now() - 1500
   // charted after its turn ended, a chart has the whole request in hand
@@ -1207,6 +1270,7 @@ export const isDecided = (alt: CompassAlt, decided: string[]) =>
 
 /** At a fork: stay on the planned path (a quiet note) or take the branch (a steer, redrawn at once). */
 async function pickTrajectory($: EngineInterface, way: 'main' | 'branch') {
+  await paneActed($)
   const stored = await read($, mapA)
   const map = isCurrent(stored) ? stored : null
   const alt = map?.alt
@@ -1244,6 +1308,7 @@ async function pickTrajectory($: EngineInterface, way: 'main' | 'branch') {
 
 /** Drops a queued item before it is sent, undoing what the pane did for it. */
 async function removeAction($: EngineInterface, id: string) {
+  await paneActed($)
   const a = (await read($, actionsA)).find(x => x.id === id)
   if (!a || a.status !== 'queued') return
   await update($, actionsA, list => list.filter(x => x.id !== id))
@@ -1285,7 +1350,7 @@ async function removeAction($: EngineInterface, id: string) {
 async function flushOutbox($: EngineInterface) {
   const t = await $.clock.now()
   const waiting = (await read($, actionsA)).filter(a => a.status === 'queued' && a.kind !== 'note')
-  if (waiting.some(a => t - a.at < SEND_GRACE_MS) || (await read($, refreshingA))) await update($, tickA, n => n + 1)
+  if (waiting.some(a => t - a.at < SEND_GRACE_MS) || isReconciling || (await read($, refreshingA))) await update($, tickA, n => n + 1)
   if (await read($, busyA)) {
     for (const a of waiting) if (a.route === 'running turn' && t - a.at >= SEND_GRACE_MS) await appendNow($, a)
     return
@@ -1305,6 +1370,7 @@ async function flushOutbox($: EngineInterface) {
 async function steer($: EngineInterface, text: string, ref = '', prev = '') {
   const t = text.trim()
   if (!t) return
+  await paneActed($)
   await update($, steersA, list => [...list, { text: t, at: Date.now() }].slice(-20))
   await enqueue($, 'steer', t, `🧭 [compass — steering from the user] ${t}\nAdjust the plan and your next steps accordingly from now on.`, ref, prev)
 }
@@ -1318,6 +1384,7 @@ const LANE_NAME: Record<CompassLane, string> = { now: 'DOING', next: 'TO DO', do
 
 /** Moves a card (optimistically) and tells the agent; a rejection rolls it back. */
 async function moveTask($: EngineInterface, id: string, lane: CompassLane) {
+  await paneActed($)
   const stored = await read($, mapA)
   const map = isCurrent(stored) ? stored : null
   const user = (await read($, userTasksA)).find(u => u.id === id)
@@ -1406,6 +1473,7 @@ async function chatSend($: EngineInterface, peer: string, text: string) {
 }
 
 async function addUserTask($: EngineInterface, text: string) {
+  await paneActed($)
   const t = text.trim()
   if (!t) return
   const id = `u${Date.now()}`
@@ -1432,6 +1500,8 @@ async function parkGrill($: EngineInterface, id: string) {
   const q = (await read($, grillA)).find(x => x.id === id)
   if (!q || q.state === 'settled' || q.state === 'parked') return
   await update($, grillA, list => list.map((x): CompassGrillQ => (x.id === id ? { ...x, state: 'parked' } : x)))
+  await unblockOn($, q.n)
+  await paneActed($)
   await queueNote($, `Parked grill question Q${q.n} "${q.title}": do not wait for it or ask again now; proceed with ${q.rec ? `the recommendation (${q.rec})` : 'your best judgement'} and keep it open`)
   const { ask, handled } = frontierOf(await read($, grillA))
   await update($, selectedA, () => (ask[0] ? `g:${ask[0].id}` : null))
@@ -1443,6 +1513,7 @@ async function unparkGrill($: EngineInterface, id: string) {
   const q = (await read($, grillA)).find(x => x.id === id)
   if (!q || q.state !== 'parked') return
   await update($, grillA, list => list.map((x): CompassGrillQ => (x.id === id ? { ...x, state: 'open' } : x)))
+  await paneActed($)
   await update($, selectedA, () => `g:${id}`)
   await queueNote($, `Reopened grill question Q${q.n} "${q.title}": the user will answer it`)
 }
@@ -1452,6 +1523,8 @@ async function dismissGrill($: EngineInterface, id: string) {
   const q = (await read($, grillA)).find(x => x.id === id)
   if (!q || q.state === 'settled') return
   await update($, grillA, list => list.map((x): CompassGrillQ => (x.id === id ? { ...x, state: 'settled', answer: 'dismissed' } : x)))
+  await unblockOn($, q.n)
+  await paneActed($)
   await queueNote($, `Dismissed grill question Q${q.n} "${q.title}": no longer relevant, drop it`)
   const { ask, handled } = frontierOf(await read($, grillA))
   await update($, selectedA, () => (ask[0] ? `g:${ask[0].id}` : null))
@@ -1472,6 +1545,11 @@ async function answerGrill($: EngineInterface, id: string, text: string) {
           : { ...q, state: 'answered', answer: clip(t, 200) },
     ),
   )
+  if (!isFollowup) {
+    const q = (await read($, grillA)).find(x => x.id === id)
+    if (q) await unblockOn($, q.n)
+  }
+  await paneActed($)
   const { ask } = frontierOf(await read($, grillA))
   await update($, selectedA, () => (ask[0] ? `g:${ask[0].id}` : null))
   if (!ask.length) await sendRound($)
@@ -1581,7 +1659,13 @@ export const register: Register = on => {
         const firstAfter = isCurrent(await read($, mapA)) ? MID_TURN_FIRST_MS : 1_000
         if ((lastRefreshAt < turnStartedAt && t - turnStartedAt > firstAfter) || since > MID_TURN_EVERY_MS) isWanted = true
       }
-      if (!isWanted) return
+      if (!isWanted) {
+        if (paneActedAt && (await $.clock.now()) - paneActedAt > RECONCILE_AFTER_MS) {
+          paneActedAt = 0
+          void reconcile($)
+        }
+        return
+      }
       isWanted = false
       void refresh($)
     })
@@ -1958,13 +2042,14 @@ export const register: Register = on => {
 
     // is the chart caught up with the session? one line, always on top
     const behind = map && typeof map.turns === 'number' ? Math.max(0, stats.turns - map.turns) : 0
-    const unseen = map ? actions.filter(a => a.status === 'sent' && a.at > map.at).length : 0
+    const unseen = map ? actions.filter(a => a.status === 'sent' && a.at > Math.max(map.at, map.reconciledAt ?? 0)).length : 0
     // what is going on with the chart, and whether you need to do anything: one answer for the
     // sync line and the sea chart alike
     const syncLine = ((): { tone: Tone; glyph: string; text: string; detail: string; canRefresh: boolean } => {
       const update = { canRefresh: true }
       const wait = { canRefresh: false }
       if (isRefreshing) return { tone: 'cyan', glyph: spin, text: 'charting now', detail: 'about 10 s · nothing to do', ...wait }
+      if (isReconciling) return { tone: 'cyan', glyph: spin, text: 'applying your changes', detail: 'a few seconds · nothing to do', ...wait }
       if (!map && stats.turns === 0 && !isBusy) return { tone: 'dim', glyph: '◌', text: 'waiting for your first prompt', detail: 'the chart starts seconds after you send one', ...wait }
       if (!map && isBusy) return { tone: 'cyan', glyph: '◌', text: 'chart coming', detail: 'drawn in a few seconds · nothing to do', ...wait }
       if (!map) return { tone: 'yellow', glyph: '◌', text: 'no chart yet', detail: 'press ↻ update to draw it', ...update }
@@ -2070,7 +2155,7 @@ export const register: Register = on => {
       const isSide = s.kind === 'attempt' || s.kind === 'aside'
       const isNow = s.state === 'active' || s.state === 'blocked'
       const rail = isSide ? (isFuture ? '┊ ├' : '│ ├') : isFuture ? '┊ ' : '│ '
-      const why = (s.state === 'abandoned' || s.kind === 'decision') && s.why ? ` · ${s.why}` : ''
+      const why = (s.state === 'abandoned' || s.state === 'blocked' || s.kind === 'decision') && s.why ? ` · ${s.why}` : ''
       const room = width - rail.length - 3 - (isNow ? 6 : 0)
       const label = s.kind === 'aside' ? `btw ${s.label}` : s.label
       const node = wrapped(`node:${s.id}`, `${label}${why}`, room, select(s.id), { dim: s.state === 'done' || s.state === 'abandoned' || s.kind === 'aside', indent: rail.length + 2 })
