@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, ModelForkResult, Register } from 'claude-code'
+import type { EngineInterface, ModelForkResult, Register, RenderElement } from 'claude-code'
 
 import type {
   CompassAction,
@@ -2047,8 +2047,8 @@ export const register: Register = on => {
   // ── the clickable compass in the hint line under the prompt ──
 
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
-    // @ts-expect-error Client is drawn on the terminal and desktop; elsewhere it is absent and Buttons stand in
-    const { Box, Button, Text, Client } = $.ui.resolve(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
+    // a Client (a region one of the surface modules draws) exists on the terminal and desktop; elsewhere Buttons stand in
     const hasClient = e.surface === 'terminal' || e.surface === 'desktop'
     const stored = await read($, mapA)
     const map = isCurrent(stored) ? stored : null
@@ -2080,7 +2080,7 @@ export const register: Register = on => {
           {gap('hp:l')}
           {/* a Button draws one engine colour: where a Client can be drawn, the gold brand is one and takes the click */}
           {hasClient ? (
-            <Client module="./brand.tsx" key="compass-crumb" props={{ color: GOLD, bg: TONE.gold.bg, spin }} />
+            h('Client', { module: './brand.tsx', key: 'compass-crumb', props: { color: GOLD, bg: TONE.gold.bg, spin } })
           ) : (
             <Button key="compass-crumb" plain label="◈ compass" onPress={() => void togglePane($)} />
           )}
@@ -2157,8 +2157,7 @@ export const register: Register = on => {
     const openPeer = tab === 'chat' && selected?.startsWith('p:') ? selected.slice(2) : null
     const unreadOf = (name: string) => (name === openPeer ? 0 : chat.filter(m => m.peer === name && m.dir === 'in' && m.at > (chatSeen[name] ?? 0)).length)
     const unreadAll = [...new Set(chat.map(m => m.peer))].reduce((n, p) => n + unreadOf(p), 0)
-    // @ts-expect-error Client is drawn on the terminal and desktop; elsewhere it is absent and Buttons stand in
-    const { Client } = $.ui.resolve(e)
+    // a Client (a region one of the surface modules draws) exists on the terminal and desktop; elsewhere Buttons stand in
     const hasClient = e.surface === 'terminal' || e.surface === 'desktop'
     const map = isCurrent(stored) ? stored : null
     const now = await $.clock.now()
@@ -2207,7 +2206,7 @@ export const register: Register = on => {
       presses.set(key, onPress)
       return hasClient ? (
         <Box key={`${key}:box`} flexShrink={0}>
-          <Client module="./pill.tsx" key={key} props={{ label, fg: TONE[tone].fg, bg: TONE[tone].bg, isOn }} />
+          {h('Client', { module: './pill.tsx', key, props: { label, fg: TONE[tone].fg, bg: TONE[tone].bg, isOn } })}
         </Box>
       ) : (
         <Button key={key} plain dimColor={!isOn} label={label} onPress={() => void onPress()} />
@@ -2426,12 +2425,12 @@ export const register: Register = on => {
     }
 
     // ── tabs ──
-    let body: ReturnType<typeof h>
+    let body: RenderElement
 
     if (tab === 'flow') {
       const ms = map?.milestones ?? []
       const { milestone: active, step } = locate(map)
-      const rows: ReturnType<typeof h>[] = []
+      const rows: RenderElement[] = []
       // the milestones compass and the agent settled on: a header with overall progress, then one
       // row each (number, name, its own steps bar), the active one unfolded into its steps
       if (ms.length) {
@@ -2828,16 +2827,16 @@ export const register: Register = on => {
       if (hasClient) {
         body = (
           <Box flexDirection="column" key="tasks">
-            <Client
-              module="./board.tsx"
-              key="board"
-              width={width}
-              props={{
+            {h('Client', {
+              module: './board.tsx',
+              key: 'board',
+              width,
+              props: {
                 wip: 3,
                 selected: picked?.id ?? null,
                 cards: all.map(t => ({ id: t.id, text: `${t.from ? `⇄${t.from} ` : ''}${t.text}`, lane: t.lane, by: t.by, isQueued: !!t.isQueued || queuedRefs.has(t.id) })),
-              }}
-            />
+              },
+            })}
             {picked && (
               <Box flexDirection="column" key="picked" borderStyle="round" borderDimColor paddingX={1}>
                 <Text wrap="wrap" bold>
@@ -3372,7 +3371,7 @@ export const register: Register = on => {
     const queued = actions.filter(a => a.status === 'queued')
     const sent = actions.filter(a => a.status !== 'queued' && now - a.at < 600_000).reverse()
     const WHEN = { 'running turn': ['↪', 'cyan'], 'new turn': ['⏭', 'yellow'], 'next prompt': ['✎', 'purple'], '': ['⋯', 'yellow'] } as const
-    const footRows: ReturnType<typeof h>[] = []
+    const footRows: RenderElement[] = []
     const groups = (['running turn', 'new turn', 'next prompt'] as const).filter(r => queued.some(a => a.route === r))
     const groupName = { 'running turn': 'into this turn', 'new turn': isBusy ? 'after this turn' : 'next turn', 'next prompt': 'with next prompt' } as const
     const failed = sent.filter(a => a.status === 'rejected').length
