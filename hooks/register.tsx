@@ -1212,7 +1212,8 @@ async function appendNow($: EngineInterface, a: CompassAction) {
   try {
     const r = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: a.text }] } })
     if ('deny' in r && r.deny) throw new Error(r.deny)
-    await setAction($, a.id, { status: 'sent', route: 'running turn', at: Date.now() })
+    const sentNow: ActionPatch = { status: 'sent', route: 'running turn', at: Date.now() }
+    await setAction($, a.id, sentNow)
     $.ui.toast(`↗ sent into the running turn · ${clip(a.label, 50)}`)
   } catch (err) {
     await reject($, a, err)
@@ -1221,7 +1222,8 @@ async function appendNow($: EngineInterface, a: CompassAction) {
 
 async function reject($: EngineInterface, a: CompassAction, err: unknown) {
   const reason = err instanceof Error ? err.message.slice(0, 60) : String(err).slice(0, 60)
-  await setAction($, a.id, { status: 'rejected', reason, at: Date.now() })
+  const rejected: ActionPatch = { status: 'rejected', reason, at: Date.now() }
+  await setAction($, a.id, rejected)
   const prev = a.prev
   if (a.ref && (LANES as readonly string[]).includes(prev)) {
     await editMap($, mp => ({ ...mp, tasks: mp.tasks.map(x => (x.id === a.ref ? { ...x, lane: prev as CompassLane } : x)) }))
@@ -1237,11 +1239,13 @@ async function enqueue($: EngineInterface, kind: CompassAction['kind'], label: s
   await update($, actionsA, list => [...list, a].slice(-40))
   const isBusy = await read($, busyA)
   if (kind === 'note') {
-    await setAction($, a.id, { route: 'next prompt' })
+    const withPrompt: ActionPatch = { route: 'next prompt' }
+    await setAction($, a.id, withPrompt)
     $.ui.toast(`⋯ queued for your next prompt · ${clip(a.label, 44)}`)
     return
   }
-  await setAction($, a.id, { route: kind === 'steer' && isBusy ? 'running turn' : 'new turn' })
+  const routed: ActionPatch = { route: kind === 'steer' && isBusy ? 'running turn' : 'new turn' }
+  await setAction($, a.id, routed)
   $.ui.toast(`⋯ sends in ${SEND_GRACE_MS / 1000}s · ${clip(a.label, 44)} · ✕ in the pane cancels`)
 }
 
@@ -1251,7 +1255,8 @@ async function forceAction($: EngineInterface, id: string) {
   if (!a || a.status !== 'queued') return
   if (await read($, busyA)) return appendNow($, a)
   try {
-    await setAction($, a.id, { status: 'sent', route: 'new turn', at: Date.now() })
+    const sentTurn: ActionPatch = { status: 'sent', route: 'new turn', at: Date.now() }
+    await setAction($, a.id, sentTurn)
     await $.prompt.submit({ text: a.text })
     $.ui.toast(`↗ sent now as a new turn · ${clip(a.label, 44)}`)
   } catch (err) {
@@ -1329,7 +1334,8 @@ async function pickTrajectory($: EngineInterface, way: 'main' | 'branch') {
     ),
   }))
   const t = `Change direction: ${alt.label}${alt.why ? ` (${alt.why})` : ''}. Next: ${alt.steps.join(' → ')}`
-  await update($, steersA, list => [...list, { text: t, at: Date.now() }].slice(-20))
+  const sent = { text: t, at: Date.now() }
+  await update($, steersA, list => [...list, sent].slice(-20))
   await enqueue($, 'steer', t, `🧭 [compass — steering from the user] ${t}\nRe-plan from here accordingly.`, 'alt', before)
 }
 
@@ -1398,7 +1404,8 @@ async function steer($: EngineInterface, text: string, ref = '', prev = '') {
   const t = text.trim()
   if (!t) return
   await paneActed($)
-  await update($, steersA, list => [...list, { text: t, at: Date.now() }].slice(-20))
+  const sent = { text: t, at: Date.now() }
+  await update($, steersA, list => [...list, sent].slice(-20))
   await enqueue($, 'steer', t, `🧭 [compass — steering from the user] ${t}\nAdjust the plan and your next steps accordingly from now on.`, ref, prev)
 }
 
@@ -1790,7 +1797,8 @@ export const register: Register = on => {
     const sent = await next(e)
     if (e.origin?.kind === 'model' && !e.agentId) {
       const isOk = sent.isDelivered === true
-      await update($, chatA, list => [...list, { peer: peerKey(e.to, list), dir: 'out' as const, text: clip(e.text.trim(), 600), at: Date.now(), status: isOk ? ('sent' as const) : ('rejected' as const) }].slice(-200))
+      const out = { dir: 'out' as const, text: clip(e.text.trim(), 600), at: Date.now(), status: isOk ? ('sent' as const) : ('rejected' as const) }
+      await update($, chatA, list => [...list, { ...out, peer: peerKey(e.to, list) }].slice(-200))
       $.ui.toast(isOk ? `▸ outbound to ${peerKey(e.to, await read($, chatA))}` : `✗ not delivered to ${e.to} · ${sent.reason ?? ''}`)
     }
     return sent
@@ -1941,10 +1949,9 @@ export const register: Register = on => {
   // ── the clickable compass in the hint line under the prompt ──
 
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
-    const els = $.ui.resolve(e)
-    const { Box, Button, Text } = els
     // @ts-expect-error Client is drawn on the terminal and desktop; elsewhere it is absent and Buttons stand in
-    const { Client } = els
+    const { Box, Button, Text, Client } = $.ui.resolve(e)
+    const hasClient = e.surface === 'terminal' || e.surface === 'desktop'
     const stored = await read($, mapA)
     const map = isCurrent(stored) ? stored : null
     const front = frontierOf(await read($, grillA))
@@ -1974,7 +1981,7 @@ export const register: Register = on => {
         <Box flexShrink={0}>
           {gap('hp:l')}
           {/* a Button draws one engine colour: where a Client can be drawn, the gold brand is one and takes the click */}
-          {Client ? (
+          {hasClient ? (
             <Client key="compass-crumb" module="./brand.tsx" props={{ color: GOLD, bg: TONE.gold.bg, spin }} />
           ) : (
             <Button key="compass-crumb" plain label="◈ compass" onPress={() => void togglePane($)} />
@@ -2053,7 +2060,8 @@ export const register: Register = on => {
     const unreadOf = (name: string) => (name === openPeer ? 0 : chat.filter(m => m.peer === name && m.dir === 'in' && m.at > (chatSeen[name] ?? 0)).length)
     const unreadAll = [...new Set(chat.map(m => m.peer))].reduce((n, p) => n + unreadOf(p), 0)
     // @ts-expect-error Client is drawn on the terminal and desktop; elsewhere it is absent and Buttons stand in
-    const { Client } = els
+    const { Client } = $.ui.resolve(e)
+    const hasClient = e.surface === 'terminal' || e.surface === 'desktop'
     const map = isCurrent(stored) ? stored : null
     const now = await $.clock.now()
     const board = boardOf(map, userTasks)
@@ -2099,7 +2107,7 @@ export const register: Register = on => {
     )
     const pillBtn = (key: string, label: string, tone: Tone, onPress: () => unknown, isOn = false) => {
       presses.set(key, onPress)
-      return Client ? (
+      return hasClient ? (
         <Box key={`${key}:box`} flexShrink={0}>
           <Client key={key} module="./pill.tsx" props={{ label, fg: TONE[tone].fg, bg: TONE[tone].bg, isOn }} />
         </Box>
@@ -2718,7 +2726,7 @@ export const register: Register = on => {
       const queuedRefs = new Set(actions.filter(a => a.status === 'queued' && a.ref).map(a => a.ref))
       const doneN = board.done.length
       const filled = total ? Math.round((doneN / total) * 14) : 0
-      if (Client) {
+      if (hasClient) {
         body = (
           <Box flexDirection="column" key="tasks">
             <Client
