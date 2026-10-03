@@ -1,10 +1,26 @@
-# 🧭 compass
+<h1 align="center">🧭 compass</h1>
 
-<p align="center"><img src="docs/demo.gif" alt="compass in a Claude Code session: the sea chart, a live flow chart of the session, Claude's questions, the outbox and steering" width="900"></p>
+<p align="center"><b>Watch your Claude Code session think. Steer it while it works.</b></p>
 
-<p align="center"><b>See</b> what your Claude Code session is doing · <b>project</b> where it is headed · <b>steer</b> it.<br><a href="docs/demo.mp4">Watch the demo video (MP4)</a></p>
+<p align="center"><img src="docs/demo.gif" alt="compass beside a Claude Code session: the sea chart, the plan as live milestones, Claude's questions in the grill, the outbox, a steer landing on the chart" width="900"></p>
 
-A Claude Code mod that keeps a live map of your session: where you were, where you are, and where you're headed. It sits in a pane docked on the right, so the transcript keeps scrolling beside it, and you can steer the session from it.
+<p align="center"><a href="docs/demo.mp4">Full-quality video (MP4)</a> · <a href="#install">Install</a> · <a href="#what-compass-reads-sends-runs-and-stores">What it can touch</a></p>
+
+Give Claude a real task and it disappears for a few minutes. It reads files, makes a plan in its head, picks libraries, writes code, runs tests. You find out what it decided when it stops, and by then it has made a dozen calls you would have made differently.
+
+compass is a mod that opens a pane next to the transcript and keeps it current while Claude works.
+
+**You see the plan as it stands right now.** Milestones and steps, drawn as a flow chart with a marker on *now*, what is done, what is next, and where the work forked. It's redrawn as the session moves, so the chart shows the session as it is now, not the plan from twenty minutes ago.
+
+**Claude asks, and the work doesn't stop.** Design choices land in the grill tab with Claude's pick already filled in. Click an option, type your own answer, or park the question and let Claude go with its recommendation. Your answers go back as one batch, and the next round of questions picks up from them.
+
+**You can steer without hitting Esc.** Type one sentence into the steer box, drag a task to DOING, add one of your own, or click a step to skip it. It lands in the running turn, and the chart redraws to show it took.
+
+**Nothing goes in blind.** Everything the pane sends sits in an outbox for 8 seconds. Click it to read the exact text Claude will get, reorder it, send it now, or cancel it.
+
+It costs one extra model call per update, which reuses the session's prompt cache. The stats tab shows exactly how much compass itself used.
+
+It earns its keep on the long ones: a feature that spans a dozen files, a refactor with judgment calls in it, a planning session where you want the decisions out on the table instead of buried in the scrollback. For a two-line fix you won't miss it.
 
 Requires Claude Code 2.1.287 or later (`claude --version`).
 
@@ -18,7 +34,7 @@ Requires Claude Code 2.1.287 or later (`claude --version`).
 
 If it doesn't show up, restart Claude Code. From a local clone instead: `claude --plugin-dir ./claude-compass`.
 
-## Use
+## Tour
 
 The pane is drawn like a small GUI: indicators are graphics (colored pills, level bars, counters, lit dots for countdowns, a spinner while charting), and information (steps, tasks, questions, messages) stays text. Before the first chart lands, the flow tab shows an animated sea chart: a 32-point compass rose with clouds, gulls and waves, and a gull crossing it while compass works.
 

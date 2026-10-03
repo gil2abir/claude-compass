@@ -1,6 +1,6 @@
 {
   "name": "claude-compass",
-  "description": "compass: a live session map mod for Claude Code",
+  "description": "compass: watch your Claude Code session think, and steer it while it works",
   "owner": {
     "name": "gil2abir"
   },
