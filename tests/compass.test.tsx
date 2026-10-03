@@ -1,6 +1,18 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { bodyOf, isDecided, leadOf, moveIn, wordWrap, boardOf, crumb, gist, peerKey, plain, frontierOf, mergeGrill, parseLoose, parseMap, senderOf } from '../hooks/register'
+import { barText, bodyOf, dotsText, isDecided, span, leadOf, moveIn, wordWrap, boardOf, crumb, gist, peerKey, plain, frontierOf, mergeGrill, parseLoose, parseMap, senderOf } from '../hooks/register'
+
+/** Clicks a control by key: a Button is pressed, a pill (a Client region) gets a pointer click. */
+const tap = async (mounted: unknown, key: string) => {
+  const ui = mounted as { find: (q: { key: string }) => Promise<{ type?: string } | undefined>; press: (q: { key: string }) => Promise<unknown>; pointer: (q: Record<string, unknown>) => Promise<unknown> }
+  const el = await ui.find({ key })
+  if (el?.type === 'Client') {
+    await ui.pointer({ type: 'down', x: 1, y: 0, button: 'left', in: key })
+    await ui.pointer({ type: 'up', x: 1, y: 0, button: 'left', in: key })
+    return
+  }
+  await ui.press({ key })
+}
 
 const MAP = {
   goal: 'Build compass mod',
@@ -83,10 +95,10 @@ test('pane draws the git-flow map, folds, and task board', async ($, on) => {
     expect(await ui.find({ key: 'node:s5' })).toBeDefined()
     // done milestone is folded to one row
     expect(await ui.find({ key: 'node:s1' })).toBeUndefined()
-    await ui.press({ key: 'msbtn:m1' })
+    await tap(ui, 'msbtn:m1')
     expect(await ui.find({ key: 'node:s2' })).toBeDefined()
-    await ui.press({ key: 'msbtn:m1' })
-    await ui.press({ key: 'tab:tasks' })
+    await tap(ui, 'msbtn:m1')
+    await tap(ui, 'tab:tasks')
     // the board: rows 0 chips · 1 rule · 2 DOING · 3 card t1 · 4 TO DO · 5 empty · 6 DONE (folded) · 7 rule · 8 BACKLOG · 9 t3
     expect(await ui.find({ text: /DOING/, in: 'board' })).toBeDefined()
     if (surface === 'terminal') {
@@ -96,22 +108,22 @@ test('pane draws the git-flow map, folds, and task board', async ($, on) => {
       expect(await ui.find({ text: /drop here/, in: 'board' })).toBeDefined()
       await ui.pointer({ type: 'up', x: 4, y: 6, button: 'left', in: 'board' })
       // optimistic move, queued note with its badge, and the activity strip says so
-      expect(await ui.find({ text: /DONE ·2/, in: 'board' })).toBeDefined()
+      expect(await ui.find({ text: /DONE 2/, in: 'board' })).toBeDefined()
       expect(await ui.find({ text: /write register → DONE/ })).toBeDefined()
       const keys = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '')
       expect(keys.some(k => k.startsWith('force:'))).toBe(true)
     }
-    await ui.press({ key: 'tabicon:flow' })
+    await tap(ui, 'tab:flow')
     expect(await ui.find({ text: /dead end: tried/ })).toBeUndefined()
-    await ui.press({ key: 'legend' })
+    await tap(ui, 'legend')
     expect(await ui.find({ text: /dead end: tried/ })).toBeDefined()
-    await ui.press({ key: 'legend' })
-    await ui.press({ key: 'tabicon:stats' })
+    await tap(ui, 'legend')
+    await tap(ui, 'tab:stats')
     expect(await ui.find({ text: /42%/ })).toBeDefined()
-    expect(await ui.find({ text: /\$1\.50/ })).toBeDefined()
-    await ui.press({ key: 'tab:grill' })
+    expect(await ui.find({ text: /\$ 1\.50/ })).toBeDefined()
+    await tap(ui, 'tab:grill')
     expect(await ui.find({ key: 'gopt:q1:0' })).toBeDefined()
-    await ui.press({ key: 'tab:flow' })
+    await tap(ui, 'tab:flow')
     await ui.unmount()
   }
 })
@@ -222,10 +234,10 @@ test('the agent posts a round, the user answers it, and the round goes back as o
   expect(String(posted.text)).toMatch(/2 on the frontier, 1 waiting/)
 
   const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
-  await ui.press({ key: 'tab:grill' })
+  await tap(ui, 'tab:grill')
   expect(await ui.find({ text: /Q1 · Where to store/ })).toBeDefined()
   expect(await ui.find({ text: /recommended/ })).toBeDefined()
-  await ui.press({ key: 'gopt:store:1' })
+  await tap(ui, 'gopt:store:1')
   expect(await ui.find({ text: /Q3 · Name/ })).toBeDefined()
   expect(submitted.length).toBe(0)
   await ui.input({ key: 'gans:name', text: '?why not reuse the old one' })
@@ -300,7 +312,7 @@ test('the status gist is the active cut, fits its budget, and uses plain glyphs 
     expect(Array.from(text).length <= budget).toBe(true)
     expect(text).not.toMatch(/\uFFFD|[\uD800-\uDFFF]|\p{Extended_Pictographic}/u)
     expect(text).toMatch(/[^\x20-\x7E\u00C0-\u024F◈✓●○›…!?/]/u.test(text) ? /^$/ : /compass/)
-    expect(text).toMatch(/!/)
+    expect(/needs you|\?3/.test(text)).toBe(true)
     // labels are whole or absent, never cut mid-word
     expect(text).not.toMatch(/…/)
     for (const label of ['a very long active step label here', 'the following step which is long']) {
@@ -365,12 +377,12 @@ test('chat marks inbound/outbound, badges new messages, and opens a clickable hi
   await $.session.send({ to: 'uds:/tmp/cc-socks/1.sock', text: 'running it now', origin: { kind: 'model' } } as never)
 
   const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
-  await ui.press({ key: 'tab:chat' })
+  await tap(ui, 'tab:chat')
   expect(await ui.find({ key: 'tab:chat' })).toBeDefined()
-  expect((await ui.find({ key: 'tab:chat' }))?.props?.label).toMatch(/●1/)
+  expect(await ui.find({ key: 'tabn:chat', text: /1/ })).toBeDefined()
   expect(await ui.find({ text: /● 1 new/ })).toBeDefined()
-  expect(await ui.find({ text: /◂1/ })).toBeDefined()
-  await ui.press({ key: 'peer:Docs agent' })
+  expect(await ui.find({ text: /◂ 1/ })).toBeDefined()
+  await tap(ui, 'peer:Docs agent')
   expect(await ui.find({ text: /◂ 1 in/ })).toBeDefined()
   expect(await ui.find({ text: /▸ 1 out/ })).toBeDefined()
   expect(await ui.find({ text: /◂ in/ })).toBeDefined()
@@ -378,11 +390,11 @@ test('chat marks inbound/outbound, badges new messages, and opens a clickable hi
   const rows = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').filter(k => k.startsWith('b:m:Docs agent'))
   expect(rows.length).toBe(2)
   expect(await ui.find({ key: rows[0]!, text: /can you run the benchmark\? ▸$/ })).toBeDefined()
-  await ui.press({ key: rows[0]! })
+  await tap(ui, rows[0]!)
   expect(await ui.find({ text: /per-file timings/ })).toBeDefined()
-  await ui.press({ key: 'peer:Docs agent' })
+  await tap(ui, 'peer:Docs agent')
   expect(await ui.find({ text: /● 1 new/ })).toBeUndefined()
-  expect((await ui.find({ key: 'tab:chat' }))?.props?.label).not.toMatch(/●/)
+  expect(await ui.find({ key: 'tabn:chat' })).toBeUndefined()
   await ui.unmount()
 })
 
@@ -424,9 +436,9 @@ test('the outbox lists what goes to the session and when, and lets the user reor
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
 
   const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
-  await ui.press({ key: 'tab:tasks' })
+  await tap(ui, 'tab:tasks')
   for (const t of ['alpha task', 'beta task', 'gamma task']) await ui.input({ key: 'task', text: t })
-  expect(await ui.find({ text: /⇣ 3 queued/ })).toBeDefined()
+  expect(await ui.find({ text: /⇣ 3/ })).toBeDefined()
   const ids = async () => (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').filter(k => k.startsWith('drop:')).map(k => k.slice(5))
   const [a, b, c] = await ids()
   // gamma up one: alpha, gamma, beta
@@ -442,7 +454,7 @@ test('the outbox lists what goes to the session and when, and lets the user reor
   const note = context.join('\n')
   expect(note).not.toMatch(/alpha task/)
   expect(note.indexOf('gamma task') < note.indexOf('beta task')).toBe(true)
-  expect(await ui.find({ text: /queue empty/ })).toBeDefined()
+  expect(await ui.find({ text: /outbox empty/ })).toBeDefined()
   await clock.advance(10)
   await ui.unmount()
 })
@@ -475,12 +487,12 @@ test('the sync line says whether the chart has caught up with the session', asyn
   on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
   const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
-  expect(await ui.find({ text: /queue empty/ })).toBeDefined()
+  expect(await ui.find({ text: /outbox empty/ })).toBeDefined()
 
   await $.turn.start({ text: 'build it', turnId: 't1' } as never)
   await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' } as never)
   await clock.advance(1500)
-  expect(await ui.find({ text: /in sync · includes your last message/ })).toBeDefined()
+  expect(await ui.find({ text: /✓ in sync/ })).toBeDefined()
 
   // the next chart fails: the pane says it is behind and offers ↻
   isUp = false
@@ -492,7 +504,8 @@ test('the sync line says whether the chart has caught up with the session', asyn
 
   // a new message mid-turn is named until a chart includes it
   await $.turn.start({ text: 'fix the header', turnId: 't3' } as never)
-  expect(await ui.find({ text: /not charted yet: your message "fix the header"/ })).toBeDefined()
+  expect(await ui.find({ text: /new message not charted/ })).toBeDefined()
+  expect(await ui.find({ text: /fix the header/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -522,7 +535,7 @@ test('a steer waits in the outbox with a countdown, can be cancelled, and otherw
 
   await ui.input({ key: 'steer', text: 'drop the cache idea' })
   await clock.advance(2000)
-  expect(await ui.find({ text: /^[67]s $/ })).toBeDefined()
+  expect(await ui.find({ text: /^●{5,7}·{1,3} $/ })).toBeDefined()
   const id = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').find(k => k.startsWith('drop:'))!.slice(5)
   await ui.press({ key: `drop:${id}` })
   await clock.advance(10_000)
@@ -531,7 +544,7 @@ test('a steer waits in the outbox with a countdown, can be cancelled, and otherw
   await ui.input({ key: 'steer', text: 'use the faster runner' })
   await clock.advance(9000)
   expect(attempts('use the faster runner')).toBe(1)
-  expect(await ui.find({ text: /queue empty/ })).toBeDefined()
+  expect(await ui.find({ text: /outbox empty/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -543,8 +556,8 @@ test('the outbox is pinned to the bottom of the pane window as it scrolls', asyn
   for (const offset of [0, 7]) {
     const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE, props: { ...PANE.props, scroll: { offset, bodyRows: 30 } } })
     const foot = await ui.find({ key: 'activity' })
-    // a rule and the "queue empty" row: two rows, ending on the window's last row
-    expect(foot?.props?.top).toBe(offset + 30 - 2)
+    // the "outbox empty" row alone, on the window's last row
+    expect(foot?.props?.top).toBe(offset + 30 - 1)
     await ui.unmount()
   }
 })
@@ -575,22 +588,22 @@ test('a fork shows the planned path and one branch; taking the branch steers and
   await clock.advance(1500)
   const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
   expect(await ui.find({ text: /two ways on/ })).toBeDefined()
-  expect(await ui.find({ text: /◇ ship as a skill/ })).toBeDefined()
+  expect(await ui.find({ text: /^ship as a skill$/ })).toBeDefined()
   expect(await ui.find({ key: 'pick:main' })).toBeDefined()
 
   // take the branch: the planned step is dropped, the branch's steps are the new future, a steer waits
-  await ui.press({ key: 'pick:branch' })
+  await tap(ui, 'pick:branch')
   expect(await ui.find({ text: /two ways on/ })).toBeUndefined()
   expect(await ui.find({ text: /write SKILL md/ })).toBeDefined()
   expect(await ui.find({ text: /run tests · not chosen/ })).toBeDefined()
-  expect(await ui.find({ text: /⇣ 1 queued/ })).toBeDefined()
+  expect(await ui.find({ text: /⇣ 1/ })).toBeDefined()
   // ✕ before it is sent puts the fork back
   const id = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').find(k => k.startsWith('drop:'))!.slice(5)
   await ui.press({ key: `drop:${id}` })
   expect(await ui.find({ text: /two ways on/ })).toBeDefined()
 
   // keep the plan: a note for the next prompt, and the next chart does not offer it again
-  await ui.press({ key: 'pick:main' })
+  await tap(ui, 'pick:main')
   expect(await ui.find({ text: /two ways on/ })).toBeUndefined()
   await $.turn.start({ text: 'more', turnId: 't2' } as never)
   await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't2', reason: 'answer' } as never)
@@ -661,7 +674,7 @@ test('a fork the user decided is not offered again while the work waits, not the
   const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
   await turn(1)
   expect(await ui.find({ text: /two ways on/ })).toBeDefined()
-  await ui.press({ key: 'pick:branch' })
+  await tap(ui, 'pick:branch')
   await clock.advance(9000)
   for (const i of [2, 3, 4]) {
     await turn(i)
@@ -700,9 +713,9 @@ test('a grill question can be dismissed: it settles, the agent hears it, and it 
   await post('r1', 'Wait for prod deploy')
   await post('r2', 'Bump the major version')
   const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
-  await ui.press({ key: 'tab:grill' })
+  await tap(ui, 'tab:grill')
   expect(await ui.find({ key: 'gdrop:r1' })).toBeDefined()
-  await ui.press({ key: 'gdrop:r1' })
+  await tap(ui, 'gdrop:r1')
   expect(await ui.find({ key: 'gopt:r1:0' })).toBeUndefined()
   expect(await ui.find({ key: 'gopt:r2:0' })).toBeDefined()
   // re-posted under a new id, it stays dismissed
@@ -710,5 +723,83 @@ test('a grill question can be dismissed: it settles, the agent hears it, and it 
   expect(await ui.find({ key: 'gopt:r9:0' })).toBeUndefined()
   await $.prompt.submit({ text: 'go on' } as never)
   expect(context.join('\n')).toMatch(/Dismissed grill question Q1 "Wait for prod deploy"/)
+  await ui.unmount()
+})
+
+test('indicator helpers: level bars, countdown pixels, short spans', async () => {
+  expect(barText(0, 5)).toBe('     ')
+  expect(barText(1, 5)).toBe('█████')
+  expect(barText(0.5, 4)).toBe('██  ')
+  expect(Array.from(barText(0.3, 10)).length).toBe(10)
+  expect(dotsText(3, 8)).toBe('●●●·····')
+  expect(span(45_000)).toBe('45s')
+  expect(span(160 * 60_000)).toBe('2h 40m')
+  expect(span(31 * 3_600_000)).toBe('1d 7h')
+})
+
+test('skipping a step from the flow and cancelling it in the outbox puts the step back; the chart ignores a queued steer', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  mock.env(on, { HOME: '/nonexistent' })
+  const prompts: string[] = []
+  on('model.fork', (_$, e) => {
+    prompts.push((e as { prompt: string }).prompt)
+    return { value: { isAnswered: true, text: JSON.stringify(MAP), usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } } as never
+  })
+  on('session.id', () => ({ value: 'sess' }))
+  on('fs.read', () => { throw new Error('none') })
+  on('session.messages', () => ({ value: [] }) as never)
+  on('session.usage', () => ({ value: { startedAt: 1_000_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }) as never)
+  on('turn.complete', (_$, e) => ({ text: e.answer }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('ui.toast', () => ({ value: undefined }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  await $.turn.start({ text: 'go', turnId: 't1' } as never)
+  await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+  await clock.advance(1500)
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  await tap(ui, 'node:s5')
+  await tap(ui, 'skip:s5')
+  expect(await ui.find({ text: /run tests · skipped by you/ })).toBeDefined()
+  // a chart made now does not see the queued steer
+  await tap(ui, 'refresh')
+  await clock.advance(1500)
+  expect(prompts[prompts.length - 1]).not.toMatch(/Skip this/)
+  const id = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').find(k => k.startsWith('drop:'))!.slice(5)
+  await tap(ui, `drop:${id}`)
+  expect(await ui.find({ text: /skipped by you/ })).toBeUndefined()
+  expect(await ui.find({ key: 'node:s5' })).toBeDefined()
+  // a turn compass itself submitted is not "your new message"
+  await $.turn.start({ text: 'The compass plugin sent a message: 🧭 [compass — steering from the user] go', turnId: 't2' } as never)
+  expect(await ui.find({ text: /new message not charted/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('cancelling a grill round in the outbox puts its answers back', async ($, on) => {
+  mock.clock(on, { now: 1_000_000 })
+  mock.env(on, { HOME: '/nonexistent' })
+  on('session.id', () => ({ value: 'sess' }))
+  on('fs.read', () => { throw new Error('none') })
+  on('session.messages', () => ({ value: [] }) as never)
+  on('session.usage', () => ({ value: { startedAt: 1_000_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('ui.toast', () => ({ value: undefined }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  await $.tool.call({ tool: 'mcp__compass__grill', topic: 'release', questions: [{ id: 'r1', title: 'Ship today', body: 'Ship?', options: ['yes', 'no'], recommendation: 'yes' }] } as never)
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  await tap(ui, 'tab:grill')
+  await tap(ui, 'gopt:r1:0')
+  expect(await ui.find({ text: /⇣ 1/ })).toBeDefined()
+  const id = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').find(k => k.startsWith('drop:'))!.slice(5)
+  await tap(ui, `drop:${id}`)
+  // answered again, not settled: the round can be resent
+  expect(await ui.find({ text: /round 1/ })).toBeDefined()
+  expect(await ui.find({ text: /0 settled/ })).toBeDefined()
   await ui.unmount()
 })

@@ -35,6 +35,49 @@ const PAST_KEEP = 2
 const FUTURE_KEEP = 3
 const GRILL_TOOL = 'mcp__compass__grill'
 const GOLD = '#E8B53A'
+// ── the widget kit: indicators are drawn, information stays text ──
+
+/** Pill colours, after the reference: a tinted fill with a bright label of the same hue. */
+const TONE = {
+  gold: { fg: '#E8B53A', bg: '#3b321c' },
+  green: { fg: '#86d4ab', bg: '#1d3a2f' },
+  purple: { fg: '#b9a6f2', bg: '#2e2946' },
+  red: { fg: '#f2a093', bg: '#442728' },
+  blue: { fg: '#97b1f5', bg: '#243049' },
+  cyan: { fg: '#83d6e8', bg: '#1b3940' },
+  yellow: { fg: '#f0d27a', bg: '#3e381d' },
+  gray: { fg: '#c4c4c4', bg: '#333438' },
+  dim: { fg: '#8a8a8a', bg: '#2a2b2e' },
+} as const
+type Tone = keyof typeof TONE
+const TRACK = '#3a3b3f'
+const PANEL = '#232427'
+const SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+
+/** A level as a smooth bar `cells` wide: whole blocks, then an eighth-block edge. */
+export const barText = (frac: number, cells: number) => {
+  const f = Math.max(0, Math.min(1, Number.isFinite(frac) ? frac : 0)) * cells
+  const full = Math.floor(f)
+  const part = Math.round((f - full) * 8)
+  const edge = full < cells ? (part ? ' ▏▎▍▌▋▊▉'[part]! : ' ') : ''
+  return `${'█'.repeat(full)}${edge}${' '.repeat(Math.max(0, cells - full - 1))}`.slice(0, cells)
+}
+
+/** A countdown as pixels going out: `left` lit of `total`. */
+export const dotsText = (left: number, total: number) => `${'●'.repeat(Math.max(0, Math.min(total, left)))}${'·'.repeat(Math.max(0, total - Math.max(0, left)))}`
+
+/** A short duration: 2h 40m, 1d 7h, 45s. */
+export const span = (ms: number) => {
+  const m = Math.max(0, Math.round(ms / 60000))
+  if (ms < 60000) return `${Math.max(0, Math.round(ms / 1000))}s`
+  if (m < 60) return `${m}m`
+  if (m < 1440) return `${Math.floor(m / 60)}h ${m % 60}m`
+  return `${Math.floor(m / 1440)}d ${Math.floor((m % 1440) / 60)}h`
+}
+
+/** Handlers of the pill buttons drawn this render, by key: a pill's 'press' post runs its own. */
+const presses = new Map<string, () => unknown>()
+
 /** How long every new item waits in the outbox, so it can still be reordered or removed. */
 const SEND_GRACE_MS = 8000
 
@@ -368,7 +411,8 @@ export const gist = (map: CompassMap | null, asks: number, queued: number, budge
   const progress = here >= 0 && steps.length > 1 ? `step ${here + 1}/${steps.length}` : ''
   // what needs the user: words when they fit, a glyph when they do not
   const needs = (isShort: boolean): GistPart[] => [
-    ...(isBlocked ? [{ text: isShort ? '!' : '! needs you', tone: 'need' as const }] : []),
+    // blocked: the step itself turns red; the words only when there is room
+    ...(isBlocked && !isShort ? [{ text: '! needs you', tone: 'need' as const }] : []),
     ...(asks ? [{ text: isShort ? `?${asks}` : `? ${asks} to answer`, tone: 'ask' as const }] : []),
     ...(map?.alt && !map.altPick ? [{ text: isShort ? '⑂' : '⑂ 2 ways', tone: 'ask' as const }] : []),
     ...(queued && !isShort ? [{ text: `${queued} queued`, tone: 'queue' as const }] : []),
@@ -564,6 +608,7 @@ async function hydrate($: EngineInterface) {
     files: [...new Set([...s.files, ...files])],
     costUsd: usage.cost?.usd ?? s.costUsd ?? 0,
     contextPct: usage.context.percent ?? s.contextPct ?? 0,
+    limits: (usage.rateLimits ?? []).map(r => ({ kind: r.kind, pct: r.percentUsed, resetsAt: r.resetsAt ?? '' })),
   }))
   if (todos) {
     const found = todos
@@ -722,6 +767,12 @@ async function countOwn($: EngineInterface, reply: ModelForkResult) {
   })
 }
 
+/** Steers that went into the session: a queued one can still be cancelled, so the chart ignores it. */
+async function sentSteers($: EngineInterface) {
+  const held = new Set((await read($, actionsA)).filter(a => a.status === 'queued' && a.kind === 'steer').map(a => a.label))
+  return (await read($, steersA)).filter(x => !held.has(clip(x.text, 80)))
+}
+
 async function refresh($: EngineInterface) {
   if (inflight) return
   inflight = true
@@ -738,7 +789,7 @@ async function refresh($: EngineInterface) {
       isCurrent(stored) ? stored : null,
       await read($, agentTodosA),
       (await read($, userTasksA)).map(u => u.text),
-      (await read($, steersA)).slice(-6).map(s => s.text),
+      (await sentSteers($)).slice(-6).map(s => s.text),
       await read($, btwA),
       await read($, grillA),
       (await read($, chatA)).filter(m => m.dir === 'in'),
@@ -763,7 +814,8 @@ async function refresh($: EngineInterface) {
     }
     const { grill: inferred, ...next } = map
     const prevMap = isCurrent(stored) ? stored : null
-    const declined = prevMap?.declined ?? []
+    const latest = await read($, mapA)
+    const declined = (isCurrent(latest) ? latest.declined : null) ?? prevMap?.declined ?? []
     const sameMilestone = prevMap && locate(prevMap).milestone?.id === locate(next).milestone?.id
     const kept = !next.alt && sameMilestone && prevMap.alt && !prevMap.altPick ? prevMap.alt : null
     const alt = (next.alt && !isDecided(next.alt, declined) ? next.alt : null) ?? kept
@@ -927,6 +979,24 @@ async function removeAction($: EngineInterface, id: string) {
     await editMap($, mp => ({ ...mp, tasks: mp.tasks.map(x => (x.id === a.ref ? { ...x, lane: a.prev as CompassLane } : x)) }))
   }
   if (a.ref.startsWith('u')) await update($, userTasksA, list => list.filter(u => u.id !== a.ref))
+  if (a.ref === 'grill') {
+    // the round never went out: its questions are answered again, ready to change or resend
+    try {
+      const was = new Map(JSON.parse(a.prev) as [string, CompassGrillQ['state']][])
+      await update($, grillA, list => list.map((q): CompassGrillQ => (was.has(q.id) ? { ...q, state: was.get(q.id)! } : q)))
+      await update($, grillRoundA, r => Math.max(1, r - 1))
+    } catch {
+      // nothing to restore
+    }
+  }
+  if (a.ref === 'plan') {
+    try {
+      const was = JSON.parse(a.prev) as { milestones: CompassMilestone[]; tasks: CompassTask[] }
+      await editMap($, mp => ({ ...mp, milestones: was.milestones, tasks: was.tasks }))
+    } catch {
+      // nothing to restore
+    }
+  }
   if (a.ref === 'alt') {
     try {
       const was = JSON.parse(a.prev) as { id: string; steps: CompassStep[]; declined?: string[] }
@@ -943,7 +1013,7 @@ async function removeAction($: EngineInterface, id: string) {
 async function flushOutbox($: EngineInterface) {
   const t = await $.clock.now()
   const waiting = (await read($, actionsA)).filter(a => a.status === 'queued' && a.kind !== 'note')
-  if (waiting.some(a => t - a.at < SEND_GRACE_MS)) await update($, tickA, n => n + 1)
+  if (waiting.some(a => t - a.at < SEND_GRACE_MS) || (await read($, refreshingA))) await update($, tickA, n => n + 1)
   if (await read($, busyA)) {
     for (const a of waiting) if (a.route === 'running turn' && t - a.at >= SEND_GRACE_MS) await appendNow($, a)
     return
@@ -960,11 +1030,11 @@ async function flushOutbox($: EngineInterface) {
 }
 
 /** Immediate course change: rides the running turn, or starts one. */
-async function steer($: EngineInterface, text: string) {
+async function steer($: EngineInterface, text: string, ref = '', prev = '') {
   const t = text.trim()
   if (!t) return
   await update($, steersA, list => [...list, { text: t, at: Date.now() }].slice(-20))
-  await enqueue($, 'steer', t, `🧭 [compass — steering from the user] ${t}\nAdjust the plan and your next steps accordingly from now on.`)
+  await enqueue($, 'steer', t, `🧭 [compass — steering from the user] ${t}\nAdjust the plan and your next steps accordingly from now on.`, ref, prev)
 }
 
 /** Quiet instruction: rides the user's next prompt, unless forced out with ⚡. */
@@ -1077,7 +1147,8 @@ async function sendRound($: EngineInterface) {
   const { handled } = frontierOf(items)
   if (!handled.length) return
   const round = await read($, grillRoundA)
-  await enqueue($, 'turn', `grill round ${round}: ${handled.length} answer${handled.length > 1 ? 's' : ''}`, roundMessage(round, handled))
+  const before = JSON.stringify(handled.map(q => [q.id, q.state]))
+  await enqueue($, 'turn', `grill round ${round}: ${handled.length} answer${handled.length > 1 ? 's' : ''}`, roundMessage(round, handled), 'grill', before)
   const ids = new Set(handled.map(q => q.id))
   await update($, grillA, list => list.map((q): CompassGrillQ => (ids.has(q.id) ? { ...q, state: q.state === 'followup' ? 'sent' : 'settled' } : q)))
   await update($, grillRoundA, r => r + 1)
@@ -1192,6 +1263,12 @@ export const register: Register = on => {
       }
     }
     void refreshPeers($)
+    // a reload (or a resume) may have missed a turn's end: chart again when the chart is behind
+    {
+      const m = await read($, mapA)
+      const turns = (await read($, statsA)).turns
+      if (m && isCurrent(m) && typeof m.turns === 'number' && turns > m.turns) wantRefresh()
+    }
     let ticks = 0
     $.clock.every(1000, async () => {
       if (++ticks % 5 === 0) void snapshot($).catch(() => undefined)
@@ -1329,6 +1406,11 @@ export const register: Register = on => {
 
   // the board posts moves and selections; its data is input to validate
   on('ui.message', async ($, e, next) => {
+    const press = presses.get(e.element)
+    if (press && (e.data as { type?: unknown } | undefined)?.type === 'press') {
+      await press()
+      return {}
+    }
     if (e.element === 'compass-crumb') {
       if ((e.data as { type?: unknown } | undefined)?.type === 'open') await togglePane($)
       return {}
@@ -1379,7 +1461,9 @@ export const register: Register = on => {
     await update($, busyA, () => true)
     // instant and free: the new request shows as "now" before any model call
     const request = plain(e.text.replace(/<[^>]+>/g, ' ').replace(/^🧭\s*\[compass[^\]]*\]\s*/u, ''))
-    if (request && !e.text.startsWith('<')) await update($, incomingA, () => ({ text: clip(request, 80), at: Date.now() }))
+    // the user's own request only: a turn compass submitted is already in the outbox as sent
+    const isOwn = /\[compass\b|^the compass plugin sent a message/i.test(e.text)
+    if (request && !e.text.startsWith('<') && !isOwn) await update($, incomingA, () => ({ text: clip(request, 80), at: Date.now() }))
     return next(e)
   })
 
@@ -1441,36 +1525,62 @@ export const register: Register = on => {
     const map = isCurrent(stored) ? stored : null
     const asks = frontierOf(await read($, grillA)).ask.length
     const queued = (await read($, actionsA)).filter(a => a.status === 'queued').length
+    const isRefreshing = await read($, refreshingA)
+    await read($, tickA)
+    const now = await $.clock.now()
+    // progress through the active milestone, drawn as a small bar
+    const { milestone } = locate(map)
+    const steps = (milestone?.steps ?? []).filter(s => s.kind !== 'aside')
+    const done = steps.filter(s => s.state === 'done').length
+    const hasBar = steps.length > 1
     // the engine's own hint keeps its room; the gist takes what is left, never wrapping
     const columns = e.viewport?.columns ?? 100
     const hint = glen(e.props.hint ?? '')
-    const budget = Math.max(24, columns - hint - 6)
+    const budget = Math.max(24, columns - hint - 6 - (hasBar ? 8 : 0) - 6)
     const incoming = await read($, incomingA)
     const parts = gist(map, asks, queued, budget, incoming?.text ?? null)
-    const tone = {
-      brand: { color: GOLD, bold: true },
-      past: { color: 'green', dim: true },
-      now: { color: 'cyan', bold: true },
-      blocked: { color: 'red', bold: true },
+    const text = {
+      past: { color: TONE.green.fg, dim: true },
+      now: { color: '#e6e6e6', bold: true },
+      blocked: { color: TONE.red.fg, bold: true },
       next: { dim: true },
       sep: { dim: true },
-      ask: { color: 'yellow', bold: true },
-      need: { color: 'red', bold: true },
-      queue: { dim: true },
     } as const
+    const PILL = { ask: 'yellow', need: 'red', queue: 'gray' } as const
     const engine = await next(e)
+    const spin = isRefreshing ? SPIN[Math.floor(now / 120) % SPIN.length] : ''
     // the engine's own node may only sit under a Box with no props
     return (
       <Box>
         <Box flexShrink={0}>
           {/* a Button draws one engine colour: where a Client can be drawn, the gold brand is one and takes the click */}
           {Client ? (
-            <Client key="compass-crumb" module="./brand.tsx" props={{ color: GOLD }} />
+            <Client key="compass-crumb" module="./brand.tsx" props={{ color: GOLD, bg: TONE.gold.bg, spin }} />
           ) : (
             <Button key="compass-crumb" plain label={parts[0]!.text} onPress={() => void togglePane($)} />
           )}
+          {hasBar ? (
+            <Text key="g:bar">
+              {' '}
+              <Text color={TONE.green.fg} backgroundColor={TRACK}>
+                {barText(done / steps.length, 5)}
+              </Text>
+              <Text dimColor>{` ${done}/${steps.length}`}</Text>
+            </Text>
+          ) : null}
           {parts.slice(1).map((p, i) => {
-            const t: { color?: string; bold?: boolean; dim?: boolean } = tone[p.tone]
+            if (p.tone === 'brand') return null
+            // the bar already shows where in the milestone the work is
+            if (hasBar && /^● step \d+\/\d+$/.test(p.text)) return null
+            if (p.tone === 'ask' || p.tone === 'need' || p.tone === 'queue') {
+              const t = TONE[PILL[p.tone]]
+              return (
+                <Text key={`g:${i}`} color={t.fg} backgroundColor={t.bg} bold>
+                  {` ${p.text} `}
+                </Text>
+              )
+            }
+            const t: { color?: string; bold?: boolean; dim?: boolean } = text[p.tone]
             return (
               <Text key={`g:${i}`} color={t.color} bold={t.bold} dimColor={t.dim} wrap="truncate-end">
                 {p.text}
@@ -1544,6 +1654,31 @@ export const register: Register = on => {
       <Button key={`fold:${key}`} plain dimColor label={`${isOpen(key) ? '▾' : '▸'} ${label}`} onPress={() => toggleIn($, key)} />
     )
 
+    // indicators: a tinted pill, a level bar, a pill button (a Client, so it keeps its colours)
+    const pill = (key: string, text: string, tone: Tone, bold = false) => (
+      <Box key={key} flexShrink={0}>
+        <Text color={TONE[tone].fg} backgroundColor={TONE[tone].bg} bold={bold}>
+          {` ${text} `}
+        </Text>
+      </Box>
+    )
+    const meter = (key: string, frac: number, cells: number, tone: Tone) => (
+      <Text key={key} color={TONE[tone].fg} backgroundColor={TRACK}>
+        {barText(frac, cells)}
+      </Text>
+    )
+    const pillBtn = (key: string, label: string, tone: Tone, onPress: () => unknown, isOn = false) => {
+      presses.set(key, onPress)
+      return Client ? (
+        <Box key={`${key}:box`} flexShrink={0}>
+          <Client key={key} module="./pill.tsx" props={{ label, fg: TONE[tone].fg, bg: TONE[tone].bg, isOn }} />
+        </Box>
+      ) : (
+        <Button key={key} plain dimColor={!isOn} label={label} onPress={() => void onPress()} />
+      )
+    }
+    const spin = SPIN[Math.floor(now / 120) % SPIN.length]!
+
     // a clickable label that wraps between words instead of being cut: the first row is the
     // button, the rest follow under it, so every word stays readable
     const wrapped = (key: string, text: string, room: number, onPress: () => unknown, opts: { dim?: boolean; indent?: number } = {}) => {
@@ -1562,46 +1697,34 @@ export const register: Register = on => {
       }
     }
 
-    // ── header ──
+    // ── header: a title bar, then the tabs as a segmented control ──
     const header = (
       <Box flexDirection="column" key="head">
         <Box justifyContent="space-between">
           <Box flexShrink={1}>
             <Text bold wrap="wrap">
-              <Text color={GOLD}>◈ </Text>
-              <Text color="cyan">{map?.goal || 'compass'}</Text>
+              <Text color={GOLD}>{'◈ '}</Text>
+              <Text color="#e6e6e6">{map?.goal || 'compass'}</Text>
             </Text>
           </Box>
-          <Box columnGap={1}>
-            <Button
-              key="legend"
-              label="key"
-              plain
-              dimColor={!isOpen('legend')}
-              onPress={async () => {
-                await update($, tabA, () => 'flow')
-                await toggleIn($, 'legend')
-              }}
-            />
-            <Button key="refresh" label="↻" plain hotkey="r" onPress={() => wantRefresh()} />
-            <Button key="close" label="✕" plain role="dismiss" onPress={() => void togglePane($)} />
+          <Box flexShrink={0} columnGap={1}>
+            {pillBtn('legend', '? key', isOpen('legend') ? 'cyan' : 'dim', async () => {
+              await update($, tabA, () => 'flow')
+              await toggleIn($, 'legend')
+            }, isOpen('legend'))}
+            {pillBtn('refresh', isRefreshing ? spin : '↻', isRefreshing ? 'cyan' : 'dim', () => wantRefresh())}
+            <Button key="close" plain dimColor label="✕" role="dismiss" onPress={() => void togglePane($)} />
           </Box>
         </Box>
-        <Box flexWrap="wrap" columnGap={2} marginTop={1}>
+        <Box flexWrap="wrap" marginTop={1}>
           {TABS.map(t => {
             const isOn = t.id === tab
-            const badge = t.id === 'grill' && front.ask.length ? ` ${front.ask.length}` : t.id === 'chat' && unreadAll ? ` ●${unreadAll}` : ''
+            const count = t.id === 'grill' ? front.ask.length : t.id === 'chat' ? unreadAll : 0
             return (
-              <Box key={`tabbox:${t.id}`} flexDirection="column">
-                <Box>
-                  <Button key={`tabicon:${t.id}`} label={t.icon} plain dimColor={!isOn} onPress={() => update($, tabA, () => t.id)} />
-                  <Text> </Text>
-                  <Button key={`tab:${t.id}`} label={`${t.label}${badge}`} plain dimColor={!isOn} onPress={() => update($, tabA, () => t.id)} />
-                  {t.id === 'chat' && <Text color={isRemote ? 'green' : 'red'}> ●</Text>}
-                </Box>
-                <Text color={isOn ? 'cyan' : undefined} dimColor={!isOn}>
-                  {(isOn ? '━' : ' ').repeat(t.label.length + badge.length + 2 + (t.id === 'chat' ? 2 : 0))}
-                </Text>
+              <Box key={`tabbox:${t.id}`} marginRight={1}>
+                {pillBtn(`tab:${t.id}`, `${t.icon} ${t.label}`, isOn ? 'blue' : 'dim', () => update($, tabA, () => t.id), isOn)}
+                {count > 0 ? pill(`tabn:${t.id}`, `${count}`, t.id === 'grill' ? 'yellow' : 'cyan', true) : null}
+                {t.id === 'chat' ? <Text color={isRemote ? TONE.green.fg : TONE.red.fg}>●</Text> : null}
               </Box>
             )
           })}
@@ -1610,45 +1733,34 @@ export const register: Register = on => {
     )
 
     // ── one graph row (accordion detail on click) ──
+    // a snapshot of the chart's plan, so cancelling the steer in the outbox puts it back
+    const planNow = () => JSON.stringify({ milestones: map?.milestones ?? [], tasks: map?.tasks ?? [] })
     const detail = (id: string, label: string, why: string, state: CompassState) => (
       <Box flexDirection="column" key={`detail:${id}`} paddingLeft={4}>
         {why ? <Text dimColor>↳ {why}</Text> : null}
         <Box columnGap={1} flexWrap="wrap">
-          {state !== 'done' && state !== 'active' && (
-            <Button key={`go:${id}`} plain label="▶ go" onPress={() => void steer($, `Switch focus now to: "${label}".`)} />
-          )}
-          {state !== 'done' && state !== 'abandoned' && (
-            <Button
-              key={`skip:${id}`}
-              plain
-              label="⤼ skip"
-              onPress={async () => {
-                await editMap($, mp => ({
-                  ...mp,
-                  milestones: mp.milestones.map(ms => ({ ...ms, steps: ms.steps.map(x => (x.id === id ? { ...x, state: 'abandoned', why: 'skipped by you' } : x)) })),
-                }))
-                await steer($, `Skip this, don't do it: "${label}".`)
-              }}
-            />
-          )}
-          {state === 'pending' && (
-            <Button
-              key={`later:${id}`}
-              plain
-              label="☐ later"
-              onPress={async () => {
-                await editMap($, mp => ({
-                  ...mp,
-                  milestones: mp.milestones.map(ms => ({ ...ms, steps: ms.steps.filter(x => x.id !== id) })),
-                  tasks: [...mp.tasks, { id: `l${id}`, text: label, lane: 'later', by: 'user', from: '' }],
-                }))
-                await queueNote($, `Defer to the backlog, not now: ${label}`)
-              }}
-            />
-          )}
-          {state === 'abandoned' && (
-            <Button key={`retry:${id}`} plain label="↺ retry" onPress={() => void steer($, `Revisit the dropped path: "${label}".`)} />
-          )}
+          {state !== 'done' && state !== 'active' && pillBtn(`go:${id}`, '▶ go', 'green', () => steer($, `Switch focus now to: "${label}".`))}
+          {state !== 'done' &&
+            state !== 'abandoned' &&
+            pillBtn(`skip:${id}`, '⤼ skip', 'red', async () => {
+              const before = planNow()
+              await editMap($, mp => ({
+                ...mp,
+                milestones: mp.milestones.map(ms => ({ ...ms, steps: ms.steps.map(x => (x.id === id ? { ...x, state: 'abandoned', why: 'skipped by you' } : x)) })),
+              }))
+              await steer($, `Skip this, don't do it: "${label}".`, 'plan', before)
+            })}
+          {state === 'pending' &&
+            pillBtn(`later:${id}`, '☐ later', 'blue', async () => {
+              const before = planNow()
+              await editMap($, mp => ({
+                ...mp,
+                milestones: mp.milestones.map(ms => ({ ...ms, steps: ms.steps.filter(x => x.id !== id) })),
+                tasks: [...mp.tasks, { id: `l${id}`, text: label, lane: 'later', by: 'user', from: '' }],
+              }))
+              await queueNote($, `Defer to the backlog, not now: ${label}`, 'plan', before)
+            })}
+          {state === 'abandoned' && pillBtn(`retry:${id}`, '↺ retry', 'yellow', () => steer($, `Revisit the dropped path: "${label}".`))}
         </Box>
       </Box>
     )
@@ -1670,11 +1782,8 @@ export const register: Register = on => {
               {m.glyph}{' '}
             </Text>
             {node.head}
-            {isNow && (
-              <Text color={s.state === 'blocked' ? 'red' : 'cyan'} bold>
-                {' '}◀ now
-              </Text>
-            )}
+            {isNow && <Text> </Text>}
+            {isNow && pill(`now:${s.id}`, s.state === 'blocked' ? '! waiting' : '◀ now', s.state === 'blocked' ? 'red' : 'cyan', true)}
           </Box>
           {node.tail}
           {selected === s.id && detail(s.id, s.label, s.why, s.state)}
@@ -1696,8 +1805,8 @@ export const register: Register = on => {
         const count = m.steps.length
         const msRow = wrapped(
           `msbtn:${m.id}`,
-          `${m.label}${m.state === 'abandoned' && m.why ? ` · ${m.why}` : ''}${!isActive && count ? `  ${isUnfolded ? '▾' : `+${count}`}` : ''}`,
-          width - 3,
+          `${m.label}${m.state === 'abandoned' && m.why ? ` · ${m.why}` : ''}${!isActive && count && isUnfolded ? '  ▾' : ''}`,
+          width - 8,
           () => (isActive ? undefined : toggleIn($, `m:${m.id}`)),
           { dim: m.state === 'done' || m.state === 'abandoned' || m.state === 'pending' },
         )
@@ -1708,6 +1817,8 @@ export const register: Register = on => {
                 {mk.glyph}{' '}
               </Text>
               {msRow.head}
+              {!isActive && count && !isUnfolded ? <Text> </Text> : null}
+              {!isActive && count && !isUnfolded ? pill(`msn:${m.id}`, `+${count}`, 'dim') : null}
             </Box>
             {msRow.tail}
           </Box>,
@@ -1733,41 +1844,39 @@ export const register: Register = on => {
         if (hereIdx >= 0) rows.push(stepRow(steps[hereIdx]!, false))
         const alt = isActive && map?.alt && !map.altPick ? map.alt : null
         if (alt) {
-          // the fork: the planned path on the left, the branch to the right; pick one to steer
-          const colW = Math.floor((width - 2) / 2)
-          const col = (key: string, title: string, color: string, why: string, items: string[], mark: string, pick: () => unknown, label: string) => (
-            <Box key={key} flexDirection="column" width={colW}>
-              {wordWrap(title, colW - 1).map((l, i) => (
-                <Text key={`${key}:t${i}`} color={color} bold>
+          // the fork: two cards side by side, the planned path and the branch; pick one to steer
+          const colW = Math.floor((width - 3) / 2)
+          const card = (key: string, title: string, tone: Tone, why: string, items: string[], mark: string, pick: () => unknown, label: string) => (
+            <Box key={key} flexDirection="column" width={colW} borderStyle="round" borderColor={TONE[tone].fg} borderDimColor={tone === 'dim'} paddingX={1}>
+              {wordWrap(title, colW - 4).map((l, i) => (
+                <Text key={`${key}:t${i}`} color={TONE[tone].fg} bold>
                   {l}
                 </Text>
               ))}
               {why
-                ? wordWrap(why, colW - 1).map((l, i) => (
+                ? wordWrap(why, colW - 4).map((l, i) => (
                     <Text key={`${key}:w${i}`} dimColor>
                       {l}
                     </Text>
                   ))
                 : null}
               {items.flatMap((it, i) =>
-                wordWrap(`${mark} ${it}`, colW - 1).map((l, j) => (
-                  <Text key={`${key}:s${i}:${j}`} dimColor={color !== 'cyan'}>
-                    {j ? `  ${l}` : l}
-                  </Text>
+                wordWrap(`${mark} ${it}`, colW - 4).map((l, j) => (
+                  <Text key={`${key}:s${i}:${j}`}>{j ? `  ${l}` : l}</Text>
                 )),
               )}
-              <Button key={`pick:${key}`} plain label={label} onPress={() => void pick()} />
+              <Box marginTop={1}>{pillBtn(`pick:${key}`, label, tone === 'dim' ? 'gray' : tone, pick)}</Box>
             </Box>
           )
           rows.push(
             <Box key={`fork:${m.id}`} flexDirection="column">
-              <Text dimColor>
-                ├─┬{'─'.repeat(Math.max(0, colW - 3))}╮ <Text color="yellow">two ways on</Text>
-              </Text>
               <Box>
-                <Text dimColor>│ </Text>
-                {col('main', '○ as planned', 'white', '', future.slice(0, FUTURE_KEEP + 1).map(s => s.label), '○', () => pickTrajectory($, 'main'), '▶ keep this')}
-                {col('branch', `◇ ${alt.label}`, 'cyan', alt.why, alt.steps, '◇', () => pickTrajectory($, 'branch'), '⤴ take this')}
+                <Text dimColor>├ </Text>
+                {pill(`forkp:${m.id}`, '⑂ two ways on', 'purple', true)}
+              </Box>
+              <Box columnGap={1}>
+                {card('main', 'as planned', 'dim', '', future.slice(0, FUTURE_KEEP + 1).map(s => s.label), '○', () => pickTrajectory($, 'main'), '▶ keep')}
+                {card('branch', alt.label, 'cyan', alt.why, alt.steps, '◇', () => pickTrajectory($, 'branch'), '⤴ take')}
               </Box>
             </Box>,
           )
@@ -1808,17 +1917,6 @@ export const register: Register = on => {
               ))}
             </Box>
           )}
-          {incoming && (
-            <Box key="incoming">
-              <Text color="cyan" bold>
-                ●{' '}
-              </Text>
-              <Text color="cyan" wrap="wrap">
-                {incoming.text}
-              </Text>
-              <Text dimColor> · charting</Text>
-            </Box>
-          )}
           {ms.length === 0 ? (
             art(
               'flow',
@@ -1839,15 +1937,14 @@ export const register: Register = on => {
           {q && (
             <Box key="flow:q" flexDirection="column">
               {(() => {
-                const w = wrapped('flow:qbtn', `Q${q.n} ${q.from ? `⇄${q.from} ` : ''}${q.title}${front.ask.length > 1 ? `  +${front.ask.length - 1} more` : ''}`, width - 2, async () => {
+                const w = wrapped('flow:qbtn', `${q.from ? `⇄${q.from} ` : ''}${q.title}${front.ask.length > 1 ? `  +${front.ask.length - 1} more` : ''}`, width - 9, async () => {
                   await update($, selectedA, () => `g:${q.id}`)
                   await update($, tabA, () => 'grill')
                 })
                 return [
                   <Box key="flow:qrow">
-                    <Text color="yellow" bold>
-                      ?{' '}
-                    </Text>
+                    {pill('flow:qp', `? Q${q.n}`, 'yellow', true)}
+                    <Text> </Text>
                     {w.head}
                   </Box>,
                   w.tail,
@@ -1858,10 +1955,11 @@ export const register: Register = on => {
           {board.now.length > 0 && (
             <Box key="flow:t" flexDirection="column">
               {(() => {
-                const w = wrapped('flow:tbtn', `now: ${board.now[0]!.from ? `⇄${board.now[0]!.from} ` : ''}${board.now[0]!.text}${board.next.length ? ` · next ${board.next.length}` : ''}${board.later.length ? ` · later ${board.later.length}` : ''}`, width - 2, () => update($, tabA, () => 'tasks'))
+                const w = wrapped('flow:tbtn', `${board.now[0]!.from ? `⇄${board.now[0]!.from} ` : ''}${board.now[0]!.text}`, width - 9, () => update($, tabA, () => 'tasks'))
                 return [
                   <Box key="flow:trow">
-                    <Text color="cyan">☐ </Text>
+                    {pill('flow:tp', '▶ doing', 'cyan', true)}
+                    <Text> </Text>
                     {w.head}
                   </Box>,
                   w.tail,
@@ -1869,8 +1967,16 @@ export const register: Register = on => {
               })()}
             </Box>
           )}
-          {step?.state === 'blocked' && <Text color="red">! waiting on you</Text>}
-          {steers.length > 0 && <Text dimColor wrap="wrap">↪ {steers[steers.length - 1]!.text}</Text>}
+          {(() => {
+            // the last steer that actually went in; a queued one waits in the outbox
+            const held = new Set(actions.filter(a => a.status === 'queued' && a.kind === 'steer').map(a => a.label))
+            const last = [...steers].reverse().find(x => !held.has(clip(x.text, 80)))
+            return last ? (
+              <Text dimColor wrap="wrap">
+                ↪ {last.text}
+              </Text>
+            ) : null
+          })()}
           {input('steer', '↪ steer the course…', 'steer', v => void steer($, v))}
         </Box>
       )
@@ -2004,11 +2110,11 @@ export const register: Register = on => {
         const c = tally(name)
         const fresh = unreadOf(name)
         return (
-          <Text>
-            {fresh ? <Text color="yellow" bold> ● {fresh} new</Text> : null}
-            {c.inn ? <Text color="cyan"> ◂{c.inn}</Text> : null}
-            {c.out ? <Text color="green"> ▸{c.out}</Text> : null}
-          </Text>
+          <Box flexShrink={0} columnGap={1} marginLeft={1}>
+            {fresh ? pill(`cn:${name}`, `● ${fresh} new`, 'yellow', true) : null}
+            {c.inn ? pill(`ci:${name}`, `◂ ${c.inn}`, 'cyan') : null}
+            {c.out ? pill(`co:${name}`, `▸ ${c.out}`, 'green') : null}
+          </Box>
         )
       }
       const openThread = (name: string) => async () => {
@@ -2032,15 +2138,10 @@ export const register: Register = on => {
       body = (
         <Box flexDirection="column" key="chat">
           <Box justifyContent="space-between">
-            <Text>
-              <Text color={isRemote ? 'green' : 'red'} bold>
-                ●{' '}
-              </Text>
-              <Text>remote control {isRemote ? 'online' : 'offline'}</Text>
-            </Text>
+            {pill('rc', `● remote control ${isRemote ? 'online' : 'offline'}`, isRemote ? 'green' : 'red', true)}
             <Box columnGap={1}>
-              <Text dimColor>{peersAt ? ago(now - peersAt) : ''}</Text>
-              <Button key="peers-refresh" plain label="↻" onPress={() => void refreshPeers($)} />
+              <Text dimColor>{peersAt ? `◷ ${span(now - peersAt)}` : ''}</Text>
+              {pillBtn('peers-refresh', '↻', 'dim', () => refreshPeers($))}
             </Box>
           </Box>
           {selfName ? <Text dimColor wrap="wrap">this session: {selfName}</Text> : null}
@@ -2050,13 +2151,12 @@ export const register: Register = on => {
           {peers.map(p => (
             <Box flexDirection="column" key={`peer:${p.id}`}>
               <Box>
-                <Text color={dot(p.status)}>● </Text>
-                <Button key={`peer:${p.name}`} plain label={p.name} onPress={openThread(p.name)} />
-                <Text dimColor wrap="wrap">
-                  {' '}
-                  {p.kind}
-                  {p.status ? ` · ${p.status}` : ''}
-                </Text>
+                <Text color={dot(p.status) === 'green' ? TONE.green.fg : dot(p.status) === 'yellow' ? TONE.yellow.fg : TONE.red.fg}>● </Text>
+                <Box flexShrink={1}>
+                  <Button key={`peer:${p.name}`} plain label={p.name} onPress={openThread(p.name)} />
+                </Box>
+                <Box flexGrow={1} />
+                {pill(`pk:${p.id}`, `${p.kind}${p.status ? ` · ${p.status}` : ''}`, 'dim')}
                 {counts(p.name)}
               </Box>
               {p.group && /remote/i.test(p.group) ? <Text dimColor>{'  '}{p.group}</Text> : null}
@@ -2289,66 +2389,86 @@ export const register: Register = on => {
       const msAll = map?.milestones.length ?? 0
       const msDone = (map?.milestones ?? []).filter(m => m.state === 'done').length
       const taskAll = board.now.length + board.next.length + board.later.length + board.done.length
-      const meter = (part: number, all: number, n: number, color: string) => {
-        const f = all ? Math.round((part / all) * n) : 0
-        return (
-          <Text>
-            <Text color={color}>{'█'.repeat(f)}</Text>
-            <Text dimColor>{'░'.repeat(n - f)}</Text>
-          </Text>
-        )
-      }
-      const kv = (icon: string, k: string, v: string, color = 'white') => (
-        <Box key={`s:${k}`} justifyContent="space-between">
-          <Text>
-            {icon} <Text dimColor>{k}</Text>
-          </Text>
-          <Text color={color} bold>
-            {v}
+      // one grid for every row: label | bar | value | reset, so bars and numbers line up
+      const LABEL_W = 22
+      const VALUE_W = 6
+      const TAIL_W = 10
+      const cells = Math.max(6, width - LABEL_W - VALUE_W - TAIL_W)
+      const label = (icon: string, k: string, tone: Tone) => (
+        <Box width={LABEL_W} flexShrink={0}>
+          <Text wrap="truncate-end">
+            <Text color={TONE[tone].fg}>{icon}</Text> <Text dimColor>{k}</Text>
           </Text>
         </Box>
       )
-      const barRow = (icon: string, k: string, part: number, all: number, color: string, label: string) => (
-        <Box key={`b:${k}`} justifyContent="space-between">
-          <Text>
-            {icon} <Text dimColor>{k}</Text>
-          </Text>
-          <Text>
-            {meter(part, all, 12, color)}
-            <Text bold> {label}</Text>
-          </Text>
+      const kv = (icon: string, k: string, v: string, tone: Tone = 'gray') => (
+        <Box key={`s:${k}`}>
+          {label(icon, k, tone)}
+          {pill(`sv:${k}`, v, tone, true)}
+        </Box>
+      )
+      const levelTone = (f: number): Tone => (f > 0.8 ? 'red' : f > 0.5 ? 'yellow' : 'green')
+      const barRow = (icon: string, k: string, part: number, all: number, tone: Tone, value: string, tail = '') => (
+        <Box key={`b:${k}`}>
+          {label(icon, k, tone)}
+          {meter(`bm:${k}`, all ? part / all : 0, cells, tone)}
+          <Box width={VALUE_W} flexShrink={0} justifyContent="flex-end">
+            <Text bold>{value}</Text>
+          </Box>
+          <Box width={TAIL_W} flexShrink={0}>
+            <Text dimColor>{tail ? ` ⟲ ${tail}` : ''}</Text>
+          </Box>
         </Box>
       )
       const head = (t: string) => (
-        <Text key={`h:${t}`} color="cyan" bold>
-          {t}
-        </Text>
+        <Box key={`h:${t}`} marginTop={1}>
+          <Text color={TONE.blue.fg} bold>
+            {t}
+          </Text>
+        </Box>
       )
       const pct = Math.round(stats.contextPct)
       const own = stats.own ?? EMPTY_STATS.own
+      const LIMIT_NAME: Record<string, string> = { five_hour: '5h window', seven_day: '7d window' }
       body = (
         <Box flexDirection="column" key="stats">
           {head('◷ session')}
-          {kv('◷', 'elapsed', ago(now - (stats.startedAt || now)))}
-          {kv('↻', 'turns', `${stats.turns}`)}
-          {kv('⚒', 'tool calls', `${calls}`, 'cyan')}
-          {kv('△', 'errors', `${stats.errors}`, stats.errors ? 'red' : 'green')}
-          {kv('✎', 'files edited', `${stats.files.length}`, 'yellow')}
-          {stats.costUsd > 0 && kv('$', 'session cost', `$${stats.costUsd.toFixed(2)}`, 'yellow')}
-          {barRow('◫', 'context', pct, 100, pct > 80 ? 'red' : pct > 50 ? 'yellow' : 'green', `${pct}%`)}
+          <Box flexWrap="wrap" columnGap={1}>
+            {pill('st:time', `◷ ${span(now - (stats.startedAt || now))}`, 'gray')}
+            {pill('st:turns', `↻ ${stats.turns}`, 'blue')}
+            {pill('st:calls', `⚒ ${calls}`, 'cyan')}
+            {pill('st:err', `△ ${stats.errors}`, stats.errors ? 'red' : 'green')}
+            {pill('st:files', `✎ ${stats.files.length}`, 'yellow')}
+            {stats.costUsd > 0 ? pill('st:cost', `$ ${stats.costUsd.toFixed(2)}`, 'gold') : null}
+          </Box>
+          <Box flexWrap="wrap" columnGap={1} marginTop={1}>
+            {pill('st:in', `↑ ${kfmt(stats.tokensIn)}`, 'red')}
+            {pill('st:out', `↓ ${kfmt(stats.tokensOut)}`, 'green')}
+            {pill('st:cache', `≋ ${kfmt(stats.tokensCached)}`, 'purple')}
+          </Box>
+          {head('▤ limits')}
+          {barRow('◫', 'context', pct, 100, levelTone(pct / 100), `${pct}%`)}
+          {(stats.limits ?? []).map(l => {
+            const reset = l.resetsAt ? Date.parse(l.resetsAt) - now : NaN
+            return barRow(l.kind === 'seven_day' ? '▦' : '◔', LIMIT_NAME[l.kind] ?? l.kind, l.pct, 100, levelTone(l.pct / 100), `${Math.round(l.pct)}%`, Number.isFinite(reset) ? span(reset) : '')
+          })}
           {head('├ course')}
           {barRow('⚑', 'milestones', msDone, msAll, 'green', `${msDone}/${msAll}`)}
           {barRow('☑', 'tasks', board.done.length, taskAll, 'cyan', `${board.done.length}/${taskAll}`)}
           {barRow('?', 'grill', front.settled.length, grill.length, 'yellow', `${front.settled.length}/${grill.length}`)}
           {kv('●', 'steps · ✗ dead ends', `${steps.filter(s => s.state === 'done').length} · ${steps.filter(s => s.state === 'abandoned').length}`, 'green')}
-          {kv('↪', 'steers · ◌ asides', `${steers.length} · ${btw.length}`, 'magenta')}
+          {kv('↪', 'steers · ◌ asides', `${steers.length} · ${btw.length}`, 'purple')}
           {head('⚒ tools')}
           {top.length === 0 && art('stats', 'no tool calls yet')}
           {top.map(([name, n], i) => (
             <Box key={`tool:${name}`}>
-              <Text>{clip(name, 12).padEnd(13)}</Text>
-              <Text color={['cyan', 'green', 'yellow', 'magenta'][i % 4]}>{'▇'.repeat(Math.max(1, Math.round((n / max) * Math.max(4, width - 20))))}</Text>
-              <Text bold> {n}</Text>
+              <Box width={LABEL_W} flexShrink={0}>
+                <Text wrap="truncate-end">{name.replace(/^mcp__/, '')}</Text>
+              </Box>
+              {meter(`tm:${name}`, n / max, cells, (['cyan', 'green', 'yellow', 'purple'] as const)[i % 4]!)}
+              <Box width={VALUE_W} flexShrink={0} justifyContent="flex-end">
+                <Text bold>{n}</Text>
+              </Box>
             </Box>
           ))}
           <Box marginTop={1} flexDirection="column">
@@ -2407,94 +2527,93 @@ export const register: Register = on => {
     await read($, tickA)
     const queued = actions.filter(a => a.status === 'queued')
     const sent = actions.filter(a => a.status !== 'queued' && now - a.at < 600_000).reverse()
-    const WHEN = { 'running turn': ['↪', 'cyan'], 'new turn': ['⏭', 'yellow'], 'next prompt': ['✎', 'magenta'], '': ['⋯', 'yellow'] } as const
-    const pad = <Text key="pad" wrap="truncate-end">{' '.repeat(width)}</Text>
+    const WHEN = { 'running turn': ['↪', 'cyan'], 'new turn': ['⏭', 'yellow'], 'next prompt': ['✎', 'purple'], '': ['⋯', 'yellow'] } as const
     const footRows: ReturnType<typeof h>[] = []
-    footRows.push(
-      <Text key="f:rule" dimColor>
-        {'┄'.repeat(width)}
-      </Text>,
-    )
     const groups = (['running turn', 'new turn', 'next prompt'] as const).filter(r => queued.some(a => a.route === r))
-    const groupName = { 'running turn': 'into this turn', 'new turn': isBusy ? 'after this turn' : 'as a new turn', 'next prompt': 'with your next prompt' } as const
-    const headLen = 12 + groups.reduce((n, r) => n + 4 + glen(groupName[r]), 0) + (sent.length ? 6 : 0)
-    const isLegendShort = headLen > width
+    const groupName = { 'running turn': 'into this turn', 'new turn': isBusy ? 'after this turn' : 'next turn', 'next prompt': 'with next prompt' } as const
+    const failed = sent.filter(a => a.status === 'rejected').length
     footRows.push(
-      <Box key="f:head">
-        <Text bold={queued.length > 0} color={queued.length ? 'yellow' : undefined} dimColor={!queued.length}>
-          ⇣ {queued.length ? `${queued.length} queued` : 'queue empty'}
-        </Text>
+      <Box key="f:head" backgroundColor={PANEL}>
+        {queued.length ? pill('f:count', `⇣ ${queued.length}`, 'yellow', true) : <Text color={TONE.dim.fg} backgroundColor={PANEL}>{' ⇣ outbox empty'}</Text>}
         {groups.map(r => (
-          <Text key={`f:g:${r}`} dimColor wrap="truncate-end">
+          <Text key={`f:g:${r}`} backgroundColor={PANEL} wrap="truncate-end">
             {'  '}
-            <Text color={WHEN[r][1]}>{WHEN[r][0]}</Text>
-            {isLegendShort ? queued.filter(a => a.route === r).length : ` ${groupName[r]}`}
+            <Text color={TONE[WHEN[r][1]].fg}>{WHEN[r][0]}</Text>
+            <Text color={TONE.dim.fg}>
+              {' '}
+              {width < 56 ? queued.filter(a => a.route === r).length : groupName[r]}
+            </Text>
           </Text>
         ))}
         <Box flexGrow={1} />
-        {sent.length > 0 && <Button key="fold:activity" plain dimColor label={`${isOpen('activity') ? '▾' : '▸'} ✓${sent.length}`} onPress={() => toggleIn($, 'activity')} />}
-        {pad}
+        {sent.length > 0 && <Button key="fold:activity" plain dimColor label={`${isOpen('activity') ? '▾' : '▸'} ✓${sent.length - failed}${failed ? ` ✗${failed}` : ''} `} onPress={() => toggleIn($, 'activity')} />}
       </Box>,
     )
     for (const r of groups) {
       const list = queued.filter(a => a.route === r)
-      list.forEach((a, i) => {
+      for (const a of list) {
         const left = Math.max(0, Math.ceil((a.at + SEND_GRACE_MS - now) / 1000))
-        const clock = r !== 'next prompt' && left > 0 ? `${left}s ` : ''
-        const ctl = (list.length > 1 ? 4 : 0) + 4
-        const lines = wordWrap(a.label, Math.max(8, width - 2 - glen(clock) - ctl - 1))
-        const isPreview = isOpen(`ob:${a.id}`)
+        const timer = r !== 'next prompt' && left > 0 ? dotsText(left, SEND_GRACE_MS / 1000) : ''
+        const ctl = (list.length > 1 ? 4 : 0) + 5
+        const lines = wordWrap(a.label, Math.max(8, width - 3 - (timer ? timer.length + 1 : 0) - ctl))
         footRows.push(
-          <Box key={`f:${a.id}`}>
-            <Text color={WHEN[r][1]} bold>
-              {WHEN[r][0]}{' '}
-            </Text>
-            {clock ? <Text dimColor>{clock}</Text> : null}
+          <Box key={`f:${a.id}`} backgroundColor={PANEL}>
+            <Box flexShrink={0}>
+              <Text color={TONE[WHEN[r][1]].fg} backgroundColor={PANEL} bold>
+                {` ${WHEN[r][0]} `}
+              </Text>
+              {timer ? (
+                <Text color={TONE[WHEN[r][1]].fg} backgroundColor={PANEL}>
+                  {timer}{' '}
+                </Text>
+              ) : null}
+            </Box>
             <Button key={`obl:${a.id}`} plain dimColor={r === 'next prompt'} label={lines[0] ?? ''} onPress={() => toggleIn($, `ob:${a.id}`)} />
             <Box flexGrow={1} />
             {list.length > 1 && <Button key={`up:${a.id}`} plain dimColor label=" ▲" onPress={() => void moveAction($, a.id, -1)} />}
             {list.length > 1 && <Button key={`down:${a.id}`} plain dimColor label=" ▼" onPress={() => void moveAction($, a.id, 1)} />}
             <Button key={`force:${a.id}`} plain label=" ⚡" onPress={() => void forceAction($, a.id)} />
-            <Button key={`drop:${a.id}`} plain label=" ✕" onPress={() => void removeAction($, a.id)} />
-            {pad}
+            <Button key={`drop:${a.id}`} plain label=" ✕ " onPress={() => void removeAction($, a.id)} />
           </Box>,
         )
         lines.slice(1).forEach((l, j) =>
           footRows.push(
-            <Box key={`f:${a.id}:${j}`}>
-              <Text>
-                {'  '}
+            <Box key={`f:${a.id}:${j}`} backgroundColor={PANEL}>
+              <Text backgroundColor={PANEL}>
+                {'   '}
                 {l}
               </Text>
-              {pad}
             </Box>,
           ),
         )
-        if (isPreview)
-          wordWrap(a.text, width - 4).forEach((l, j) =>
+        if (isOpen(`ob:${a.id}`))
+          wordWrap(a.text, width - 5).forEach((l, j) =>
             footRows.push(
-              <Box key={`f:${a.id}:p${j}`}>
-                <Text dimColor>
-                  {'  │ '}
+              <Box key={`f:${a.id}:p${j}`} backgroundColor={PANEL}>
+                <Text dimColor backgroundColor={PANEL}>
+                  {'   │ '}
                   {l}
                 </Text>
-                {pad}
               </Box>,
             ),
           )
-        void i
-      })
+      }
     }
     if (isOpen('activity'))
       for (const a of sent.slice(0, 6)) {
-        const tail = a.status === 'sent' ? ` ${ago(now - a.at)}` : ' ✗'
+        const tail = a.status === 'sent' ? ` ${span(now - a.at)} ` : ' ✗ '
         footRows.push(
-          <Box key={`f:s:${a.id}`}>
-            <Text color={a.status === 'sent' ? 'green' : 'red'}>{a.status === 'sent' ? '✓ ' : '✗ '}</Text>
-            <Text dimColor>{wordWrap(a.label, Math.max(8, width - 3 - glen(tail)))[0]}</Text>
+          <Box key={`f:s:${a.id}`} backgroundColor={PANEL}>
+            <Text color={a.status === 'sent' ? TONE.green.fg : TONE.red.fg} backgroundColor={PANEL}>
+              {a.status === 'sent' ? ' ✓ ' : ' ✗ '}
+            </Text>
+            <Text dimColor backgroundColor={PANEL}>
+              {wordWrap(a.label, Math.max(8, width - 4 - glen(tail)))[0]}
+            </Text>
             <Box flexGrow={1} />
-            <Text dimColor>{tail}</Text>
-            {pad}
+            <Text dimColor backgroundColor={PANEL}>
+              {tail}
+            </Text>
           </Box>,
         )
       }
@@ -2502,7 +2621,7 @@ export const register: Register = on => {
     const scroll = e.props.scroll
     const footTop = Math.max(0, scroll.offset + scroll.bodyRows - footH)
     const activity = (
-      <Box key="activity" position="absolute" top={footTop} left={0} width={width} flexDirection="column" overflow="hidden">
+      <Box key="activity" position="absolute" top={footTop} left={0} width={width} flexDirection="column" overflow="hidden" backgroundColor={PANEL}>
         {footRows}
       </Box>
     )
@@ -2510,26 +2629,31 @@ export const register: Register = on => {
     // is the chart caught up with the session? one line, always on top
     const behind = map && typeof map.turns === 'number' ? Math.max(0, stats.turns - map.turns) : 0
     const unseen = map ? actions.filter(a => a.status === 'sent' && a.at > map.at).length : 0
-    const syncLine = (() => {
-      if (isRefreshing) return { glyph: '⟳', color: 'cyan', text: incoming ? `charting your new message: ${incoming.text}` : 'updating the chart…', canRefresh: false }
-      if (!map) return { glyph: '◌', color: 'yellow', text: stats.turns ? 'no chart yet' : 'charting starts after the first turn', canRefresh: stats.turns > 0 }
-      if (incoming) return { glyph: '◌', color: 'yellow', text: `not charted yet: your message "${incoming.text}"${isBusy ? ' · charts when the turn ends' : ''}`, canRefresh: !isBusy }
-      if (behind) return { glyph: '◌', color: 'yellow', text: `${behind} turn${behind > 1 ? 's' : ''} behind the session`, canRefresh: true }
-      if (unseen) return { glyph: '◌', color: 'yellow', text: `${unseen} of your pane updates went in after this chart`, canRefresh: !isBusy }
-      return { glyph: '✓', color: 'green', text: `in sync · includes your last message and updates`, canRefresh: false }
+    const syncLine = ((): { tone: Tone; glyph: string; text: string; detail: string; canRefresh: boolean } => {
+      if (isRefreshing) return { tone: 'cyan', glyph: spin, text: 'charting', detail: incoming ? incoming.text : '', canRefresh: false }
+      if (!map) return { tone: 'dim', glyph: '◌', text: stats.turns ? 'no chart yet' : 'waiting for the first turn', detail: '', canRefresh: stats.turns > 0 }
+      if (incoming) return { tone: 'yellow', glyph: '◌', text: 'new message not charted', detail: `${incoming.text}${isBusy ? ' · after this turn' : ''}`, canRefresh: !isBusy }
+      if (behind) return { tone: 'yellow', glyph: '◌', text: `${behind} turn${behind > 1 ? 's' : ''} behind`, detail: '', canRefresh: true }
+      if (unseen) return { tone: 'yellow', glyph: '◌', text: `${unseen} update${unseen > 1 ? 's' : ''} not charted`, detail: '', canRefresh: !isBusy }
+      return { tone: 'green', glyph: '✓', text: 'in sync', detail: '', canRefresh: false }
     })()
     const sync = (
-      <Box key="sync" justifyContent="space-between">
-        <Box flexShrink={1}>
-          <Text wrap="wrap">
-            <Text color={syncLine.color} bold>
-              {syncLine.glyph}{' '}
+      <Box key="sync" marginTop={1} marginBottom={1}>
+        {pill('sync:state', `${syncLine.glyph} ${syncLine.text}`, syncLine.tone, true)}
+        {map ? (
+          <Box flexShrink={0}>
+            <Text dimColor>{` ◷ ${span(now - map.at)}`}</Text>
+          </Box>
+        ) : null}
+        <Box flexGrow={1} flexShrink={1}>
+          {syncLine.detail ? (
+            <Text dimColor wrap="wrap">
+              {'  '}
+              {syncLine.detail}
             </Text>
-            <Text dimColor={syncLine.glyph === '✓'}>{syncLine.text}</Text>
-            {map ? <Text dimColor> · charted {ago(now - map.at)} ago</Text> : null}
-          </Text>
+          ) : null}
         </Box>
-        {syncLine.canRefresh && <Button key="sync:refresh" plain label=" ↻ update" onPress={() => wantRefresh()} />}
+        {syncLine.canRefresh && pillBtn('sync:refresh', '↻ update', 'cyan', () => wantRefresh())}
       </Box>
     )
 
