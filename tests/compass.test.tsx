@@ -951,3 +951,35 @@ test('transcriptDigest keeps the first request and the latest exchanges within i
   expect(d).toMatch(/message 199/)
   expect(d.length < 3000 + 300).toBe(true)
 })
+
+test('a session too long to fork is charted from a digest; an interrupted turn is left alone', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  let forkReason = 'api-error'
+  const asked: string[] = []
+  on('model.fork', () => ({ value: { isAnswered: false, reason: forkReason, status: 400, error: 'invalid_request_error' } }) as never)
+  on('model.complete', (_$, e) => {
+    asked.push((e as { prompt: string }).prompt)
+    return { value: { isAnswered: true, text: JSON.stringify(MAP), usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } } as never
+  })
+  on('session.id', () => ({ value: 'sess-long' }))
+  on('session.messages', () => ({ value: [{ role: 'user', text: 'a very long session', toolUses: [] }, { role: 'assistant', text: 'lots of work', toolUses: [] }] }) as never)
+  on('session.usage', () => ({ value: { startedAt: 1, context: { window: 1000, percent: 95 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }) as never)
+  on('turn.complete', (_$, e) => ({ text: e.answer }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  await clock.advance(1500)
+  expect(asked.length).toBe(1)
+  expect(await ui.find({ key: 'node:s4' })).toBeDefined()
+  expect(await ui.find({ text: /chart not updated/ })).toBeUndefined()
+  // aborted: no fallback call
+  forkReason = 'aborted'
+  await tap(ui, 'sync:refresh')
+  await clock.advance(1500)
+  expect(asked.length).toBe(1)
+  await ui.unmount()
+})

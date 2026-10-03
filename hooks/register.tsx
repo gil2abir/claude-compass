@@ -1038,11 +1038,13 @@ async function refresh($: EngineInterface) {
     let reply: ModelForkResult = await $.model.fork({ prompt })
     // the very first turn has no answer yet to fork from: chart from the request itself, fast,
     // so the first chart lands while Claude is still working; the turn's end charts it in full
-    // nothing to fork yet: the first turn of a new session, or a session resumed or restarted
-    // before its next request. Chart from what there is, with the fast model; the next turn's end
-    // charts it again from the shared, cached context
+    // the fork failed or had nothing to branch from: the first turn of a new session, a session
+    // resumed or restarted before its next request, or one too long to fork (an API error or an
+    // empty reply). Chart from a digest of the conversation with the fast model; the next turn's
+    // end tries the shared, cached context again. An interrupted turn (aborted) is left alone.
     let isQuick = false
-    if (!reply.isAnswered && reply.reason === 'nothing-to-fork') {
+    const forkFailed = reply.isAnswered ? '' : reply.reason
+    if (!reply.isAnswered && reply.reason !== 'aborted') {
       const saved = transcriptDigest(await $.session.messages())
       const brief = saved || (lastRequest ? `The session's first request: ${lastRequest}` : '')
       if (brief) {
@@ -1066,7 +1068,8 @@ async function refresh($: EngineInterface) {
     }
     if (!reply.isAnswered) {
       // nothing to fork and nothing saved: a brand-new session, which is no error
-      await update($, errorA, () => (reply.reason === 'nothing-to-fork' ? null : `chart not updated (${reply.reason}); kept the last one · ↻ to retry`))
+      const why = forkFailed && forkFailed !== 'nothing-to-fork' ? forkFailed : reply.reason
+      await update($, errorA, () => (why === 'nothing-to-fork' ? null : `chart not updated (${why}); kept the last one · ↻ to retry`))
       return
     }
     if (!map) {
