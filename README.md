@@ -1,5 +1,9 @@
 # 🧭 compass
 
+<p align="center"><img src="docs/demo.gif" alt="compass in a Claude Code session: the sea chart, a live flow chart of the session, Claude's questions, the outbox and steering" width="900"></p>
+
+<p align="center"><b>See</b> what your Claude Code session is doing · <b>project</b> where it is headed · <b>steer</b> it.<br><a href="docs/demo.mp4">Watch the demo video (MP4)</a></p>
+
 A Claude Code mod that keeps a live map of your session: where you were, where you are, and where you're headed. It sits in a pane docked on the right, so the transcript keeps scrolling beside it, and you can steer the session from it.
 
 Requires Claude Code 2.1.287 or later (`claude --version`).
@@ -20,7 +24,7 @@ The pane is drawn like a small GUI: indicators are graphics (colored pills, leve
 
 Click the gold `◈ compass` under the prompt to open or close the pane, or type `/compass`. Next to it, one panel of chips: the course (`✓ last │ ● now │ ○ next`), the current milestone (`⚑ M4 ██░ 1/5 steps`, the same M4 as in the flow tab), and chips for anything waiting on you (`? 2 to answer`, `⑂ 2 ways`, `⇣ 1 queued`). Short on room, parts leave a chip before whole chips go.
 
-At the top of every tab, a **sync line**: whether the chart has caught up with the session: `✓ in sync`, `⟳ charting your new message`, `◌ not charted yet: your message …`, `◌ N turns behind`, with `↻ update`.
+At the top of every tab, a **sync line** says what is going on with the chart and whether you need to do anything: `⠋ charting now · nothing to do`, `◌ chart coming · drawn in a few seconds`, `◌ 1 turn behind · updates when this turn ends`, or, when it needs you, `press ↻ update` with the button beside it. Under the flow, the **steer card** takes a sentence that points the whole session somewhere new; the steers you sent (yours, and go / skip / later / retry and fork picks) fold under it.
 
 Pinned to the bottom of the pane, the **outbox**: everything the pane will put into the session, one line per item, marked by when it goes: `↪` into this turn, `⏭` as the next turn, `✎` with your next prompt. Every item waits 8 s (with a countdown) before it is sent, so you can still change your mind: click to preview the exact text, `▲▼` to reorder, `⚡` to send now, `✕` to remove (what it did in the pane is undone). `✓n` unfolds what was already sent.
 
