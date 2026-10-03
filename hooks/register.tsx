@@ -452,7 +452,7 @@ export const parseLoose = (text: string): Record<string, unknown> | null => {
   return null
 }
 
-type GrillDraft = Pick<CompassGrillQ, 'id' | 'title' | 'body' | 'options' | 'rec' | 'dependsOn' | 'mode' | 'from'>
+type GrillDraft = Pick<CompassGrillQ, 'id' | 'title' | 'body' | 'options' | 'rec' | 'dependsOn' | 'mode' | 'from' | 'blocking'>
 
 const grillDrafts = (v: unknown, fallbackMode: 'plan' | 'work'): GrillDraft[] =>
   objs(v)
@@ -466,10 +466,11 @@ const grillDrafts = (v: unknown, fallbackMode: 'plan' | 'work'): GrillDraft[] =>
       dependsOn: strs(q.dependsOn, 6, 32),
       mode: q.mode === 'plan' || q.mode === 'work' ? q.mode : fallbackMode,
       from: str(q.from, 30),
+      blocking: q.blocking === true,
     }))
 
 /** Coerces a fork reply into a CompassMap, plus any decisions it inferred for the grill. */
-export const parseMap = (text: string, at: number): (CompassMap & { grill: GrillDraft[] }) | null => {
+export const parseMap = (text: string, at: number): (CompassMap & { grill: GrillDraft[]; moot: string[] }) | null => {
   const o = parseLoose(text)
   if (!o || !Array.isArray(o.milestones)) return null
   const milestones: CompassMilestone[] = objs(o.milestones)
@@ -501,7 +502,7 @@ export const parseMap = (text: string, at: number): (CompassMap & { grill: Grill
   const a = o.alt && typeof o.alt === 'object' ? (o.alt as Record<string, unknown>) : null
   const altSteps = a ? strs(a.steps, 4, 40) : []
   const alt: CompassAlt | null = a && str(a.label, 40) && altSteps.length ? { label: str(a.label, 40), why: str(a.why, 80), steps: altSteps } : null
-  return { goal: str(o.goal, 60), milestones, tasks, recap: strs(o.recap, 7, 140), at, alt, grill: grillDrafts(o.grill, 'work') }
+  return { goal: str(o.goal, 60), milestones, tasks, recap: strs(o.recap, 7, 140), at, alt, grill: grillDrafts(o.grill, 'work'), moot: strs(o.moot, 12, 32) }
 }
 
 /** The active milestone and its active (or blocked) step: the "you are here". */
@@ -603,7 +604,7 @@ const partWidth = (x: HintPart) => (x.bar !== undefined ? BAR_CELLS : glen(x.tex
  * short, parts leave from inside a chip first (last step, next step, long labels), then whole
  * chips by priority, so every chip stays one unit. `room` counts the panel's own padding.
  */
-export const hintChips = (map: CompassMap | null, asks: number, queued: number, room: number, incoming: string | null = null): HintChip[] => {
+export const hintChips = (map: CompassMap | null, asks: number, queued: number, room: number, incoming: string | null = null, blocking = 0): HintChip[] => {
   const SEP: HintPart = { text: ' │ ', isDim: true }
   const chip = (key: string, tone: Tone, parts: HintPart[]): HintChip => ({ key, tone, parts, width: 2 + parts.reduce((n, x) => n + partWidth(x), 0) })
   const BRAND = 11
@@ -634,11 +635,12 @@ export const hintChips = (map: CompassMap | null, asks: number, queued: number, 
   const needs = (isShort: boolean, keep: string[]) =>
     [
       isBlocked ? chip('need', 'red', [{ text: isShort ? '!' : '! needs you', isBold: true }]) : null,
-      asks ? chip('ask', 'yellow', [{ text: isShort ? `? ${asks}` : `? ${asks} to answer`, isBold: true }]) : null,
+      blocking ? chip('block', 'red', [{ text: isShort ? `⏸ ${blocking}` : `⏸ ${blocking} waits on you`, isBold: true }]) : null,
+      asks - blocking > 0 ? chip('ask', 'yellow', [{ text: isShort ? `? ${asks - blocking}` : `? ${asks - blocking} open`, isBold: true }]) : null,
       map?.alt && !map.altPick ? chip('fork', 'purple', [{ text: isShort ? '⑂' : '⑂ 2 ways', isBold: true }]) : null,
       queued ? chip('queue', 'gray', [{ text: isShort ? `⇣ ${queued}` : `⇣ ${queued} queued` }]) : null,
     ].filter((c): c is HintChip => c !== null && keep.includes(c.key))
-  const ALL = ['need', 'ask', 'fork', 'queue']
+  const ALL = ['need', 'block', 'ask', 'fork', 'queue']
   const p = progress ? [progress] : []
   // richest first; each step down gives up the least: parts of a chip, then words, then whole chips
   const tries: HintChip[][] = [
@@ -647,10 +649,10 @@ export const hintChips = (map: CompassMap | null, asks: number, queued: number, 
     [course(false, false), ...p, ...needs(false, ALL)],
     [course(false, false), ...p, ...needs(true, ALL)],
     [course(false, false), ...needs(true, ALL)],
-    [course(false, false), ...needs(true, ['need', 'ask', 'fork'])],
-    [course(false, false), ...needs(true, ['need', 'ask'])],
+    [course(false, false), ...needs(true, ['need', 'block', 'ask', 'fork'])],
+    [course(false, false), ...needs(true, ['need', 'block', 'ask'])],
     [course(false, false)],
-    needs(true, ['need', 'ask']),
+    needs(true, ['need', 'block', 'ask']),
   ]
   return tries.find(fits) ?? []
 }
@@ -670,10 +672,11 @@ export const boardOf = (map: CompassMap | null, userTasks: { id: string; text: s
 /** The grilling frontier: open questions whose prerequisites are all settled. */
 export const frontierOf = (items: CompassGrillQ[]) => {
   const ids = new Set(items.map(q => q.id))
-  const settled = new Set(items.filter(q => q.state === 'settled').map(q => q.id))
+  const settled = new Set(items.filter(q => q.state === 'settled' || q.state === 'parked').map(q => q.id))
   const isReady = (q: CompassGrillQ) => q.dependsOn.every(d => !ids.has(d) || settled.has(d))
-  const live = items.filter(q => q.state !== 'settled')
+  const live = items.filter(q => q.state !== 'settled' && q.state !== 'parked')
   return {
+    parked: items.filter(q => q.state === 'parked'),
     ask: live.filter(q => q.state === 'open' && isReady(q)),
     handled: live.filter(q => q.state === 'answered' || q.state === 'followup'),
     waiting: live.filter(q => q.state === 'open' && !isReady(q)),
@@ -691,7 +694,9 @@ export const mergeGrill = (items: CompassGrillQ[], drafts: GrillDraft[], topic: 
     const same = list.find(q => q.id === d.id) ?? (source === 'map' ? list.find(q => q.title.toLowerCase() === d.title.toLowerCase()) : undefined)
     if (same) {
       if (source === 'map') continue
-      list = list.map((q): CompassGrillQ => (q === same ? { ...q, ...d, topic: topic || q.topic, state: q.state === 'settled' ? 'settled' : 'open', answer: q.state === 'settled' ? q.answer : '', at } : q))
+      list = list.map((q): CompassGrillQ =>
+        q === same ? { ...q, ...d, topic: topic || q.topic, state: q.state === 'settled' || q.state === 'parked' ? q.state : 'open', answer: q.state === 'settled' ? q.answer : '', at } : q,
+      )
     } else {
       const n = list.reduce((m, q) => Math.max(m, q.n), 0) + 1
       list.push({ ...d, n, topic, source, state: 'open', answer: '', followups: [], at })
@@ -719,7 +724,10 @@ The user answers your questions in the compass pane's grill tab while you work. 
 - Facts are your job: read files, run tools, dispatch sub-agents rather than asking. Decisions are the user's: never answer them yourself.
 - Do not block: after posting, continue only with work that does not depend on the open answers, else end your turn. Answers arrive as a new user turn, one round at a time.
 - A follow-up keeps its question open: answer it, then re-ask the question with the same id and a clarified body.
-- When the frontier is empty, call the tool with askConfirm; do not act on a plan until the user confirms the shared understanding.`
+- When the frontier is empty, call the tool with askConfirm; do not act on a plan until the user confirms the shared understanding.
+- Mark each question blocking: true only when work truly waits on it; otherwise blocking: false and keep working on your recommendation, ready to adjust when the answer comes.
+- Keep checking as the work moves: new goals, ideas, trade-offs, or second-order effects down the road that the user should decide or know about are new questions.
+- The user answers what they want, when they want, in any order. A parked question means: do not wait for it and do not ask again now; proceed with your recommendation and keep it open. A dismissed question is dropped.`
 
 const mapPrompt = (
   prev: CompassMap | null,
@@ -733,7 +741,7 @@ const mapPrompt = (
   [
     'You are COMPASS, a silent observer of this session. Do NOT continue the task, call tools, or address the user.',
     'Reply with ONLY one minified JSON object (no prose, no fence). Be terse: the whole reply must stay under 2500 characters.',
-    '{"goal":s,"milestones":[{"id":s,"label":s,"state":"done|active|pending|abandoned","why":s,"steps":[{"id":s,"label":s,"kind":"step|attempt|decision|aside","state":"done|active|pending|abandoned|blocked","why":s}]}],"tasks":[{"id":s,"text":s,"lane":"now|next|later|done","by":"agent|user","from":s}],"recap":[s],"alt":{"label":s,"why":s,"steps":[s]}|null,"grill":[{"id":s,"title":s,"body":s,"options":[s],"recommendation":s,"dependsOn":[s],"from":s}]}',
+    '{"goal":s,"milestones":[{"id":s,"label":s,"state":"done|active|pending|abandoned","why":s,"steps":[{"id":s,"label":s,"kind":"step|attempt|decision|aside","state":"done|active|pending|abandoned|blocked","why":s}]}],"tasks":[{"id":s,"text":s,"lane":"now|next|later|done","by":"agent|user","from":s}],"recap":[s],"moot":[s],"alt":{"label":s,"why":s,"steps":[s]}|null,"grill":[{"id":s,"title":s,"body":s,"options":[s],"recommendation":s,"dependsOn":[s],"from":s,"blocking":b}]}',
     'Model = version tree + phase chunking:',
     '- goal: the session goal, ≤6 words.',
     '- milestones: 3-7 phases in order — done ones, exactly ONE active, then planned pending ones. abandoned = a dropped phase (why = reason ≤6 words).',
@@ -744,7 +752,9 @@ const mapPrompt = (
     '- recap: 3-6 bullets, ≤18 words each, what happened and where things stand.',
     '- alt: when the last turns show the work could go another way (a different goal, requirement or approach the user hinted at or the agent raised), the single most plausible OTHER trajectory from now: label ≤5 words, why ≤10 words (what it trades off), steps 2-4 labels ≤5 words, verb first. The main trajectory is the active milestone\'s pending steps. Otherwise null.',
     '- from: when a task or grill question originated in another agent\'s or session\'s message, that sender\'s name; else "".',
-    '- grill: ONLY decisions the session is waiting on from the user that are NOT already in the grill list below (usually []). Frontier only: nothing that depends on an unanswered question. ≤3, each with a recommendation.',
+    '- grill: decision or steering points the user should decide or know about that are NOT already in the grill list below: open choices, new goals or ideas raised, trade-offs, implications and second-order effects down the road. Frontier only (nothing that depends on an unanswered question). ≤3, each with a recommendation and blocking (true only when work is waiting on the answer). Usually [] when nothing new came up.',
+    '- moot: ids from the grill list below that the conversation has since settled or made irrelevant (else []).',
+    '- steps that wait on an open blocking grill question: state blocked, why "waiting on Q<n>".',
     prev ? `Previous map — keep ids stable: ${JSON.stringify({ m: prev.milestones.map(m => [m.id, m.label, m.state]), t: prev.tasks.map(t => [t.id, t.text, t.lane, t.by]) })}` : '',
     todos.length ? `Agent TodoWrite list (ground truth for task status): ${JSON.stringify(todos.map(t => `${t.status}: ${t.text}`))}` : '',
     userTasks.length ? `User-added tasks (by "user"): ${JSON.stringify(userTasks)}` : '',
@@ -753,7 +763,7 @@ const mapPrompt = (
     prev?.declined?.length
       ? `Forks the user already decided (both the chosen and the other side): never offer these, or their reverse, as alt again, even while the work waits on an event or a decision: ${JSON.stringify(prev.declined)}`
       : '',
-    grill.length ? `Grill list already tracked (do not repeat): ${JSON.stringify(grill.map(q => [q.id, q.title, q.state]))}` : '',
+    grill.length ? `Grill list already tracked (do not repeat; [id, Q number, title, state, blocking]): ${JSON.stringify(grill.map(q => [q.id, q.n, q.title, q.state, !!q.blocking]))}` : '',
     inbox.length ? `Messages received from other agents/sessions (sender: text): ${JSON.stringify(inbox.slice(-8).map(m => `${m.peer}: ${m.text.slice(0, 160)}`))}` : '',
   ]
     .filter(Boolean)
@@ -1029,7 +1039,7 @@ async function refresh($: EngineInterface) {
       await update($, errorA, () => "map not updated: the model's summary wasn't valid JSON; kept the last one · ↻ to retry")
       return
     }
-    const { grill: inferred, ...charted } = map
+    const { grill: inferred, moot, ...charted } = map
     const prevMap = isCurrent(stored) ? stored : null
     const latest = await read($, mapA)
     const declined = (isCurrent(latest) ? latest.declined : null) ?? prevMap?.declined ?? []
@@ -1043,6 +1053,8 @@ async function refresh($: EngineInterface) {
       const at = await $.clock.now()
       await update($, grillA, list => mergeGrill(list, inferred, charted.goal, 'map', at))
     }
+    // what the conversation settled leaves the open list, so the grill never asks it again
+    if (moot.length) await update($, grillA, list => list.map((q): CompassGrillQ => (moot.includes(q.id) && q.state !== 'settled' ? { ...q, state: 'settled', answer: q.answer || 'settled in the session' } : q)))
     await update($, errorA, () => null)
     await update($, statsA, s => ({ ...s, refreshes: s.refreshes + 1 }))
     // user tasks the agent has adopted no longer need to be shown as queued
@@ -1374,6 +1386,26 @@ async function sendRound($: EngineInterface) {
   await update($, selectedA, () => null)
 }
 
+/** Sets a question aside: the session goes on without it (on the recommendation) and does not ask again now. */
+async function parkGrill($: EngineInterface, id: string) {
+  const q = (await read($, grillA)).find(x => x.id === id)
+  if (!q || q.state === 'settled' || q.state === 'parked') return
+  await update($, grillA, list => list.map((x): CompassGrillQ => (x.id === id ? { ...x, state: 'parked' } : x)))
+  await queueNote($, `Parked grill question Q${q.n} "${q.title}": do not wait for it or ask again now; proceed with ${q.rec ? `the recommendation (${q.rec})` : 'your best judgement'} and keep it open`)
+  const { ask, handled } = frontierOf(await read($, grillA))
+  await update($, selectedA, () => (ask[0] ? `g:${ask[0].id}` : null))
+  if (!ask.length && handled.length) await sendRound($)
+}
+
+/** Brings a parked question back: the user means to answer it. */
+async function unparkGrill($: EngineInterface, id: string) {
+  const q = (await read($, grillA)).find(x => x.id === id)
+  if (!q || q.state !== 'parked') return
+  await update($, grillA, list => list.map((x): CompassGrillQ => (x.id === id ? { ...x, state: 'open' } : x)))
+  await update($, selectedA, () => `g:${id}`)
+  await queueNote($, `Reopened grill question Q${q.n} "${q.title}": the user will answer it`)
+}
+
 /** Drops a question that no longer matters; the agent hears it with the next prompt, and it is not asked again. */
 async function dismissGrill($: EngineInterface, id: string) {
   const q = (await read($, grillA)).find(x => x.id === id)
@@ -1453,6 +1485,7 @@ export const register: Register = on => {
                 options: { type: 'array', items: { type: 'string' }, description: '2-4 short choices, if any' },
                 recommendation: { type: 'string', description: 'Your recommended answer' },
                 dependsOn: { type: 'array', items: { type: 'string' }, description: 'Ids that must be settled first' },
+                blocking: { type: 'boolean', description: 'true only when your work waits on this answer; false when you keep going on your recommendation' },
               },
               required: ['id', 'title', 'body', 'recommendation'],
             },
@@ -1532,7 +1565,7 @@ export const register: Register = on => {
       $.ui.toast(`? ${ask.length} question${ask.length > 1 ? 's' : ''} in the grill tab`)
     }
     // a plugin tool's result is a string (or blocks): the model reads it as the tool's answer
-    const text = `Posted to the user's compass grill tab: ${ask.length} on the frontier, ${waiting.length} waiting on prerequisites${input.askConfirm === true ? ', plus a confirmation request' : ''}. Do not wait: continue only with work that does not depend on these decisions, or end your turn. The answers arrive as a new user turn.`
+    const text = `Posted to the user's compass grill tab: ${ask.length} on the frontier, ${waiting.length} waiting on prerequisites${input.askConfirm === true ? ', plus a confirmation request' : ''}. Do not wait: for blocking ones, continue only with work that does not depend on them; for the others, go on with your recommendation. The user answers when they choose, in any order, and may park or dismiss; answers arrive as a new user turn, parks and dismissals as notes.`
     return { result: text as never, text }
   })
 
@@ -1662,7 +1695,8 @@ export const register: Register = on => {
     if (!pending.length) return next(e)
     const ids = new Set(pending.map(a => a.id))
     await update($, actionsA, list => list.map((a): CompassAction => (ids.has(a.id) ? { ...a, status: 'sent', route: 'next prompt', at: Date.now() } : a)))
-    const note = `🧭 Compass — updates the user made in the compass pane since last turn (user-added tasks come first):\n${pending.map(a => `- ${a.label}`).join('\n')}`
+    // the whole note, not the outbox's short label
+    const note = `🧭 Compass — updates the user made in the compass pane since last turn (user-added tasks come first):\n${pending.map(a => `- ${a.text.replace(/^🧭\s*\[compass[^\]]*\]\s*/u, '')}`).join('\n')}`
     return next({ ...e, context: [...(e.context ?? []), note] })
   })
 
@@ -1737,7 +1771,9 @@ export const register: Register = on => {
     const { Client } = els
     const stored = await read($, mapA)
     const map = isCurrent(stored) ? stored : null
-    const asks = frontierOf(await read($, grillA)).ask.length
+    const front = frontierOf(await read($, grillA))
+    const asks = front.ask.length
+    const blocking = front.ask.filter(q => q.blocking).length
     const queued = (await read($, actionsA)).filter(a => a.status === 'queued').length
     const isRefreshing = await read($, refreshingA)
     await read($, tickA)
@@ -1750,7 +1786,7 @@ export const register: Register = on => {
     const panes = paneCols > 0 ? await $.ui.panes() : []
     const isDocked = panes.some(p => p.id === PANE)
     const room = Math.max(24, (e.viewport?.columns ?? 100) + (isDocked ? paneCols + 1 : 0) - glen(e.props.hint ?? '') - 6)
-    const chips = hintChips(map, asks, queued, room, incoming?.text ?? null)
+    const chips = hintChips(map, asks, queued, room, incoming?.text ?? null, blocking)
     const gap = (key: string) => (
       <Text key={key} backgroundColor={PANEL}>
         {' '}
@@ -2144,7 +2180,6 @@ export const register: Register = on => {
         }
       }
 
-      const q = front.ask[0]
       body = (
         <Box flexDirection="column" key="flow">
           {isOpen('legend') && (
@@ -2195,25 +2230,49 @@ export const register: Register = on => {
               {rows}
             </Box>
           )}
-          {(q || board.now.length > 0) && rule}
-          {q && (
-            <Box key="flow:q" flexDirection="column">
-              {(() => {
-                const w = wrapped('flow:qbtn', `${q.from ? `⇄${q.from} ` : ''}${q.title}${front.ask.length > 1 ? `  +${front.ask.length - 1} more` : ''}`, width - 9, async () => {
-                  await update($, selectedA, () => `g:${q.id}`)
-                  await update($, tabA, () => 'grill')
-                })
-                return [
-                  <Box key="flow:qrow">
-                    {pill('flow:qp', `? Q${q.n}`, 'yellow', true)}
+          {(front.ask.length > 0 || front.handled.length > 0 || front.parked.length > 0 || front.waiting.length > 0 || board.now.length > 0) && rule}
+          {(() => {
+            // decisions in play, mirrored from the grill: what waits on you, what is open while
+            // work goes on, what is answered and about to go out, what you parked
+            const live = [...front.ask.filter(x => x.blocking), ...front.ask.filter(x => !x.blocking), ...front.waiting]
+            const answered = front.handled
+            if (!live.length && !answered.length && !front.parked.length) return null
+            const open = (id: string) => async () => {
+              await update($, selectedA, () => `g:${id}`)
+              await update($, tabA, () => 'grill')
+            }
+            const row = (key: string, glyph: string, tone: Tone, state: string, label: string, onPress: () => unknown) => {
+              const w = wrapped(`fd:${key}`, label, width - glen(state) - 6, onPress, { indent: glen(state) + 4 })
+              return (
+                <Box key={`fdr:${key}`} flexDirection="column">
+                  <Box>
+                    <Text color={TONE[tone].fg} bold>
+                      {glyph}{' '}
+                    </Text>
+                    {pill(`fds:${key}`, state, tone)}
                     <Text> </Text>
                     {w.head}
-                  </Box>,
-                  w.tail,
-                ]
-              })()}
-            </Box>
-          )}
+                  </Box>
+                  {w.tail}
+                </Box>
+              )
+            }
+            return (
+              <Box key="flow:decisions" flexDirection="column">
+                <Text color={TONE.yellow.fg} bold>
+                  ? decisions
+                </Text>
+                {live.slice(0, 5).map(x =>
+                  x.blocking && x.state === 'open'
+                    ? row(x.id, '⏸', 'red', 'waits on you', `Q${x.n} ${x.title}`, open(x.id))
+                    : row(x.id, '?', 'yellow', x.state === 'open' && !front.waiting.includes(x) ? 'open · work goes on' : 'after earlier answers', `Q${x.n} ${x.title}`, open(x.id)),
+                )}
+                {live.length > 5 && <Text dimColor>{`  +${live.length - 5} more in the grill tab`}</Text>}
+                {answered.map(x => row(x.id, '✓', 'green', 'answered', `Q${x.n} ${x.title} · goes out with the round`, open(x.id)))}
+                {front.parked.length > 0 && row('parked', '◌', 'dim', `${front.parked.length} parked`, 'work goes on with the recommendations', open(front.parked[0]!.id))}
+              </Box>
+            )
+          })()}
           {board.now.length > 0 && (
             <Box key="flow:t" flexDirection="column">
               {(() => {
@@ -2532,8 +2591,12 @@ export const register: Register = on => {
             </Box>
             <Box columnGap={1} flexShrink={0}>
               <Text dimColor>{q.mode}</Text>
+              {pillBtn(`gpark:${q.id}`, '⏸ park', 'dim', () => parkGrill($, q.id))}
               <Button key={`gdrop:${q.id}`} plain dimColor label="✕" onPress={() => void dismissGrill($, q.id)} />
             </Box>
+          </Box>
+          <Box>
+            {pill(`gblk:${q.id}`, q.blocking ? '⏸ work waits on this' : '▶ work goes on meanwhile', q.blocking ? 'red' : 'green')}
           </Box>
           {q.topic || q.from ? (
             <Text wrap="wrap">
@@ -2592,8 +2655,8 @@ export const register: Register = on => {
             const w = wrapped(`gsel:${q.id}`, `Q${q.n} ${q.title}${tail}`, width - 5, () => update($, selectedA, () => `g:${q.id}`), { dim: q.state !== 'open' })
             return [
               <Box key={`gqrow:${q.id}`}>
-                <Text color={color} bold>
-                  {mark}{' '}
+                <Text color={q.blocking && q.state === 'open' ? TONE.red.fg : color} bold>
+                  {q.blocking && q.state === 'open' ? '⏸' : mark}{' '}
                 </Text>
                 {w.head}
                 <Box flexGrow={1} />
@@ -2607,16 +2670,41 @@ export const register: Register = on => {
       const pending = actions.some(a => a.status === 'queued' && a.kind === 'turn')
       body = (
         <Box flexDirection="column" key="grill">
+          {/* the decision radar: what waits on you, what is open while work goes on, what you parked */}
+          <Box flexWrap="wrap" columnGap={1}>
+            {pill('gs:block', `⏸ ${front.ask.filter(q => q.blocking).length} blocking`, front.ask.some(q => q.blocking) ? 'red' : 'dim', true)}
+            {pill('gs:open', `? ${front.ask.filter(q => !q.blocking).length + front.waiting.length} open`, front.ask.some(q => !q.blocking) ? 'yellow' : 'dim')}
+            {pill('gs:park', `◌ ${front.parked.length} parked`, 'dim')}
+            {pill('gs:done', `✓ ${front.settled.length} settled`, front.settled.length ? 'green' : 'dim')}
+          </Box>
+          <Text dimColor wrap="wrap">
+            {isRefreshing ? `${spin} checking the session for new decisions now` : `◷ checked ${map ? `${span(now - map.at)} ago` : 'not yet'} · ${isBusy ? 'checks again a few seconds into each turn and when it ends' : 'checks again with your next prompt'}`}
+          </Text>
           {grill.length === 0 && !confirm ? (
-            art('grill', 'no questions yet · the agent posts them while planning or choosing between options')
+            <Box key="g:empty" flexDirection="column" borderStyle="round" borderColor={TONE.yellow.fg} borderDimColor paddingX={1} marginTop={1}>
+              <Text color={TONE.yellow.fg} bold>
+                ? decisions land here
+              </Text>
+              <Text wrap="wrap">Questions that need you appear here as the session moves:</Text>
+              <Text wrap="wrap" dimColor>
+                {'  '}• when Claude plans or hits a choice, it posts them (with its recommendation)
+              </Text>
+              <Text wrap="wrap" dimColor>
+                {'  '}• after every turn, compass looks for new goals, ideas, trade-offs and effects down the road you should decide or know about
+              </Text>
+              <Text wrap="wrap" dimColor>
+                {'  '}• each says whether work waits on it (⏸) or goes on meanwhile (▶)
+              </Text>
+              <Text wrap="wrap">Answer any, in any order, when you like: ⏸ park one to let the work go on without it, ✕ to drop it. The session hears every choice.</Text>
+            </Box>
           ) : (
-            <Box flexDirection="column">
+            <Box flexDirection="column" marginTop={1}>
               <Text>
                 <Text color="yellow" bold>
                   round {round}
                 </Text>
                 <Text dimColor>
-                  {' '}· {front.ask.length} to answer · {front.waiting.length} waiting · {front.settled.length} settled
+                  {' '}· answers go to Claude together once every open question here is handled, or now with ↗ send
                 </Text>
               </Text>
               {confirm && (
@@ -2661,6 +2749,23 @@ export const register: Register = on => {
               {front.waiting.length > 0 && fold('gwait', `${front.waiting.length} waiting on earlier answers`)}
               {isOpen('gwait') &&
                 front.waiting.map(q => collapsed(q, '…', undefined, `  after ${q.dependsOn.map(d => `Q${grill.find(x => x.id === d)?.n ?? '?'}`).join(', ')}`))}
+              {front.parked.length > 0 && fold('gparked', `${front.parked.length} parked · work goes on without them`)}
+              {isOpen('gparked') &&
+                front.parked.map(q => (
+                  <Box key={`gp:${q.id}`}>
+                    <Text dimColor>◌ </Text>
+                    <Box flexGrow={1} flexShrink={1}>
+                      <Text dimColor wrap="wrap">
+                        Q{q.n} {q.title}
+                        {q.rec ? ` · going with: ${q.rec}` : ''}
+                      </Text>
+                    </Box>
+                    <Box flexShrink={0} columnGap={1}>
+                      {pillBtn(`gunpark:${q.id}`, '↺ answer it', 'yellow', () => unparkGrill($, q.id))}
+                      <Button key={`gpdrop:${q.id}`} plain dimColor label="✕" onPress={() => void dismissGrill($, q.id)} />
+                    </Box>
+                  </Box>
+                ))}
               {front.settled.length > 0 && fold('gsettled', `${front.settled.length} settled`)}
               {isOpen('gsettled') &&
                 front.settled.map(q => (

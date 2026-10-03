@@ -51,7 +51,10 @@ export type CompassGrillQ = {
   source: 'agent' | 'map'
   /** another agent or session this question came from, '' when it is this session's own */
   from: string
-  state: 'open' | 'answered' | 'followup' | 'sent' | 'settled'
+  /** open: waiting · parked: the user set it aside, work goes on without it · settled: answered or dismissed */
+  state: 'open' | 'answered' | 'followup' | 'sent' | 'settled' | 'parked'
+  /** true when work waits on the answer; false when the session can go on meanwhile */
+  blocking?: boolean
   answer: string
   followups: string[]
   at: number
