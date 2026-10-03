@@ -51,7 +51,7 @@ const TONE = {
 } as const
 type Tone = keyof typeof TONE
 const TRACK = '#3a3b3f'
-const PANEL = '#232427'
+const PANEL = '#2b2c31'
 const SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 
 /** A level as a smooth bar `cells` wide: whole blocks, then an eighth-block edge. */
@@ -223,6 +223,8 @@ const presses = new Map<string, () => unknown>()
 const SEND_GRACE_MS = 8000
 /** When the sea chart was last drawn: while it shows, it redraws a few times a second. */
 let splashAt = 0
+/** The docked pane's width, as its last render saw it: the row under the prompt spans it too. */
+let paneCols = 0
 
 const EMPTY_STATS: CompassStats = {
   startedAt: 0,
@@ -587,50 +589,68 @@ export const gist = (map: CompassMap | null, asks: number, queued: number, budge
   return [brand]
 }
 
-export type HintPill = { key: string; tone: Tone; isBold?: boolean; parts: { text?: string; bar?: number; isDim?: boolean }[]; width: number }
+export type HintPart = { text?: string; bar?: number; color?: string; isDim?: boolean; isBold?: boolean }
+export type HintChip = { key: string; tone: Tone; parts: HintPart[]; width: number }
+
+const BAR_CELLS = 5
+const partWidth = (x: HintPart) => (x.bar !== undefined ? BAR_CELLS : glen(x.text ?? ''))
 
 /**
- * The row under the prompt as pills, after the reference: each item its own tinted chip with an
- * icon. Items are kept whole and dropped by priority (the step now first, then what needs the
- * user, then step progress, the next step, the last one) until the row fits `room` cells.
+ * The row under the prompt as one panel of chips, after the reference: the course in one chip
+ * (✓ last │ ● now │ ○ next), step progress in another, then what needs the user. When room runs
+ * short, parts leave from inside a chip first (last step, next step, long labels), then whole
+ * chips by priority, so every chip stays one unit. `room` counts the panel's own padding.
  */
-export const hintPills = (map: CompassMap | null, asks: number, queued: number, room: number, incoming: string | null = null): HintPill[] => {
-  const mk = (key: string, tone: Tone, parts: HintPill['parts'], isBold = false): HintPill => ({
-    key,
-    tone,
-    isBold,
-    parts,
-    width: 2 + parts.reduce((n, x) => n + (x.bar !== undefined ? 5 : glen(x.text ?? '')), 0),
-  })
-  const BRAND = 11 + 1
-  if (!map && !incoming) return [mk('wait', 'dim', [{ text: '◌ charting after your first turn' }])].filter(p => p.width + BRAND <= room)
+export const hintChips = (map: CompassMap | null, asks: number, queued: number, room: number, incoming: string | null = null): HintChip[] => {
+  const SEP: HintPart = { text: ' │ ', isDim: true }
+  const chip = (key: string, tone: Tone, parts: HintPart[]): HintChip => ({ key, tone, parts, width: 2 + parts.reduce((n, x) => n + partWidth(x), 0) })
+  const BRAND = 11
+  const fits = (chips: HintChip[]) => 1 + BRAND + chips.reduce((n, c) => n + 1 + c.width, 0) + 1 <= room
+  if (!map && !incoming) {
+    const wait = [chip('wait', 'dim', [{ text: '◌ charting after your first turn' }])]
+    return fits(wait) ? wait : []
+  }
   const { milestone, step, next } = locate(map)
   const steps = (milestone?.steps ?? []).filter(s => s.kind !== 'aside')
   const done = steps.filter(s => s.state === 'done').length
-  const past = [...steps].reverse().find(s => s.state === 'done')?.label
+  const past = incoming ? plain(step?.label ?? '') : plain([...steps].reverse().find(s => s.state === 'done')?.label ?? '')
   const isBlocked = step?.state === 'blocked'
   const nowText = plain(incoming ?? step?.label ?? milestone?.label ?? '')
-  const candidates: [number, HintPill][] = []
-  if (nowText) candidates.push([0, mk('now', isBlocked ? 'red' : 'blue', [{ text: `${isBlocked ? '!' : '●'} ${nowText}` }], true)])
-  if (isBlocked) candidates.push([1, mk('need', 'red', [{ text: '! needs you' }], true)])
-  if (asks) candidates.push([1, mk('ask', 'yellow', [{ text: `? ${asks} to answer` }], true)])
-  if (map?.alt && !map.altPick) candidates.push([1, mk('fork', 'purple', [{ text: '⑂ 2 ways' }], true)])
-  if (queued) candidates.push([2, mk('queue', 'gray', [{ text: `⇣ ${queued} queued` }])])
-  if (steps.length > 1 && !incoming) candidates.push([3, mk('steps', 'green', [{ text: '⚑ ' }, { bar: done / steps.length }, { text: ` ${done}/${steps.length} `, isDim: false }, { text: 'steps', isDim: true }])])
-  const ahead = incoming ? 'updating…' : next
-  if (ahead) candidates.push([4, mk('next', 'dim', [{ text: `○ ${plain(ahead)}` }])])
-  if (past && !incoming) candidates.push([5, mk('past', 'green', [{ text: `✓ ${plain(past)}` }])])
-  // keep the most important that fit, then lay them out in reading order
-  const ORDER = ['past', 'now', 'next', 'steps', 'need', 'ask', 'fork', 'queue']
-  let used = BRAND
-  const kept: HintPill[] = []
-  for (const [, p] of [...candidates].sort((a, b) => a[0] - b[0])) {
-    if (used + p.width + 1 <= room) {
-      kept.push(p)
-      used += p.width + 1
-    }
+  const ahead = plain(incoming ? 'updating…' : (next ?? ''))
+  const course = (withPast: boolean, withNext: boolean) => {
+    const parts: HintPart[] = []
+    if (withPast && past) parts.push({ text: `✓ ${past}`, color: TONE.green.fg }, SEP)
+    parts.push({ text: `${isBlocked ? '!' : '●'} ${nowText}`, color: isBlocked ? TONE.red.fg : '#e6e6e6', isBold: true })
+    if (withNext && ahead) parts.push(SEP, { text: `○ ${ahead}`, isDim: true })
+    return chip('course', isBlocked ? 'red' : 'blue', parts)
   }
-  return kept.sort((a, b) => ORDER.indexOf(a.key) - ORDER.indexOf(b.key))
+  const mNo = map && milestone ? map.milestones.indexOf(milestone) + 1 : 0
+  const progress =
+    steps.length > 1 && !incoming
+      ? chip('steps', 'green', [{ text: `⚑ M${mNo} `, isBold: true }, { bar: done / steps.length }, { text: ` ${done}/${steps.length}`, isBold: true }, { text: ' steps', isDim: true }])
+      : null
+  const needs = (isShort: boolean, keep: string[]) =>
+    [
+      isBlocked ? chip('need', 'red', [{ text: isShort ? '!' : '! needs you', isBold: true }]) : null,
+      asks ? chip('ask', 'yellow', [{ text: isShort ? `? ${asks}` : `? ${asks} to answer`, isBold: true }]) : null,
+      map?.alt && !map.altPick ? chip('fork', 'purple', [{ text: isShort ? '⑂' : '⑂ 2 ways', isBold: true }]) : null,
+      queued ? chip('queue', 'gray', [{ text: isShort ? `⇣ ${queued}` : `⇣ ${queued} queued` }]) : null,
+    ].filter((c): c is HintChip => c !== null && keep.includes(c.key))
+  const ALL = ['need', 'ask', 'fork', 'queue']
+  const p = progress ? [progress] : []
+  // richest first; each step down gives up the least: parts of a chip, then words, then whole chips
+  const tries: HintChip[][] = [
+    [course(true, true), ...p, ...needs(false, ALL)],
+    [course(false, true), ...p, ...needs(false, ALL)],
+    [course(false, false), ...p, ...needs(false, ALL)],
+    [course(false, false), ...p, ...needs(true, ALL)],
+    [course(false, false), ...needs(true, ALL)],
+    [course(false, false), ...needs(true, ['need', 'ask', 'fork'])],
+    [course(false, false), ...needs(true, ['need', 'ask'])],
+    [course(false, false)],
+    needs(true, ['need', 'ask']),
+  ]
+  return tries.find(fits) ?? []
 }
 
 /** Tasks the board shows: the agent's list, plus user tasks it has not picked up yet. */
@@ -1725,36 +1745,46 @@ export const register: Register = on => {
     const engine = await next(e)
     const spin = isRefreshing ? SPIN[Math.floor(now / 120) % SPIN.length] : ''
     // the room left beside the engine's own hint
-    const room = Math.max(24, (e.viewport?.columns ?? 100) - glen(e.props.hint ?? '') - 8)
-    const hint = hintPills(map, asks, queued, room, incoming?.text ?? null)
-    // the engine's own node may only sit under a Box with no props
+    // the viewport is the conversation's width; the row under the prompt also spans a docked pane
+    const isDocked = paneCols > 0 && (await $.ui.panes().catch(() => [])).some(p => p.id === PANE)
+    const room = Math.max(24, (e.viewport?.columns ?? 100) + (isDocked ? paneCols + 1 : 0) - glen(e.props.hint ?? '') - 6)
+    const chips = hintChips(map, asks, queued, room, incoming?.text ?? null)
+    const gap = (key: string) => (
+      <Text key={key} backgroundColor={PANEL}>
+        {' '}
+      </Text>
+    )
+    // one panel: its own fill around the brand and every chip, so the row reads as one unit
     return (
       <Box>
-        <Box flexShrink={0} columnGap={1}>
+        <Box flexShrink={0}>
+          {gap('hp:l')}
           {/* a Button draws one engine colour: where a Client can be drawn, the gold brand is one and takes the click */}
           {Client ? (
             <Client key="compass-crumb" module="./brand.tsx" props={{ color: GOLD, bg: TONE.gold.bg, spin }} />
           ) : (
             <Button key="compass-crumb" plain label="◈ compass" onPress={() => void togglePane($)} />
           )}
-          {hint.map(p => (
-            <Text key={`hp:${p.key}`} color={TONE[p.tone].fg} backgroundColor={TONE[p.tone].bg} bold={p.isBold}>
+          {chips.flatMap(c => [
+            gap(`hp:g:${c.key}`),
+            <Text key={`hp:${c.key}`} color={TONE[c.tone].fg} backgroundColor={TONE[c.tone].bg}>
               {' '}
-              {p.parts.map((x, i) =>
+              {c.parts.map((x, i) =>
                 x.bar !== undefined ? (
-                  <Text key={`hp:${p.key}:${i}`} color={TONE[p.tone].fg} backgroundColor={TRACK}>
-                    {barText(x.bar, 5)}
+                  <Text key={`hp:${c.key}:${i}`} color={TONE[c.tone].fg} backgroundColor={TRACK}>
+                    {barText(x.bar, BAR_CELLS)}
                   </Text>
                 ) : (
-                  <Text key={`hp:${p.key}:${i}`} dimColor={x.isDim}>
+                  <Text key={`hp:${c.key}:${i}`} color={x.color} dimColor={x.isDim} bold={x.isBold}>
                     {x.text}
                   </Text>
                 ),
               )}{' '}
-            </Text>
-          ))}
+            </Text>,
+          ])}
+          {gap('hp:r')}
         </Box>
-        <Text dimColor>{'   '}</Text>
+        <Text dimColor>{'  '}</Text>
         {engine}
       </Box>
     )
@@ -1767,6 +1797,7 @@ export const register: Register = on => {
     const { Box, Text, Button } = els
     const Input = 'Input' in els ? els.Input : null
     const width = Math.max(28, e.props.bodyColumns)
+    paneCols = e.props.placement === 'dock' ? e.props.bodyColumns + 2 : 0
     const [stored, grill, round, confirm, actions, userTasks, steers, btw, stats, tab, selected, unfolded, isRefreshing, isBusy, lastError] =
       await Promise.all([
         read($, mapA),
@@ -1964,15 +1995,34 @@ export const register: Register = on => {
       const ms = map?.milestones ?? []
       const { milestone: active, step } = locate(map)
       const rows: ReturnType<typeof h>[] = []
-      for (const m of ms) {
+      // the milestones compass and the agent settled on: a header with overall progress, then one
+      // row each (number, name, its own steps bar), the active one unfolded into its steps
+      if (ms.length) {
+        const msDone = ms.filter(m => m.state === 'done').length
+        rows.push(
+          <Box key="ms:head" marginBottom={0}>
+            <Text color={TONE.blue.fg} bold>
+              ⚑ milestones
+            </Text>
+            <Box flexGrow={1} />
+            {meter('ms:headbar', msDone / ms.length, 5, 'green')}
+            <Box width={6} flexShrink={0} justifyContent="flex-end">
+              <Text bold>{`${msDone}/${ms.length}`}</Text>
+            </Box>
+          </Box>,
+        )
+      }
+      for (const [mi, m] of ms.entries()) {
         const isActive = m === active
         const mk = STEP_MARK[m.state]
         const isUnfolded = isActive || isOpen(`m:${m.id}`)
         const count = m.steps.length
+        const real = m.steps.filter(x => x.kind !== 'aside')
+        const stepsDone = real.filter(x => x.state === 'done').length
         const msRow = wrapped(
           `msbtn:${m.id}`,
           `${m.label}${m.state === 'abandoned' && m.why ? ` · ${m.why}` : ''}${!isActive && count && isUnfolded ? '  ▾' : ''}`,
-          width - 8,
+          width - 22,
           () => (isActive ? undefined : toggleIn($, `m:${m.id}`)),
           { dim: m.state === 'done' || m.state === 'abandoned' || m.state === 'pending' },
         )
@@ -1982,9 +2032,16 @@ export const register: Register = on => {
               <Text color={mk.color} dimColor={mk.dim} bold>
                 {mk.glyph}{' '}
               </Text>
-              {msRow.head}
+              {pill(`msnum:${m.id}`, `M${mi + 1}`, isActive ? 'blue' : 'dim', isActive)}
+              <Text> </Text>
+              <Box flexShrink={1}>{msRow.head}</Box>
               {!isActive && count && !isUnfolded ? <Text> </Text> : null}
               {!isActive && count && !isUnfolded ? pill(`msn:${m.id}`, `+${count}`, 'dim') : null}
+              <Box flexGrow={1} />
+              {real.length ? meter(`msbar:${m.id}`, stepsDone / real.length, 5, m.state === 'done' ? 'green' : isActive ? 'blue' : 'dim') : null}
+              <Box width={6} flexShrink={0} justifyContent="flex-end">
+                <Text dimColor={!isActive}>{real.length ? `${stepsDone}/${real.length}` : ''}</Text>
+              </Box>
             </Box>
             {msRow.tail}
           </Box>,

@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { barText, bodyOf, dotsText, hintPills, isDecided, span, leadOf, moveIn, wordWrap, boardOf, crumb, gist, peerKey, plain, frontierOf, mergeGrill, parseLoose, parseMap, senderOf } from '../hooks/register'
+import { barText, bodyOf, dotsText, hintChips, isDecided, span, leadOf, moveIn, wordWrap, boardOf, crumb, gist, peerKey, plain, frontierOf, mergeGrill, parseLoose, parseMap, senderOf } from '../hooks/register'
 
 /** Clicks a control by key: a Button is pressed, a pill (a Client region) gets a pointer click. */
 const tap = async (mounted: unknown, key: string) => {
@@ -804,16 +804,20 @@ test('cancelling a grill round in the outbox puts its answers back', async ($, o
   await ui.unmount()
 })
 
-test('the row under the prompt is pills kept whole, dropped by priority, in reading order', async () => {
+test('the row under the prompt is one panel of chips; parts leave a chip before whole chips go', async () => {
   const map = parseMap(JSON.stringify(MAP), 1)
-  const wide = hintPills(map, 2, 1, 200)
-  expect(wide.map(p => p.key)).toEqual(['past', 'now', 'next', 'steps', 'ask', 'queue'])
-  expect(wide.find(p => p.key === 'steps')?.parts.map(x => x.text ?? '').join('')).toMatch(/1\/3 steps/)
-  // narrow: the step now and the question stay, the rest go whole
-  const narrow = hintPills(map, 2, 1, 50)
-  expect(narrow.map(p => p.key)).toEqual(['now', 'ask'])
+  const text = (c: { parts: { text?: string }[] }) => c.parts.map(x => x.text ?? '').join('')
+  const wide = hintChips(map, 2, 1, 200)
+  expect(wide.map(c => c.key)).toEqual(['course', 'steps', 'ask', 'queue'])
+  expect(text(wide[0]!)).toBe('✓ adopt IBIS model │ ● write register │ ○ run tests')
+  expect(text(wide[1]!)).toMatch(/1\/3 steps/)
+  // tighter: the course chip keeps "now" only, the badges shorten, then progress goes
+  const mid = hintChips(map, 2, 1, 70)
+  expect(text(mid[0]!)).toBe('● write register')
+  const narrow = hintChips(map, 2, 1, 40)
+  expect(narrow.map(c => c.key)).toEqual(['course', 'ask'])
   for (const room of [24, 40, 60, 90, 140]) {
-    const used = 12 + hintPills(map, 2, 1, room).reduce((n, p) => n + p.width + 1, 0)
+    const used = 1 + 11 + hintChips(map, 2, 1, room).reduce((n, c) => n + 1 + c.width, 0) + 1
     expect(used <= room).toBe(true)
   }
 })
