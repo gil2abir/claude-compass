@@ -100,6 +100,8 @@ export type CompassStats = {
   refreshes: number
   costUsd: number
   contextPct: number
+  /** the account's usage windows (5h, 7d): percent used and when each resets */
+  limits?: { kind: string; pct: number; resetsAt: string }[]
   /** compass's own map-making model calls, apart from the session's work */
   own: { calls: number; input: number; output: number; cacheRead: number; cacheWrite: number }
 }

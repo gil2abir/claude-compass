@@ -36,6 +36,16 @@ export const LANES: { lane: BoardLane; name: string }[] = [
 
 const BACKLOG_ROWS = 5
 
+/** Lane colours, the pane's pill palette: a tinted fill and a bright label of the same hue. */
+const LANE_TONE: Record<BoardLane, { fg: string; bg: string }> = {
+  now: { fg: '#83d6e8', bg: '#1b3940' },
+  next: { fg: '#97b1f5', bg: '#243049' },
+  done: { fg: '#86d4ab', bg: '#1d3a2f' },
+  later: { fg: '#8a8a8a', bg: '#2a2b2e' },
+}
+const OVER = { fg: '#f2a093', bg: '#442728' }
+const HOVER_BG = '#2f3136'
+
 const clip = (text: string, n: number) => (text.length > n ? `${text.slice(0, Math.max(1, n - 1))}…` : text)
 
 const count = (cards: BoardCard[], lane: BoardLane) => cards.filter(c => c.lane === lane).length
@@ -94,7 +104,7 @@ const Board: ClientModule<JsonValue, BoardState> = (raw, surface) => {
     const row = rows[e.y]
     if (e.type === 'leave') return set({ hover: -1 })
     if (e.type === 'down' && e.button === 'left') {
-      if (row?.kind === 'card') set({ drag: { id: row.card.id, from: row.lane, x: e.x, y: e.y, isMoving: false, target: null }, cursor: row.card.id })
+      if (row?.kind === 'card') set({ drag: { id: row.card.id, from: row.lane, x: e.x, y: e.y, isMoving: false, target: null }, cursor: null })
       return
     }
     if (e.type === 'move') {
@@ -109,7 +119,7 @@ const Board: ClientModule<JsonValue, BoardState> = (raw, surface) => {
       const drag = s.drag
       if (drag?.isMoving) {
         if (drag.target && drag.target !== drag.from) post({ type: 'move', id: drag.id, lane: drag.target })
-        return set({ drag: null })
+        return set({ drag: null, hover: -1, cursor: null })
       }
       set({ drag: null })
       // a click: a card selects, a head folds, "more" opens the backlog, a chip moves the selected card
@@ -155,19 +165,18 @@ const Board: ClientModule<JsonValue, BoardState> = (raw, surface) => {
         if (row.kind === 'chips') {
           return (
             <Box key="chips">
-              {chipSpans(cards, wip).map((c, i) => (
-                <Text key={`chip:${c.lane}`}>
-                  <Text
-                    inverse={drag?.target === c.lane || (isHover && false)}
-                    color={c.isOver ? 'red' : drag?.target === c.lane ? 'cyan' : c.lane === 'now' ? 'cyan' : undefined}
-                    bold={c.lane === 'now'}
-                    dimColor={c.lane === 'done' || c.lane === 'later'}
-                  >
-                    {c.label}
+              {chipSpans(cards, wip).map((c, i) => {
+                const t = c.isOver ? OVER : LANE_TONE[c.lane]
+                const isTarget = drag?.target === c.lane
+                return (
+                  <Text key={`chip:${c.lane}`}>
+                    <Text color={isTarget ? t.bg : t.fg} backgroundColor={isTarget ? t.fg : t.bg} bold={isTarget || c.lane === 'now'}>
+                      {c.label}
+                    </Text>
+                    {i < LANES.length - 1 ? <Text> </Text> : null}
                   </Text>
-                  {i < LANES.length - 1 ? <Text dimColor>│</Text> : null}
-                </Text>
-              ))}
+                )
+              })}
             </Box>
           )
         }
@@ -189,11 +198,11 @@ const Board: ClientModule<JsonValue, BoardState> = (raw, surface) => {
           const isOver = row.lane === 'now' && n > wip
           return (
             <Box key={`head:${row.lane}`}>
-              <Text inverse={isTarget} color={isTarget ? 'cyan' : isOver ? 'red' : undefined} bold dimColor={!isTarget && (row.lane === 'done' || row.lane === 'later')}>
-                {s.collapsed.includes(row.lane) ? '▸' : '▾'} {laneName(row.lane)} ·{row.lane === 'now' ? `${n}/${wip}` : n}
+              <Text color={isTarget ? (isOver ? OVER : LANE_TONE[row.lane]).bg : (isOver ? OVER : LANE_TONE[row.lane]).fg} backgroundColor={isTarget ? (isOver ? OVER : LANE_TONE[row.lane]).fg : (isOver ? OVER : LANE_TONE[row.lane]).bg} bold>
+                {` ${s.collapsed.includes(row.lane) ? '▸' : '▾'} ${laneName(row.lane)} ${row.lane === 'now' ? `${n}/${wip}` : n} `}
               </Text>
-              {isTarget && <Text color="cyan"> ◂ drop here</Text>}
-              {isOver && !isTarget && <Text color="red"> over limit</Text>}
+              {isTarget && <Text color={LANE_TONE[row.lane].fg}> ◂ drop here</Text>}
+              {isOver && !isTarget && <Text color={OVER.fg}> over limit</Text>}
             </Box>
           )
         }
@@ -217,16 +226,18 @@ const Board: ClientModule<JsonValue, BoardState> = (raw, surface) => {
         const isDone = c.lane === 'done'
         return (
           <Box key={`card:${c.id}`}>
-            <Text dimColor>{isSource ? '┊' : ' '}</Text>
-            <Text color={c.by === 'user' ? 'yellow' : 'magenta'} dimColor={isDone || isSource}>
-              {c.by === 'user' ? '★' : '◆'}{' '}
+            <Text color={LANE_TONE[c.lane].fg} dimColor={isSource}>
+              {isSource ? ' ┊' : ' ▌'}
             </Text>
-            <Box flexGrow={1}>
-              <Text wrap="truncate-end" inverse={isCursor || isHover} dimColor={isDone || isSource || c.lane === 'later'} strikethrough={isDone}>
+            <Text color={c.by === 'user' ? '#f0d27a' : '#b9a6f2'} backgroundColor={isCursor || isHover ? HOVER_BG : undefined} dimColor={isDone || isSource}>
+              {c.by === 'user' ? ' ★ ' : ' ◆ '}
+            </Text>
+            <Box flexGrow={1} flexShrink={1}>
+              <Text wrap="truncate-end" bold={isCursor} backgroundColor={isCursor || isHover ? HOVER_BG : undefined} dimColor={isDone || isSource || c.lane === 'later'} strikethrough={isDone}>
                 {c.text}
               </Text>
             </Box>
-            {c.isQueued && <Text color="yellow"> ⋯</Text>}
+            {c.isQueued && <Text color="#f0d27a" backgroundColor="#3e381d">{' ⋯ '}</Text>}
           </Box>
         )
       })}
