@@ -109,7 +109,7 @@ const HINTS = [
  * in the middle (each point dark on one side, light on the other, as on old charts), clouds,
  * seagulls, rolling waves, and a gull crossing the chart while the first chart is made.
  */
-export const seaChart = (width: number, height: number, t: number, isCharting: boolean): ChartRun[][] => {
+export const seaChart = (width: number, height: number, t: number, isCharting: boolean, hasTurns = false): ChartRun[][] => {
   const W = Math.max(20, width)
   const H = Math.max(8, height)
   const grid: { ch: string; ink: SeaInk; bold?: boolean }[][] = Array.from({ length: H }, () => Array.from({ length: W }, () => ({ ch: ' ', ink: 'blank' as SeaInk })))
@@ -197,7 +197,7 @@ export const seaChart = (width: number, height: number, t: number, isCharting: b
   // the hint, centred under the rose
   const word = HINTS[Math.floor(t / 2800) % HINTS.length]!
   const dots = '.'.repeat(1 + (Math.floor(t / 450) % 3))
-  const hint = isCharting ? `${SPIN[Math.floor(t / 120) % SPIN.length]} ${word}${dots}` : 'the first chart is drawn after your first turn'
+  const hint = isCharting ? `${SPIN[Math.floor(t / 120) % SPIN.length]} ${word}${dots}` : hasTurns ? 'no chart yet · press ↻ update to draw it' : 'the first chart is drawn after your first turn'
   // wrapped, never cut: a narrow pane gets it on two rows
   const hintRows = wordWrap(hint, W - 2)
   const hy = Math.min(H - seaRows - hintRows.length, Math.round(cy + ry) + 2)
@@ -2147,7 +2147,7 @@ export const register: Register = on => {
             // the sea chart fills the tab until the first chart lands
             (() => {
               splashAt = now
-              const chartRows = seaChart(width, Math.max(10, e.props.scroll.bodyRows - 11), now, stats.turns > 0 || isRefreshing || incoming !== null)
+              const chartRows = seaChart(width, Math.max(10, e.props.scroll.bodyRows - 17), now, isRefreshing || incoming !== null, stats.turns > 0)
               return (
                 <Box key="sea" flexDirection="column">
                   {chartRows.map((row, y) => (
@@ -2163,7 +2163,6 @@ export const register: Register = on => {
                       )}
                     </Text>
                   ))}
-                  {!isRefreshing && stats.turns > 0 && <Text dimColor>no chart yet · press ↻ update to draw it</Text>}
                 </Box>
               )
             })()
@@ -2207,16 +2206,51 @@ export const register: Register = on => {
             </Box>
           )}
           {(() => {
-            // the last steer that actually went in; a queued one waits in the outbox
+            // the steer card: write where the whole session should head; what you sent is folded
+            // under it (go / skip / later / retry and fork picks send steers too)
             const held = new Set(actions.filter(a => a.status === 'queued' && a.kind === 'steer').map(a => a.label))
-            const last = [...steers].reverse().find(x => !held.has(clip(x.text, 80)))
-            return last ? (
-              <Text dimColor wrap="wrap">
-                ↪ {last.text}
-              </Text>
-            ) : null
+            const sentList = steers.filter(x => !held.has(clip(x.text, 80)))
+            const isHistory = isOpen('steers')
+            return (
+              <Box key="steer-card" flexDirection="column" borderStyle="round" borderColor={TONE.cyan.fg} paddingX={1} marginTop={1}>
+                <Box>
+                  {pill('steer:title', '↪ steer the course', 'cyan', true)}
+                  <Box flexGrow={1} />
+                  <Text dimColor>Enter sends · waits 8 s in the outbox</Text>
+                </Box>
+                {Input && (
+                  <Box marginTop={1}>
+                    <Input key="steer" placeholder="tell Claude where the whole session should head next…" submitLabel="steer" onSubmit={(v: string) => void steer($, v)} />
+                  </Box>
+                )}
+                {sentList.length > 0 && (
+                  <Box marginTop={1}>
+                    <Button
+                      key="fold:steers"
+                      plain
+                      dimColor
+                      label={`${isHistory ? '▾' : '▸'} ${sentList.length} sent · last ${span(now - sentList[sentList.length - 1]!.at)} ago`}
+                      onPress={() => toggleIn($, 'steers')}
+                    />
+                  </Box>
+                )}
+                {isHistory &&
+                  [...sentList].reverse().slice(0, 8).map((x, i) => (
+                    <Box key={`steer:h${i}`}>
+                      <Text color={TONE.cyan.fg}>↪ </Text>
+                      <Box flexGrow={1} flexShrink={1}>
+                        <Text dimColor wrap="wrap">
+                          {x.text}
+                        </Text>
+                      </Box>
+                      <Box flexShrink={0}>
+                        <Text dimColor>{` ${span(now - x.at)}`}</Text>
+                      </Box>
+                    </Box>
+                  ))}
+              </Box>
+            )
           })()}
-          {input('steer', '↪ steer the course…', 'steer', v => void steer($, v))}
         </Box>
       )
     } else if (tab === 'tasks') {
