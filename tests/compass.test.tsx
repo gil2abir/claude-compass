@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { barText, bodyOf, dotsText, hintChips, isDecided, span, leadOf, moveIn, wordWrap, boardOf, crumb, gist, peerKey, plain, frontierOf, mergeGrill, parseLoose, parseMap, senderOf } from '../hooks/register'
+import { barText, bodyOf, dotsText, hintChips, isDecided, span, transcriptDigest, leadOf, moveIn, wordWrap, boardOf, crumb, gist, peerKey, plain, frontierOf, mergeGrill, parseLoose, parseMap, senderOf } from '../hooks/register'
 
 /** Clicks a control by key: a Button is pressed, a pill (a Client region) gets a pointer click. */
 const tap = async (mounted: unknown, key: string) => {
@@ -755,7 +755,7 @@ test('skipping a step from the flow and cancelling it in the outbox puts the ste
   await tap(ui, 'skip:s5')
   expect(await ui.find({ text: /run tests · skipped by you/ })).toBeDefined()
   // a chart made now does not see the queued steer
-  await tap(ui, 'refresh')
+  await tap(ui, 'sync:refresh')
   await clock.advance(1500)
   expect(prompts[prompts.length - 1]).not.toMatch(/Skip this/)
   const id = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').find(k => k.startsWith('drop:'))!.slice(5)
@@ -833,7 +833,7 @@ test('the first chart lands during the first turn: with nothing to fork yet, it 
   await clock.advance(5000)
   // still in the first turn, and the chart is up
   expect(asked.length).toBe(1)
-  expect(asked[0]).toMatch(/first request: "build a compass mod for claude code"/)
+  expect(asked[0]).toMatch(/first request: build a compass mod for claude code/)
   expect(await ui.find({ key: 'node:s4' })).toBeDefined()
   await ui.unmount()
 })
@@ -910,4 +910,44 @@ test('the chart does not repeat a question already in the grill, reworded or not
     { id: 'x2', title: 'Package name', body: 'What to call the package?', options: [], rec: '', dependsOn: [], mode: 'work', from: '', blocking: false },
   ], 'csv', 'map', at)
   expect(merged.map(q => q.id)).toEqual(['fmt', 'x2'])
+})
+
+test('a resumed session with nothing to fork is charted from its saved conversation, and says so while it works', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const asked: string[] = []
+  on('model.fork', () => ({ value: { isAnswered: false, reason: 'nothing-to-fork' } }) as never)
+  on('model.complete', (_$, e) => {
+    asked.push((e as { prompt: string }).prompt)
+    return { value: { isAnswered: true, text: JSON.stringify(MAP), usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } } as never
+  })
+  on('session.id', () => ({ value: 'sess-old' }))
+  on('session.messages', () => ({ value: [
+    { role: 'user', text: 'ship the POD links page', toolUses: [] },
+    { role: 'assistant', text: 'Plan: build the page, then deploy.', toolUses: [{ tool_use_id: 'a', tool: 'Write', input: { file_path: '/x' } }] },
+    { role: 'user', text: 'also fix the RTL card', toolUses: [] },
+  ] }) as never)
+  on('session.usage', () => ({ value: { startedAt: 1, context: { window: 1000, percent: 40 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true, source: 'resume' } as never)
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  await clock.advance(1500)
+  expect(asked.length).toBe(1)
+  expect(asked[0]).toMatch(/first request: ship the POD links page/)
+  expect(asked[0]).toMatch(/USER: also fix the RTL card/)
+  expect(await ui.find({ key: 'node:s4' })).toBeDefined()
+  // one update button, in the sync line
+  expect(await ui.find({ key: 'refresh' })).toBeUndefined()
+  expect(await ui.find({ key: 'sync:refresh' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('transcriptDigest keeps the first request and the latest exchanges within its cap', async () => {
+  const msgs = [{ role: 'user', text: 'first ask', toolUses: [] }, ...Array.from({ length: 200 }, (_, i) => ({ role: i % 2 ? 'user' : 'assistant', text: `message ${i} ${'x'.repeat(200)}`, toolUses: [] }))]
+  const d = transcriptDigest(msgs, 3000)
+  expect(d).toMatch(/first request: first ask/)
+  expect(d).toMatch(/message 199/)
+  expect(d.length < 3000 + 300).toBe(true)
 })

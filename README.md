@@ -45,7 +45,7 @@ Commands: `/compass`, `/compass refresh`, `/compass steer <text>`, `/compass tas
 
 - The map is made by one extra model call (`$.model.fork`) that reuses the session's prompt cache: 3 s after each prompt (so the first chart arrives while Claude is still working on your first request), again when each turn ends, and every 3 min during long turns. The stats tab shows compass's own token use.
 - The agent gets a `grill` tool and short instructions in its system prompt for asking you questions without blocking.
-- The chart is saved in the plugin's own store (`$.store`), so `claude --resume` reopens it without charting again; the 12 most recent sessions are kept.
+- Recovering: a session you resume or come back to reopens its saved chart from the plugin's own store (`$.store`, the 12 most recent sessions) with no model call. If there is none (for example a session charted by an older compass), compass charts it right away from a compact digest of the saved conversation (its first request and the recent exchanges, about 12k characters) with the fast model; the next turn's end charts it again from the shared, cached context.
 
 ## What compass reads, sends, runs and stores
 

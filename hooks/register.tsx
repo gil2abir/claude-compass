@@ -604,13 +604,13 @@ const partWidth = (x: HintPart) => (x.bar !== undefined ? BAR_CELLS : glen(x.tex
  * short, parts leave from inside a chip first (last step, next step, long labels), then whole
  * chips by priority, so every chip stays one unit. `room` counts the panel's own padding.
  */
-export const hintChips = (map: CompassMap | null, asks: number, queued: number, room: number, incoming: string | null = null, blocking = 0): HintChip[] => {
+export const hintChips = (map: CompassMap | null, asks: number, queued: number, room: number, incoming: string | null = null, blocking = 0, hasTurns = false): HintChip[] => {
   const SEP: HintPart = { text: ' │ ', isDim: true }
   const chip = (key: string, tone: Tone, parts: HintPart[]): HintChip => ({ key, tone, parts, width: 2 + parts.reduce((n, x) => n + partWidth(x), 0) })
   const BRAND = 11
   const fits = (chips: HintChip[]) => 1 + BRAND + chips.reduce((n, c) => n + 1 + c.width, 0) + 1 <= room
   if (!map && !incoming) {
-    const wait = [chip('wait', 'dim', [{ text: '◌ charting after your first turn' }])]
+    const wait = [chip('wait', 'dim', [{ text: hasTurns ? '◌ no chart yet · ↻ update in the pane' : '◌ charting after your first prompt' }])]
     return fits(wait) ? wait : []
   }
   const { milestone, step, upcoming } = locate(map)
@@ -991,6 +991,28 @@ async function sentSteers($: EngineInterface) {
   return (await read($, steersA)).filter(x => !held.has(clip(x.text, 80)))
 }
 
+/**
+ * The saved conversation in brief: its first request and the recent exchanges, a few thousand
+ * characters. Used when the session has made no request in this process yet (a resume, or a
+ * restart), so the shared-context fork has nothing to branch from.
+ */
+export const transcriptDigest = (messages: readonly { role: string; text: string; toolUses: readonly { tool: string }[]; toolResults?: readonly unknown[] }[], cap = 12_000) => {
+  const isAsk = (m: { role: string; text: string; toolResults?: readonly unknown[] }) => m.role === 'user' && !!m.text.trim() && !m.toolResults?.length
+  const first = messages.find(isAsk)?.text ?? ''
+  const lines: string[] = []
+  let size = 0
+  for (const m of [...messages].reverse()) {
+    const tools = [...new Set(m.toolUses.map(u => u.tool))]
+    const text = plain(m.text)
+    if (!text && !tools.length) continue
+    const line = `${m.role === 'user' ? (isAsk(m) ? 'USER' : 'tool results') : 'CLAUDE'}: ${clip(text, isAsk(m) ? 600 : 300)}${tools.length ? ` [used: ${tools.join(', ')}]` : ''}`
+    if (size + line.length > cap) break
+    lines.unshift(line)
+    size += line.length
+  }
+  return first || lines.length ? `The session's first request: ${clip(plain(first), 800)}\nThe recent conversation, oldest first:\n${lines.join('\n')}` : ''
+}
+
 async function refresh($: EngineInterface) {
   if (inflight) return
   inflight = true
@@ -1016,16 +1038,23 @@ async function refresh($: EngineInterface) {
     let reply: ModelForkResult = await $.model.fork({ prompt })
     // the very first turn has no answer yet to fork from: chart from the request itself, fast,
     // so the first chart lands while Claude is still working; the turn's end charts it in full
+    // nothing to fork yet: the first turn of a new session, or a session resumed or restarted
+    // before its next request. Chart from what there is, with the fast model; the next turn's end
+    // charts it again from the shared, cached context
     let isQuick = false
-    if (!reply.isAnswered && reply.reason === 'nothing-to-fork' && lastRequest) {
-      isQuick = true
-      reply = await $.model.complete({
-        model: 'haiku',
-        system: 'You are COMPASS. Reply with ONLY one minified JSON object, no prose.',
-        prompt: `${prompt}\nThere is no conversation yet beyond the user's first request below: chart the plan it implies (the first milestone active, its first step active, the rest pending).\nThe user's first request: ${JSON.stringify(lastRequest)}`,
-        maxTokens: 2000,
-        effort: 'low',
-      })
+    if (!reply.isAnswered && reply.reason === 'nothing-to-fork') {
+      const saved = transcriptDigest(await $.session.messages())
+      const brief = saved || (lastRequest ? `The session's first request: ${lastRequest}` : '')
+      if (brief) {
+        isQuick = true
+        reply = await $.model.complete({
+          model: 'haiku',
+          system: 'You are COMPASS. Reply with ONLY one minified JSON object, no prose.',
+          prompt: `${prompt}\nYou cannot see the session itself; this is what it holds. Chart it from this (if it is only a first request, chart the plan it implies: the first milestone active, its first step active, the rest pending).\n${brief}${lastRequest && saved ? `\nThe user's latest request: ${JSON.stringify(lastRequest)}` : ''}`,
+          maxTokens: 2500,
+          effort: 'low',
+        })
+      }
     }
     await countOwn($, reply)
     let map = reply.isAnswered ? parseMap(reply.text, await $.clock.now()) : null
@@ -1036,7 +1065,8 @@ async function refresh($: EngineInterface) {
       map = reply.isAnswered ? parseMap(reply.text, await $.clock.now()) : null
     }
     if (!reply.isAnswered) {
-      await update($, errorA, () => (reply.reason === 'nothing-to-fork' ? null : `map not updated (${reply.reason}); kept the last one`))
+      // nothing to fork and nothing saved: a brand-new session, which is no error
+      await update($, errorA, () => (reply.reason === 'nothing-to-fork' ? null : `chart not updated (${reply.reason}); kept the last one · ↻ to retry`))
       return
     }
     if (!map) {
@@ -1794,7 +1824,7 @@ export const register: Register = on => {
     const panes = paneCols > 0 ? await $.ui.panes() : []
     const isDocked = panes.some(p => p.id === PANE)
     const room = Math.max(24, (e.viewport?.columns ?? 100) + (isDocked ? paneCols + 1 : 0) - glen(e.props.hint ?? '') - 6)
-    const chips = hintChips(map, asks, queued, room, incoming?.text ?? null, blocking)
+    const chips = hintChips(map, asks, queued, room, incoming?.text ?? null, blocking, (await read($, statsA)).turns > 0)
     const gap = (key: string) => (
       <Text key={key} backgroundColor={PANEL}>
         {' '}
@@ -1980,7 +2010,6 @@ export const register: Register = on => {
               await update($, tabA, () => 'flow')
               await toggleIn($, 'legend')
             }, isOpen('legend'))}
-            {pillBtn('refresh', isRefreshing ? spin : '↻', isRefreshing ? 'cyan' : 'dim', () => wantRefresh())}
             <Button key="close" plain dimColor label="✕" role="dismiss" onPress={() => void togglePane($)} />
           </Box>
         </Box>
@@ -3057,7 +3086,7 @@ export const register: Register = on => {
             </Text>
           ) : null}
         </Box>
-        {syncLine.canRefresh && pillBtn('sync:refresh', '↻ update', 'cyan', () => wantRefresh())}
+        {!isRefreshing && pillBtn('sync:refresh', syncLine.canRefresh ? '↻ update' : '↻', syncLine.canRefresh ? 'cyan' : 'dim', () => wantRefresh())}
       </Box>
     )
 
