@@ -809,6 +809,12 @@ let paneActedAt = 0
 /** Each full chart bumps this; a reconcile made across one is dropped. */
 let chartEpoch = 0
 let isReconciling = false
+// a new request gets a quick chart of its own (haiku) within seconds; a full chart that started
+// before the request and lands after the quick one is stale, and the one started after it wins
+let requestAt = 0
+let quickAt = 0
+let landedFrom = 0
+let isQuickCharting = false
 const RECONCILE_AFTER_MS = 2_500
 let lastRefreshAt = 0
 // the first request of a turn is on the wire within a few seconds; the fork then sees the new prompt
@@ -1101,6 +1107,44 @@ async function reconcile($: EngineInterface) {
   }
 }
 
+/**
+ * The user's new request, on the chart in seconds: haiku adds it to the current chart (the work it
+ * starts becomes "now") without marking anything done. The full chart a few seconds into the turn
+ * sees the conversation and replaces it when it lands.
+ */
+async function chartRequest($: EngineInterface, request: string) {
+  const stored = await read($, mapA)
+  if (!isCurrent(stored) || isQuickCharting) return
+  isQuickCharting = true
+  const startedAt = Date.now()
+  await update($, tickA, n => n + 1)
+  try {
+    const prompt = [
+      'You are COMPASS. Reply with ONLY one minified JSON object in the same shape as the chart below (goal, milestones, tasks, recap, alt, moot).',
+      'The user just sent the session a new request (below). Update the chart so it shows that request as the work now: if it continues the active milestone, add its steps there; otherwise add a new milestone for it after the finished ones. Mark the new work active (its first step active, the rest pending) and the step that was active before pending unless the request finishes it. Do NOT mark anything done the session has not shown. Keep every existing id; new ids are short and unique. Keep the goal unless the request changes it.',
+      `The chart: ${JSON.stringify({ goal: stored.goal, milestones: stored.milestones, tasks: stored.tasks, recap: stored.recap, alt: stored.alt ?? null })}`,
+      `The new request: ${JSON.stringify(clip(request, 1500))}`,
+    ].join('\n')
+    const reply = await $.model.complete({ model: 'haiku', system: 'You are COMPASS. Reply with ONLY one minified JSON object, no prose.', prompt, maxTokens: 2500, effort: 'low' })
+    await countOwn($, reply)
+    // a full chart that started after this one already landed: it saw the request, it counts
+    if (!reply.isAnswered || landedFrom > startedAt) return
+    const map = parseMap(reply.text, await $.clock.now())
+    if (!map || !map.milestones.length) return
+    const { grill: _ignored, moot: _moot, ...charted } = map
+    void _ignored
+    void _moot
+    const at = await $.clock.now()
+    await update($, mapA, m => (m && isCurrent(m) ? { ...m, goal: charted.goal || m.goal, milestones: charted.milestones, tasks: charted.tasks, recap: charted.recap.length ? charted.recap : m.recap, reconciledAt: at } : m))
+    quickAt = Date.now()
+    await update($, incomingA, () => null)
+  } catch {
+    // the full chart a few seconds into the turn covers it
+  } finally {
+    isQuickCharting = false
+  }
+}
+
 async function refresh($: EngineInterface) {
   if (inflight) return
   inflight = true
@@ -1166,6 +1210,9 @@ async function refresh($: EngineInterface) {
       await update($, errorA, () => "map not updated: the model's summary wasn't valid JSON; kept the last one · ↻ to retry")
       return
     }
+    // started before the user's latest request, landing after its quick chart: that chart is newer
+    if (startedAt < requestAt && quickAt > startedAt) return
+    landedFrom = startedAt
     const { grill: inferred, moot, ...charted } = map
     const prevMap = isCurrent(stored) ? stored : null
     const latest = await read($, mapA)
@@ -1383,7 +1430,7 @@ async function removeAction($: EngineInterface, id: string) {
 async function flushOutbox($: EngineInterface) {
   const t = await $.clock.now()
   const waiting = (await read($, actionsA)).filter(a => a.status === 'queued' && a.kind !== 'note')
-  if (waiting.some(a => t - a.at < SEND_GRACE_MS) || isReconciling || (await read($, refreshingA))) await update($, tickA, n => n + 1)
+  if (waiting.some(a => t - a.at < SEND_GRACE_MS) || isReconciling || isQuickCharting || (await read($, refreshingA))) await update($, tickA, n => n + 1)
   if (await read($, busyA)) {
     for (const a of waiting) if (a.route === 'running turn' && t - a.at >= SEND_GRACE_MS) await appendNow($, a)
     return
@@ -1872,7 +1919,11 @@ export const register: Register = on => {
     if (request && !e.text.startsWith('<')) lastRequest = clip(request, 2000)
     // the user's own request only: a turn compass submitted is already in the outbox as sent
     const isOwn = /\[compass\b|^the compass plugin sent a message/i.test(e.text)
-    if (request && !e.text.startsWith('<') && !isOwn) await update($, incomingA, () => ({ text: clip(request, 80), at: Date.now() }))
+    if (request && !e.text.startsWith('<') && !isOwn) {
+      await update($, incomingA, () => ({ text: clip(request, 80), at: Date.now() }))
+      requestAt = Date.now()
+      void chartRequest($, request)
+    }
     return next(e)
   })
 
@@ -2125,7 +2176,8 @@ export const register: Register = on => {
     const syncLine = ((): { tone: Tone; glyph: string; text: string; detail: string; canRefresh: boolean } => {
       const update = { canRefresh: true }
       const wait = { canRefresh: false }
-      if (isRefreshing) return { tone: 'cyan', glyph: spin, text: 'charting now', detail: 'about 10 s · nothing to do', ...wait }
+      if (isQuickCharting) return { tone: 'cyan', glyph: spin, text: 'charting your new message', detail: 'a few seconds · nothing to do', ...wait }
+      if (isRefreshing) return { tone: 'cyan', glyph: spin, text: 'charting now', detail: 'nothing to do', ...wait }
       if (isReconciling) return { tone: 'cyan', glyph: spin, text: 'applying your changes', detail: 'a few seconds · nothing to do', ...wait }
       if (!map && stats.turns === 0 && !isBusy) return { tone: 'dim', glyph: '◌', text: 'waiting for your first prompt', detail: 'the chart starts seconds after you send one', ...wait }
       if (!map && isBusy) return { tone: 'cyan', glyph: '◌', text: 'chart coming', detail: 'drawn in a few seconds · nothing to do', ...wait }
