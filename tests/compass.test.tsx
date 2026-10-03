@@ -837,3 +837,67 @@ test('the first chart lands during the first turn: with nothing to fork yet, it 
   expect(await ui.find({ key: 'node:s4' })).toBeDefined()
   await ui.unmount()
 })
+
+test('the grill is a decision radar: blocking vs open, park and bring back, settled by the session, mirrored in the flow', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  let reply: Record<string, unknown> = { ...MAP, grill: [] }
+  on('model.fork', () => ({ value: { isAnswered: true, text: JSON.stringify(reply), usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }) as never)
+  on('session.id', () => ({ value: 'sess' }))
+  on('session.messages', () => ({ value: [] }) as never)
+  on('session.usage', () => ({ value: { startedAt: 1_000_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }) as never)
+  on('turn.complete', (_$, e) => ({ text: e.answer }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('ui.toast', () => ({ value: undefined }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
+  let context: readonly string[] = []
+  on('prompt.submit', (_$, e) => {
+    context = (e as { context?: readonly string[] }).context ?? []
+    return { text: (e as { text: string }).text } as never
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  await tap(ui, 'tab:grill')
+  // empty: it says what lands here and when
+  expect(await ui.find({ text: /decisions land here/ })).toBeDefined()
+  expect(await ui.find({ text: /after every turn, compass looks for new goals/ })).toBeDefined()
+
+  await $.tool.call({ tool: 'mcp__compass__grill', topic: 'release', questions: [
+    { id: 'db', title: 'Pick the database', body: 'Which?', options: ['sqlite', 'postgres'], recommendation: 'sqlite', blocking: true },
+    { id: 'name', title: 'Name the CLI', body: 'Name?', recommendation: 'tstats', blocking: false },
+  ] } as never)
+  expect(await ui.find({ text: /⏸ 1 blocking/ })).toBeDefined()
+  expect(await ui.find({ text: /\? 1 open/ })).toBeDefined()
+  expect(await ui.find({ text: /work waits on this/ })).toBeDefined()
+
+  // park the open one: it leaves the questions, the session hears it on the next prompt
+  await tap(ui, 'gsel:name')
+  await tap(ui, 'gpark:name')
+  expect(await ui.find({ text: /◌ 1 parked/ })).toBeDefined()
+  await $.prompt.submit({ text: 'go on' } as never)
+  expect(context.join('\n')).toMatch(/Parked grill question Q2 "Name the CLI": do not wait for it.*recommendation \(tstats\)/)
+  // bring it back
+  await tap(ui, 'fold:gparked')
+  await tap(ui, 'gunpark:name')
+  expect(await ui.find({ text: /◌ 0 parked/ })).toBeDefined()
+
+  // the flow mirrors it: the blocking one waits on you, the other is open while work goes on
+  await tap(ui, 'tab:flow')
+  await $.turn.start({ text: 'go', turnId: 't1' } as never)
+  await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+  await clock.advance(1500)
+  expect(await ui.find({ text: /waits on you/ })).toBeDefined()
+  expect(await ui.find({ text: /open · work goes on/ })).toBeDefined()
+
+  // the conversation settled the database: the next chart says so and it leaves the open list
+  reply = { ...MAP, grill: [], moot: ['db'] }
+  await $.turn.start({ text: 'more', turnId: 't2' } as never)
+  await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't2', reason: 'answer' } as never)
+  await clock.advance(1500)
+  expect(await ui.find({ text: /waits on you/ })).toBeUndefined()
+  await tap(ui, 'tab:grill')
+  expect(await ui.find({ text: /✓ 1 settled/ })).toBeDefined()
+  await ui.unmount()
+})
