@@ -72,28 +72,35 @@ Commands: `/compass`, `/compass refresh`, `/compass steer <text>`, `/compass tas
 
 A mod runs on your machine with the same access Claude Code has. Read the source (`hooks/register.tsx`, `hooks/board.tsx`, `hooks/brand.tsx`, `hooks/pill.tsx`) before installing. In short:
 
-**Prompts it submits.** Only what you put in the outbox, exactly as the outbox previews it (click an item to see the text): steers you type or pick (go, skip, later, retry, take a branch), task changes you make on the board, your grill answers and dismissals. Each waits 8 s in the outbox and can be removed. They go in as a new turn (`prompt.submit`), into the running turn (`session.append`), or as context on your next prompt. Compass never puts file contents in a prompt.
+**Prompts it submits.** Only what you put in the outbox, exactly as the outbox previews it (click an item to see the text): steers you type or pick (go, skip, later, retry, take a branch), task changes you make on the board, your grill answers and dismissals. Each waits 8 s in the outbox and can be removed. They go in as a new turn (`prompt.submit`), into the running turn (`session.append`), or as context on your next prompt. Compass never puts file contents, the session id, or anything else it read from the session into these prompts; the only text it adds of its own is a short header naming the kind of item (`🧭 [compass — steering from the user]`, `🧭 [compass grill · round 1 — answers from the user]`).
 
 **Model calls.** To draw the chart it makes one extra call to the session's own model (`model.fork`): it sees the session's conversation, which is already with that model, plus compass's state (the current chart, tasks, sent steers, grill questions, decided forks, messages from other agents). Nothing is added to your session's history.
 
-**Tools it calls itself.** `ListAgents`, to list your other sessions and agents in the chat tab (when the pane opens and every 15 s while the chat tab is shown), and `SendMessage` (through `session.send`) when you send a message from the chat tab. It registers one tool of its own, `grill`, which the agent uses to post questions; compass's `tool.call` hook answers that tool and no other.
+**Tools it calls itself.** `ListAgents`, to list your other sessions and agents in the chat tab (when the pane opens and every 15 s while the chat tab is shown), and `SendMessage` (through `session.send`) when you send a message from the chat tab. It registers one tool of its own, `grill`, which the agent uses to post questions; compass's `tool.call` hook answers that tool and no other. Both tool names are fixed in the source; compass never calls a shell, an agent, an MCP server or any tool whose name it was handed, and never runs a command.
 
 **Hooks, and what each does.** All pass the event on unchanged unless noted:
-- `tool.call` (every tool): records the call's start and end for the live tab (tool name, a few words of its input, status, duration), counts tools and errors for the stats tab, notes edited files, reads TodoWrite/TaskCreate for the task board, reads ListAgents results for the chat tab. Answers only its own `grill` tool.
-- `command.run`: `/compass` is compass's own command (it answers it); `/btw` is recorded as a side question and passed on.
+- `tool.call` (every tool): records the call's start and end for the live tab (tool name, a few words of its input, status, duration), counts tools and errors for the stats tab, notes edited files, reads TodoWrite/TaskCreate for the task board, reads ListAgents results for the chat tab. It never changes, blocks or re-runs a call: it reads the tool's name, a few words of its input (the command, a file name, a pattern) and whether it succeeded, and that stays in the pane. Compass's own calls are skipped. Answers only its own `grill` tool, by returning the round's summary to the agent in place of a tool run.
+- `command.run`: `/compass` is compass's own command (it answers it); `/btw` is recorded as a side question and passed on; every other command passes through untouched.
 - `prompt.submit`: adds your queued "with your next prompt" notes as context; records `/btw`.
-- `prompt.compose`: adds the grilling guide and the steers you sent to the system prompt.
+- `prompt.compose`: adds one section to the system prompt (the grilling guide and the steers you sent) and changes nothing else in it.
 - `session.send` / `session.receive`: records chat messages to and from other sessions.
 - `session.start` / `session.end`, `turn.start` / `turn.complete`: keep the chart current; `/clear` starts the compass over.
 - `ui.render`, `ui.message`, `ui.scroll`: draw the pane and the row under the prompt. On transcript rows (`UserMessage`) it only reads a background task's notification to close its live-tab row, and draws nothing.
 
-**What it reads.** The session's messages and usage (`session.messages`, `session.usage`) for the chart and the stats. It reads no files, no environment variables and no credentials.
+**What it reads.** The session's messages and usage (`session.messages`, `session.usage`) for the chart and the stats. It reads no files, no environment variables, no API keys, tokens or other credentials. `session.id` is read only to name the entry its chart is saved under in its own store; `$.store.keys()` lists those entries.
 
 **What it writes.** No files. It keeps each session's compass in its own plugin store (`$.store`, a JSON file Claude Code keeps for the plugin) so `claude --resume` reopens it; the 12 most recent sessions are kept and `/clear` removes the current one.
 
-**Network.** None of its own. The `repository` link in `plugin.json` is metadata.
+**What leaves the machine, and where.** Three things, all through Claude Code itself:
+- the chart call (`model.fork`) sends the conversation and compass's state to the session's own model, the same model and account the session already uses;
+- the prompts you let through the outbox go into this session only;
+- a message you type in the chat tab goes, through `SendMessage`, to the session or agent you picked.
 
-The `types` field in `plugin.json` names the mod's state contract (`types/index.d.ts`), which `claude plugin validate` checks; Claude Code itself ignores it. `tests/` is the test suite for `claude plugin test`: its hooks stand in for the engine (they answer tool calls, the store and model calls with fixed data).
+The session id, usage figures and the live feed stay on your machine.
+
+**Network.** None of its own: no HTTP calls, no telemetry. The `repository` link in `plugin.json` is metadata.
+
+The `types` field in `plugin.json` names the mod's state contract (`types/index.d.ts`), which `claude plugin validate` checks; Claude Code itself ignores it. `tests/` is the test suite for `claude plugin test`: its hooks stand in for the engine (they answer tool calls, the store and model calls with fixed data), and it uses test-only calls such as `$.ui.mount` that the mod itself never makes.
 
 ## Update
 
