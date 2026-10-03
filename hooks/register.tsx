@@ -587,6 +587,52 @@ export const gist = (map: CompassMap | null, asks: number, queued: number, budge
   return [brand]
 }
 
+export type HintPill = { key: string; tone: Tone; isBold?: boolean; parts: { text?: string; bar?: number; isDim?: boolean }[]; width: number }
+
+/**
+ * The row under the prompt as pills, after the reference: each item its own tinted chip with an
+ * icon. Items are kept whole and dropped by priority (the step now first, then what needs the
+ * user, then step progress, the next step, the last one) until the row fits `room` cells.
+ */
+export const hintPills = (map: CompassMap | null, asks: number, queued: number, room: number, incoming: string | null = null): HintPill[] => {
+  const mk = (key: string, tone: Tone, parts: HintPill['parts'], isBold = false): HintPill => ({
+    key,
+    tone,
+    isBold,
+    parts,
+    width: 2 + parts.reduce((n, x) => n + (x.bar !== undefined ? 5 : glen(x.text ?? '')), 0),
+  })
+  const BRAND = 11 + 1
+  if (!map && !incoming) return [mk('wait', 'dim', [{ text: '◌ charting after your first turn' }])].filter(p => p.width + BRAND <= room)
+  const { milestone, step, next } = locate(map)
+  const steps = (milestone?.steps ?? []).filter(s => s.kind !== 'aside')
+  const done = steps.filter(s => s.state === 'done').length
+  const past = [...steps].reverse().find(s => s.state === 'done')?.label
+  const isBlocked = step?.state === 'blocked'
+  const nowText = plain(incoming ?? step?.label ?? milestone?.label ?? '')
+  const candidates: [number, HintPill][] = []
+  if (nowText) candidates.push([0, mk('now', isBlocked ? 'red' : 'blue', [{ text: `${isBlocked ? '!' : '●'} ${nowText}` }], true)])
+  if (isBlocked) candidates.push([1, mk('need', 'red', [{ text: '! needs you' }], true)])
+  if (asks) candidates.push([1, mk('ask', 'yellow', [{ text: `? ${asks} to answer` }], true)])
+  if (map?.alt && !map.altPick) candidates.push([1, mk('fork', 'purple', [{ text: '⑂ 2 ways' }], true)])
+  if (queued) candidates.push([2, mk('queue', 'gray', [{ text: `⇣ ${queued} queued` }])])
+  if (steps.length > 1 && !incoming) candidates.push([3, mk('steps', 'green', [{ text: '⚑ ' }, { bar: done / steps.length }, { text: ` ${done}/${steps.length} `, isDim: false }, { text: 'steps', isDim: true }])])
+  const ahead = incoming ? 'updating…' : next
+  if (ahead) candidates.push([4, mk('next', 'dim', [{ text: `○ ${plain(ahead)}` }])])
+  if (past && !incoming) candidates.push([5, mk('past', 'green', [{ text: `✓ ${plain(past)}` }])])
+  // keep the most important that fit, then lay them out in reading order
+  const ORDER = ['past', 'now', 'next', 'steps', 'need', 'ask', 'fork', 'queue']
+  let used = BRAND
+  const kept: HintPill[] = []
+  for (const [, p] of [...candidates].sort((a, b) => a[0] - b[0])) {
+    if (used + p.width + 1 <= room) {
+      kept.push(p)
+      used += p.width + 1
+    }
+  }
+  return kept.sort((a, b) => ORDER.indexOf(a.key) - ORDER.indexOf(b.key))
+}
+
 /** Tasks the board shows: the agent's list, plus user tasks it has not picked up yet. */
 export const boardOf = (map: CompassMap | null, userTasks: { id: string; text: string }[]) => {
   const tasks = map?.tasks ?? []
@@ -1675,65 +1721,38 @@ export const register: Register = on => {
     const isRefreshing = await read($, refreshingA)
     await read($, tickA)
     const now = await $.clock.now()
-    // progress through the active milestone, drawn as a small bar
-    const { milestone } = locate(map)
-    const steps = (milestone?.steps ?? []).filter(s => s.kind !== 'aside')
-    const done = steps.filter(s => s.state === 'done').length
-    const hasBar = steps.length > 1
-    // the engine's own hint keeps its room; the gist takes what is left, never wrapping
-    const columns = e.viewport?.columns ?? 100
-    const hint = glen(e.props.hint ?? '')
-    const budget = Math.max(24, columns - hint - 6 - (hasBar ? 8 : 0) - 6)
     const incoming = await read($, incomingA)
-    const parts = gist(map, asks, queued, budget, incoming?.text ?? null)
-    const text = {
-      past: { color: TONE.green.fg, dim: true },
-      now: { color: '#e6e6e6', bold: true },
-      blocked: { color: TONE.red.fg, bold: true },
-      next: { dim: true },
-      sep: { dim: true },
-    } as const
-    const PILL = { ask: 'yellow', need: 'red', queue: 'gray' } as const
     const engine = await next(e)
     const spin = isRefreshing ? SPIN[Math.floor(now / 120) % SPIN.length] : ''
+    // the room left beside the engine's own hint
+    const room = Math.max(24, (e.viewport?.columns ?? 100) - glen(e.props.hint ?? '') - 8)
+    const hint = hintPills(map, asks, queued, room, incoming?.text ?? null)
     // the engine's own node may only sit under a Box with no props
     return (
       <Box>
-        <Box flexShrink={0}>
+        <Box flexShrink={0} columnGap={1}>
           {/* a Button draws one engine colour: where a Client can be drawn, the gold brand is one and takes the click */}
           {Client ? (
             <Client key="compass-crumb" module="./brand.tsx" props={{ color: GOLD, bg: TONE.gold.bg, spin }} />
           ) : (
-            <Button key="compass-crumb" plain label={parts[0]!.text} onPress={() => void togglePane($)} />
+            <Button key="compass-crumb" plain label="◈ compass" onPress={() => void togglePane($)} />
           )}
-          {hasBar ? (
-            <Text key="g:bar">
+          {hint.map(p => (
+            <Text key={`hp:${p.key}`} color={TONE[p.tone].fg} backgroundColor={TONE[p.tone].bg} bold={p.isBold}>
               {' '}
-              <Text color={TONE.green.fg} backgroundColor={TRACK}>
-                {barText(done / steps.length, 5)}
-              </Text>
-              <Text dimColor>{` ${done}/${steps.length}`}</Text>
+              {p.parts.map((x, i) =>
+                x.bar !== undefined ? (
+                  <Text key={`hp:${p.key}:${i}`} color={TONE[p.tone].fg} backgroundColor={TRACK}>
+                    {barText(x.bar, 5)}
+                  </Text>
+                ) : (
+                  <Text key={`hp:${p.key}:${i}`} dimColor={x.isDim}>
+                    {x.text}
+                  </Text>
+                ),
+              )}{' '}
             </Text>
-          ) : null}
-          {parts.slice(1).map((p, i) => {
-            if (p.tone === 'brand') return null
-            // the bar already shows where in the milestone the work is
-            if (hasBar && /^● step \d+\/\d+$/.test(p.text)) return null
-            if (p.tone === 'ask' || p.tone === 'need' || p.tone === 'queue') {
-              const t = TONE[PILL[p.tone]]
-              return (
-                <Text key={`g:${i}`} color={t.fg} backgroundColor={t.bg} bold>
-                  {` ${p.text} `}
-                </Text>
-              )
-            }
-            const t: { color?: string; bold?: boolean; dim?: boolean } = text[p.tone]
-            return (
-              <Text key={`g:${i}`} color={t.color} bold={t.bold} dimColor={t.dim} wrap="truncate-end">
-                {p.text}
-              </Text>
-            )
-          })}
+          ))}
         </Box>
         <Text dimColor>{'   '}</Text>
         {engine}

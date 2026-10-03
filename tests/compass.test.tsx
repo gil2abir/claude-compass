@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { barText, bodyOf, dotsText, isDecided, span, leadOf, moveIn, wordWrap, boardOf, crumb, gist, peerKey, plain, frontierOf, mergeGrill, parseLoose, parseMap, senderOf } from '../hooks/register'
+import { barText, bodyOf, dotsText, hintPills, isDecided, span, leadOf, moveIn, wordWrap, boardOf, crumb, gist, peerKey, plain, frontierOf, mergeGrill, parseLoose, parseMap, senderOf } from '../hooks/register'
 
 /** Clicks a control by key: a Button is pressed, a pill (a Client region) gets a pointer click. */
 const tap = async (mounted: unknown, key: string) => {
@@ -802,4 +802,18 @@ test('cancelling a grill round in the outbox puts its answers back', async ($, o
   expect(await ui.find({ text: /round 1/ })).toBeDefined()
   expect(await ui.find({ text: /0 settled/ })).toBeDefined()
   await ui.unmount()
+})
+
+test('the row under the prompt is pills kept whole, dropped by priority, in reading order', async () => {
+  const map = parseMap(JSON.stringify(MAP), 1)
+  const wide = hintPills(map, 2, 1, 200)
+  expect(wide.map(p => p.key)).toEqual(['past', 'now', 'next', 'steps', 'ask', 'queue'])
+  expect(wide.find(p => p.key === 'steps')?.parts.map(x => x.text ?? '').join('')).toMatch(/1\/3 steps/)
+  // narrow: the step now and the question stay, the rest go whole
+  const narrow = hintPills(map, 2, 1, 50)
+  expect(narrow.map(p => p.key)).toEqual(['now', 'ask'])
+  for (const room of [24, 40, 60, 90, 140]) {
+    const used = 12 + hintPills(map, 2, 1, room).reduce((n, p) => n + p.width + 1, 0)
+    expect(used <= room).toBe(true)
+  }
 })

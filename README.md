@@ -18,7 +18,7 @@ If it doesn't show up, restart Claude Code. From a local clone instead: `claude 
 
 The pane is drawn like a small GUI: indicators are graphics (colored pills, level bars, counters, lit dots for countdowns, a spinner while charting), and information (steps, tasks, questions, messages) stays text. Before the first chart lands, the flow tab shows an animated sea chart: a 32-point compass rose with clouds, gulls and waves, and a gull crossing it while compass works.
 
-Click the gold `◈ compass` under the prompt to open or close the pane, or type `/compass`. Next to it: a progress bar for the active milestone, `✓ last step › ● now › ○ next`, and pills for anything waiting on you (`? 2 to answer`, `⑂ 2 ways`, queued items). Labels are shown whole or dropped when space is short, never cut mid-word.
+Click the gold `◈ compass` under the prompt to open or close the pane, or type `/compass`. Next to it, one tinted chip per item: `✓ last step`, `● now`, `○ next`, `⚑ ██░ 1/3 steps` (steps done in the current milestone), and chips for anything waiting on you (`? 2 to answer`, `⑂ 2 ways`, `⇣ 1 queued`). Chips drop out whole when space is short. Labels are shown whole or dropped when space is short, never cut mid-word.
 
 At the top of every tab, a **sync line**: whether the chart has caught up with the session: `✓ in sync`, `⟳ charting your new message`, `◌ not charted yet: your message …`, `◌ N turns behind`, with `↻ update`.
 
