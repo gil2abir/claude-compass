@@ -901,3 +901,13 @@ test('the grill is a decision radar: blocking vs open, park and bring back, sett
   expect(await ui.find({ text: /✓ 1 settled/ })).toBeDefined()
   await ui.unmount()
 })
+
+test('the chart does not repeat a question already in the grill, reworded or not', async () => {
+  const at = 1
+  const agent = mergeGrill([], [{ id: 'fmt', title: 'JSON output shape', body: 'Array of objects, JSON Lines, or both via a flag?', options: [], rec: 'both', dependsOn: [], mode: 'plan', from: '', blocking: true }], 'csv', 'agent', at)
+  const merged = mergeGrill(agent, [
+    { id: 'x1', title: 'Output shape for JSON', body: 'Emit an array of objects or JSON Lines?', options: [], rec: '', dependsOn: [], mode: 'work', from: '', blocking: false },
+    { id: 'x2', title: 'Package name', body: 'What to call the package?', options: [], rec: '', dependsOn: [], mode: 'work', from: '', blocking: false },
+  ], 'csv', 'map', at)
+  expect(merged.map(q => q.id)).toEqual(['fmt', 'x2'])
+})
