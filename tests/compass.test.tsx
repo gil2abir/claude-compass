@@ -167,7 +167,7 @@ test('a compass present from the first turn charts once there is history, and /c
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
   await clock.advance(1500)
   const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
-  expect(await ui.find({ text: /the first chart is drawn/ })).toBeDefined()
+  expect(await ui.find({ text: /waiting for your first prompt/ })).toBeDefined()
   expect(await ui.find({ text: /△/ })).toBeUndefined()
 
   hasHistory = true
@@ -493,13 +493,16 @@ test('the sync line says whether the chart has caught up with the session', asyn
   await $.turn.start({ text: '<task-notification>done</task-notification>', turnId: 't2' } as never)
   await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't2', reason: 'answer' } as never)
   await clock.advance(1500)
+  // idle and behind: it says to press ↻ update, and offers it
   expect(await ui.find({ text: /1 turn behind/ })).toBeDefined()
+  expect(await ui.find({ text: /press ↻ update/ })).toBeDefined()
   expect(await ui.find({ key: 'sync:refresh' })).toBeDefined()
 
   // a new message mid-turn is named until a chart includes it
   await $.turn.start({ text: 'fix the header', turnId: 't3' } as never)
-  expect(await ui.find({ text: /new message not charted/ })).toBeDefined()
-  expect(await ui.find({ text: /fix the header/ })).toBeDefined()
+  // mid-turn: it says what is going on and that there is nothing to do
+  expect(await ui.find({ text: /your new message/ })).toBeDefined()
+  expect(await ui.find({ text: /nothing to do/ })).toBeDefined()
   await ui.unmount()
 })
 

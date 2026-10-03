@@ -109,7 +109,7 @@ const HINTS = [
  * in the middle (each point dark on one side, light on the other, as on old charts), clouds,
  * seagulls, rolling waves, and a gull crossing the chart while the first chart is made.
  */
-export const seaChart = (width: number, height: number, t: number, isCharting: boolean, hasTurns = false): ChartRun[][] => {
+export const seaChart = (width: number, height: number, t: number, isCharting: boolean, note = 'waiting for your first prompt'): ChartRun[][] => {
   const W = Math.max(20, width)
   const H = Math.max(8, height)
   const grid: { ch: string; ink: SeaInk; bold?: boolean }[][] = Array.from({ length: H }, () => Array.from({ length: W }, () => ({ ch: ' ', ink: 'blank' as SeaInk })))
@@ -197,7 +197,7 @@ export const seaChart = (width: number, height: number, t: number, isCharting: b
   // the hint, centred under the rose
   const word = HINTS[Math.floor(t / 2800) % HINTS.length]!
   const dots = '.'.repeat(1 + (Math.floor(t / 450) % 3))
-  const hint = isCharting ? `${SPIN[Math.floor(t / 120) % SPIN.length]} ${word}${dots}` : hasTurns ? 'no chart yet · press ↻ update to draw it' : 'the first chart is drawn after your first turn'
+  const hint = isCharting ? `${SPIN[Math.floor(t / 120) % SPIN.length]} ${word}${dots}` : note
   // wrapped, never cut: a narrow pane gets it on two rows
   const hintRows = wordWrap(hint, W - 2)
   const hy = Math.min(H - seaRows - hintRows.length, Math.round(cy + ry) + 2)
@@ -1879,6 +1879,30 @@ export const register: Register = on => {
     }
     const spin = SPIN[Math.floor(now / 120) % SPIN.length]!
 
+    // is the chart caught up with the session? one line, always on top
+    const behind = map && typeof map.turns === 'number' ? Math.max(0, stats.turns - map.turns) : 0
+    const unseen = map ? actions.filter(a => a.status === 'sent' && a.at > map.at).length : 0
+    // what is going on with the chart, and whether you need to do anything: one answer for the
+    // sync line and the sea chart alike
+    const syncLine = ((): { tone: Tone; glyph: string; text: string; detail: string; canRefresh: boolean } => {
+      const update = { canRefresh: true }
+      const wait = { canRefresh: false }
+      if (isRefreshing) return { tone: 'cyan', glyph: spin, text: 'charting now', detail: 'about 10 s · nothing to do', ...wait }
+      if (!map && stats.turns === 0 && !isBusy) return { tone: 'dim', glyph: '◌', text: 'waiting for your first prompt', detail: 'the chart starts seconds after you send one', ...wait }
+      if (!map && isBusy) return { tone: 'cyan', glyph: '◌', text: 'chart coming', detail: 'drawn in a few seconds · nothing to do', ...wait }
+      if (!map) return { tone: 'yellow', glyph: '◌', text: 'no chart yet', detail: 'press ↻ update to draw it', ...update }
+      if (incoming) return isBusy
+        ? { tone: 'cyan', glyph: '◌', text: 'your new message', detail: 'charted a few seconds into the turn · nothing to do', ...wait }
+        : { tone: 'yellow', glyph: '◌', text: 'new message not charted', detail: 'press ↻ update', ...update }
+      if (behind) return isBusy
+        ? { tone: 'cyan', glyph: '◌', text: `${behind} turn${behind > 1 ? 's' : ''} behind`, detail: 'updates when this turn ends · nothing to do', ...wait }
+        : { tone: 'yellow', glyph: '◌', text: `${behind} turn${behind > 1 ? 's' : ''} behind`, detail: 'press ↻ update', ...update }
+      if (unseen) return isBusy
+        ? { tone: 'cyan', glyph: '◌', text: `${unseen} update${unseen > 1 ? 's' : ''} sent`, detail: 'charted when this turn ends · nothing to do', ...wait }
+        : { tone: 'yellow', glyph: '◌', text: `${unseen} update${unseen > 1 ? 's' : ''} not charted`, detail: 'press ↻ update', ...update }
+      return { tone: 'green', glyph: '✓', text: 'in sync', detail: isBusy ? 'Claude is working · next update when the turn ends' : '', ...wait }
+    })()
+
     // a clickable label that wraps between words instead of being cut: the first row is the
     // button, the rest follow under it, so every word stays readable
     const wrapped = (key: string, text: string, room: number, onPress: () => unknown, opts: { dim?: boolean; indent?: number } = {}) => {
@@ -2147,7 +2171,7 @@ export const register: Register = on => {
             // the sea chart fills the tab until the first chart lands
             (() => {
               splashAt = now
-              const chartRows = seaChart(width, Math.max(10, e.props.scroll.bodyRows - 17), now, isRefreshing || incoming !== null, stats.turns > 0)
+              const chartRows = seaChart(width, Math.max(10, e.props.scroll.bodyRows - 17), now, isRefreshing || (isBusy && !map), `${syncLine.text} · ${syncLine.detail}`)
               return (
                 <Box key="sea" flexDirection="column">
                   {chartRows.map((row, y) => (
@@ -2899,17 +2923,6 @@ export const register: Register = on => {
       </Box>
     )
 
-    // is the chart caught up with the session? one line, always on top
-    const behind = map && typeof map.turns === 'number' ? Math.max(0, stats.turns - map.turns) : 0
-    const unseen = map ? actions.filter(a => a.status === 'sent' && a.at > map.at).length : 0
-    const syncLine = ((): { tone: Tone; glyph: string; text: string; detail: string; canRefresh: boolean } => {
-      if (isRefreshing) return { tone: 'cyan', glyph: spin, text: 'charting', detail: incoming ? incoming.text : '', canRefresh: false }
-      if (!map) return { tone: 'dim', glyph: '◌', text: stats.turns ? 'no chart yet' : 'waiting for the first turn', detail: '', canRefresh: stats.turns > 0 }
-      if (incoming) return { tone: 'yellow', glyph: '◌', text: 'new message not charted', detail: `${incoming.text}${isBusy ? ' · after this turn' : ''}`, canRefresh: !isBusy }
-      if (behind) return { tone: 'yellow', glyph: '◌', text: `${behind} turn${behind > 1 ? 's' : ''} behind`, detail: '', canRefresh: true }
-      if (unseen) return { tone: 'yellow', glyph: '◌', text: `${unseen} update${unseen > 1 ? 's' : ''} not charted`, detail: '', canRefresh: !isBusy }
-      return { tone: 'green', glyph: '✓', text: 'in sync', detail: '', canRefresh: false }
-    })()
     const sync = (
       <Box key="sync" marginTop={1} marginBottom={1}>
         {pill('sync:state', `${syncLine.glyph} ${syncLine.text}`, syncLine.tone, true)}
