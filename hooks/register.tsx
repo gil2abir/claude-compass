@@ -225,6 +225,8 @@ const SEND_GRACE_MS = 8000
 let splashAt = 0
 /** The docked pane's width, as its last render saw it: the row under the prompt spans it too. */
 let paneCols = 0
+/** The user's latest request, whole: the first chart is drawn from it before the turn ends. */
+let lastRequest = ''
 
 const EMPTY_STATS: CompassStats = {
   startedAt: 0,
@@ -365,11 +367,11 @@ export const wordWrap = (text: string, width: number): string[] => {
       row = rows.pop() ?? ''
       continue
     }
-    const next = row ? `${row} ${word}` : word
-    if (graphemes(next).length > w) {
+    const joined = row ? `${row} ${word}` : word
+    if (graphemes(joined).length > w) {
       rows.push(row)
       row = word
-    } else row = next
+    } else row = joined
   }
   if (row) rows.push(row)
   return rows.length ? rows : ['']
@@ -511,16 +513,16 @@ export const locate = (map: CompassMap | null) => {
   const after = step ? steps.slice(steps.indexOf(step) + 1) : steps
   const nextStep = after.find(s => s.state === 'pending' && s.kind !== 'aside')
   const nextMilestone = milestone ? ms.slice(ms.indexOf(milestone) + 1).find(m => m.state === 'pending') : undefined
-  return { milestone, step, next: nextStep?.label ?? nextMilestone?.label }
+  return { milestone, step, upcoming: nextStep?.label ?? nextMilestone?.label }
 }
 
 /** `goal › milestone › [step] → next`, clipped from the left so "now" survives. */
 export const crumb = (map: CompassMap | null, width: number) => {
   if (!map) return 'charting…'
-  const { milestone, step, next } = locate(map)
+  const { milestone, step, upcoming } = locate(map)
   const head = [map.goal, milestone?.label ?? ''].filter(Boolean).map(plain).join(' › ')
   const here = step ? ` › [${plain(step.label)}]` : ''
-  const tail = next ? ` → ${plain(next)}` : ''
+  const tail = upcoming ? ` → ${plain(upcoming)}` : ''
   const full = `${head}${here}${tail}`
   if (full.length <= width) return full
   return clipLeft(`${plain(milestone?.label ?? '')}${here}${tail}`, width)
@@ -538,7 +540,7 @@ export const gist = (map: CompassMap | null, asks: number, queued: number, budge
   const brand: GistPart = { text: '◈ compass', tone: 'brand' }
   if (!map && !incoming) return [brand, { text: '  charting…', tone: 'past' }]
   if (!map) map = { goal: '', milestones: [], tasks: [], recap: [], at: 0 }
-  const { milestone, step, next } = locate(map)
+  const { milestone, step, upcoming } = locate(map)
   const steps = (milestone?.steps ?? []).filter(s => s.kind !== 'aside')
   const here = step ? steps.indexOf(step) : -1
   const pastStep = [...(here >= 0 ? steps.slice(0, here) : steps)].reverse().find(s => s.state === 'done')
@@ -546,7 +548,7 @@ export const gist = (map: CompassMap | null, asks: number, queued: number, budge
   const isBlocked = step?.state === 'blocked'
   let past = plain(pastStep?.label ?? pastMilestone?.label ?? '')
   let now = plain(step?.label ?? milestone?.label ?? '')
-  let ahead = plain(next ?? '')
+  let ahead = plain(upcoming ?? '')
   if (incoming) {
     // a turn just started on a new request: it is "now" until the chart catches up
     past = now || past
@@ -610,13 +612,13 @@ export const hintChips = (map: CompassMap | null, asks: number, queued: number, 
     const wait = [chip('wait', 'dim', [{ text: '◌ charting after your first turn' }])]
     return fits(wait) ? wait : []
   }
-  const { milestone, step, next } = locate(map)
+  const { milestone, step, upcoming } = locate(map)
   const steps = (milestone?.steps ?? []).filter(s => s.kind !== 'aside')
   const done = steps.filter(s => s.state === 'done').length
   const past = incoming ? plain(step?.label ?? '') : plain([...steps].reverse().find(s => s.state === 'done')?.label ?? '')
   const isBlocked = step?.state === 'blocked'
   const nowText = plain(incoming ?? step?.label ?? milestone?.label ?? '')
-  const ahead = plain(incoming ? 'updating…' : (next ?? ''))
+  const ahead = plain(incoming ? 'updating…' : (upcoming ?? ''))
   const course = (withPast: boolean, withNext: boolean) => {
     const parts: HintPart[] = []
     if (withPast && past) parts.push({ text: `✓ ${past}`, color: TONE.green.fg }, SEP)
@@ -832,21 +834,13 @@ async function hydrate($: EngineInterface) {
 const SNAP_VERSION = 1
 let lastSnapSig = ''
 /** <config>/projects/<project>/<session-id>.jsonl, from the classic events once one arrives. */
-let transcriptPath = ''
-
-/** Where Claude Code keeps this session: the transcript the classic hooks name, else its standard place. */
-async function sessionDir($: EngineInterface) {
-  if (transcriptPath) return transcriptPath.replace(/\.jsonl$/, '')
-  const config = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${(await $.env.get('HOME')) ?? ''}/.claude`
-  const slug = (await $.session.root()).replace(/[^a-zA-Z0-9]/g, '-')
-  return `${config}/projects/${slug}/${await $.session.id()}`
+/** The key this session's compass is saved under in the plugin's own store. */
+async function snapKey($: EngineInterface) {
+  return `snap:${await $.session.id()}`
 }
 
-const noteTranscript = (path: unknown) => {
-  if (typeof path === 'string' && path.endsWith('.jsonl')) transcriptPath = path
-}
-
-const snapPath = async ($: EngineInterface) => `${await sessionDir($)}/compass/snapshot.json`
+/** How many sessions' compasses the store keeps; the oldest go first. */
+const SNAP_KEEP = 12
 
 type Snap = {
   v: number
@@ -901,7 +895,33 @@ async function snapshot($: EngineInterface) {
     chat: chat.slice(-60),
     actions: actions.filter(a => a.status === 'queued' || Date.now() - a.at < 600_000).slice(-20),
   }
-  await $.fs.write(await snapPath($), JSON.stringify({ ...snap, sessionId: id }))
+  try {
+    await $.store.set(await snapKey($), { ...snap, sessionId: id })
+    // keep the store small: the most recent sessions only
+    const keys = (await $.store.keys()).filter(k => k.startsWith('snap:'))
+    for (const k of keys.slice(0, Math.max(0, keys.length - SNAP_KEEP))) await $.store.delete(k)
+  } catch {
+    // no store here: the compass lives for this session only
+  }
+}
+
+/** Runs the poller's periodic work; a failure waits for the next tick. */
+async function quietly($: EngineInterface, job: 'snapshot' | 'flush') {
+  try {
+    if (job === 'snapshot') await snapshot($)
+    else await flushOutbox($)
+  } catch {
+    // the next tick tries again
+  }
+}
+
+/** restore(), with a failure read as "nothing saved". */
+async function quietRestore($: EngineInterface) {
+  try {
+    return await restore($)
+  } catch {
+    return null
+  }
 }
 
 /** Puts a saved compass back; null when this session has none. */
@@ -909,7 +929,8 @@ async function restore($: EngineInterface): Promise<Snap | null> {
   const id = await $.session.id()
   let snap: (Snap & { sessionId?: string }) | undefined
   try {
-    snap = JSON.parse(await $.fs.read(await snapPath($))) as Snap & { sessionId?: string }
+    const saved = await $.store.get(await snapKey($))
+    snap = saved as (Snap & { sessionId?: string }) | undefined
   } catch {
     return null
   }
@@ -928,29 +949,6 @@ async function restore($: EngineInterface): Promise<Snap | null> {
   chartedMessages = snap.messages ?? 0
   lastSnapSig = ''
   return snap
-}
-
-async function loadBtw($: EngineInterface) {
-  try {
-    const dir = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${(await $.env.get('HOME')) ?? ''}/.claude`
-    const id = await $.session.id()
-    const text = await $.fs.read(`${dir}/history.jsonl`)
-    const found: string[] = []
-    for (const line of text.split('\n')) {
-      if (!line.includes(id) || !line.includes('/btw')) continue
-      try {
-        const row = JSON.parse(line) as { display?: unknown; sessionId?: unknown }
-        if (row.sessionId === id && typeof row.display === 'string' && row.display.startsWith('/btw ')) {
-          found.push(clip(row.display.slice(5).trim(), 120))
-        }
-      } catch {
-        // a torn line; skip it
-      }
-    }
-    if (found.length) await update($, btwA, list => [...new Set([...list, ...found])].slice(-30))
-  } catch {
-    // no history file or not readable: live capture still works
-  }
 }
 
 async function addBtw($: EngineInterface, text: string) {
@@ -991,7 +989,6 @@ async function refresh($: EngineInterface) {
   const isAfterTurn = !(await read($, busyA))
   await update($, refreshingA, () => true)
   try {
-    await loadBtw($)
     await hydrate($)
     const stored = await read($, mapA)
     const prompt = mapPrompt(
@@ -1004,7 +1001,18 @@ async function refresh($: EngineInterface) {
       (await read($, chatA)).filter(m => m.dir === 'in'),
     )
     const turnsAt = (await read($, statsA)).turns
-    let reply = await $.model.fork({ prompt })
+    let reply: ModelForkResult = await $.model.fork({ prompt })
+    // the very first turn has no answer yet to fork from: chart from the request itself, fast,
+    // so the first chart lands while Claude is still working; the turn's end charts it in full
+    if (!reply.isAnswered && reply.reason === 'nothing-to-fork' && lastRequest) {
+      reply = await $.model.complete({
+        model: 'haiku',
+        system: 'You are COMPASS. Reply with ONLY one minified JSON object, no prose.',
+        prompt: `${prompt}\nThere is no conversation yet beyond the user's first request below: chart the plan it implies (the first milestone active, its first step active, the rest pending).\nThe user's first request: ${JSON.stringify(lastRequest)}`,
+        maxTokens: 2000,
+        effort: 'low',
+      })
+    }
     await countOwn($, reply)
     let map = reply.isAnswered ? parseMap(reply.text, await $.clock.now()) : null
     if (reply.isAnswered && !map) {
@@ -1021,24 +1029,24 @@ async function refresh($: EngineInterface) {
       await update($, errorA, () => "map not updated: the model's summary wasn't valid JSON; kept the last one · ↻ to retry")
       return
     }
-    const { grill: inferred, ...next } = map
+    const { grill: inferred, ...charted } = map
     const prevMap = isCurrent(stored) ? stored : null
     const latest = await read($, mapA)
     const declined = (isCurrent(latest) ? latest.declined : null) ?? prevMap?.declined ?? []
-    const sameMilestone = prevMap && locate(prevMap).milestone?.id === locate(next).milestone?.id
-    const kept = !next.alt && sameMilestone && prevMap.alt && !prevMap.altPick ? prevMap.alt : null
-    const alt = (next.alt && !isDecided(next.alt, declined) ? next.alt : null) ?? kept
-    await update($, mapA, () => ({ ...next, alt, declined, turns: turnsAt }))
+    const sameMilestone = prevMap && locate(prevMap).milestone?.id === locate(charted).milestone?.id
+    const kept = !charted.alt && sameMilestone && prevMap.alt && !prevMap.altPick ? prevMap.alt : null
+    const alt = (charted.alt && !isDecided(charted.alt, declined) ? charted.alt : null) ?? kept
+    await update($, mapA, () => ({ ...charted, alt, declined, turns: turnsAt }))
     // the chart now includes the request the turn started on
     await update($, incomingA, inc => (inc && (isAfterTurn || inc.at <= startedAt) ? null : inc))
     if (inferred.length) {
       const at = await $.clock.now()
-      await update($, grillA, list => mergeGrill(list, inferred, next.goal, 'map', at))
+      await update($, grillA, list => mergeGrill(list, inferred, charted.goal, 'map', at))
     }
     await update($, errorA, () => null)
     await update($, statsA, s => ({ ...s, refreshes: s.refreshes + 1 }))
     // user tasks the agent has adopted no longer need to be shown as queued
-    await update($, userTasksA, list => list.filter(u => !next.tasks.some(t => t.text.toLowerCase().includes(u.text.toLowerCase().slice(0, 24)))))
+    await update($, userTasksA, list => list.filter(u => !charted.tasks.some(t => t.text.toLowerCase().includes(u.text.toLowerCase().slice(0, 24)))))
   } catch (err) {
     await update($, errorA, () => `map not updated: ${err instanceof Error ? err.message.slice(0, 60) : 'failed'}`)
   } finally {
@@ -1047,10 +1055,12 @@ async function refresh($: EngineInterface) {
   }
 }
 
+type ActionPatch = Partial<CompassAction>
+
 const LANES_ORDER = LANES
 const ROUTE_GLYPH = { queued: '⋯', sent: '↗', rejected: '✗' } as const
 
-async function setAction($: EngineInterface, id: string, patch: Partial<CompassAction>) {
+async function setAction($: EngineInterface, id: string, patch: ActionPatch) {
   await update($, actionsA, list => list.map((a): CompassAction => (a.id === id ? { ...a, ...patch } : a)))
 }
 
@@ -1117,10 +1127,10 @@ export const moveIn = (list: CompassAction[], id: string, dir: -1 | 1) => {
   let j = i + dir
   while (j >= 0 && j < list.length && !(list[j]!.status === 'queued' && queueOf(list[j]!) === queueOf(a))) j += dir
   if (j < 0 || j >= list.length) return list
-  const next = [...list]
-  next[i] = list[j]!
-  next[j] = a
-  return next
+  const swapped = [...list]
+  swapped[i] = list[j]!
+  swapped[j] = a
+  return swapped
 }
 
 async function moveAction($: EngineInterface, id: string, dir: -1 | 1) {
@@ -1152,8 +1162,8 @@ async function pickTrajectory($: EngineInterface, way: 'main' | 'branch') {
   if (way === 'main') {
     const planned = milestone?.steps.filter(s => s.state === 'pending').map(s => s.label).join(' ') ?? ''
     await editMap($, mp => ({ ...mp, altPick: 'main', declined: [...(mp.declined ?? []), alt.label, alt.steps.join(' '), ...(planned ? [planned] : [])].slice(-16) }))
-    const next = milestone?.steps.filter(s => s.state === 'pending').map(s => s.label) ?? []
-    await queueNote($, `Stay on the planned course${next.length ? `: ${next.join(' → ')}` : ''}; not "${alt.label}"`)
+    const pending = milestone?.steps.filter(s => s.state === 'pending').map(s => s.label) ?? []
+    await queueNote($, `Stay on the planned course${pending.length ? `: ${pending.join(' → ')}` : ''}; not "${alt.label}"`)
     return
   }
   const before = JSON.stringify({ id: milestone?.id ?? '', steps: milestone?.steps ?? [], declined: map.declined ?? [] })
@@ -1314,7 +1324,7 @@ export const bodyOf = (text: string) => text.replace(/<[^>]+>/g, '').trim()
 async function refreshPeers($: EngineInterface) {
   await update($, peersAtA, () => Date.now())
   try {
-    const r = await $.tool.call({ tool: 'ListAgents' } as never)
+    const r = await $.tool.call({ tool: 'ListAgents' })
     const text = typeof r.text === 'string' ? r.text : ''
     if (!text) return
     const { peers, self, isRemote } = parsePeers(text)
@@ -1422,8 +1432,8 @@ export const register: Register = on => {
       description: '🧭 Toggle the session map pane (args: refresh | steer <text> | task <text>)',
       argumentHint: '[refresh | steer <text> | task <text>]',
     })
-    await $.tool
-      .register({
+    try {
+      await $.tool.register({
       name: 'grill',
       description:
         "Post a round of grilling questions to the user's compass grill tab without blocking. Post the whole frontier (decisions whose prerequisites are settled), each with your recommended answer. Re-posting an id re-asks it. Answers arrive later as a new user turn. Use for planning and for open choices in the work in progress; never for facts you can look up.",
@@ -1452,17 +1462,18 @@ export const register: Register = on => {
         },
       },
     })
-      .catch(() => $.ui.toast('compass: the grill tool could not be registered'))
+    } catch {
+      $.ui.toast('compass: the grill tool could not be registered')
+    }
     const now = await $.clock.now()
     await update($, statsA, s => (s.startedAt ? s : { ...s, startedAt: now }))
     await update($, busyA, () => false)
     await update($, refreshingA, () => false)
-    await loadBtw($)
     $.ui.status(undefined)
     // resume: reopen the saved chart; chart afresh only when there is none,
     // or the transcript moved on while compass was not watching
     if (!isCurrent(await read($, mapA))) {
-      const snap = await restore($).catch(() => null)
+      const snap = await quietRestore($)
       if (!snap) wantRefresh()
       else {
         const count = (await $.session.messages()).length
@@ -1484,15 +1495,17 @@ export const register: Register = on => {
       if ((await $.clock.now()) - splashAt < 1500) await update($, tickA, n => n + 1)
     })
     $.clock.every(1000, async () => {
-      if (++ticks % 5 === 0) void snapshot($).catch(() => undefined)
+      if (++ticks % 5 === 0) void quietly($, 'snapshot')
       if ((await read($, tabA)) === 'chat' && Date.now() - (await read($, peersAtA)) > 15_000) void refreshPeers($)
-      void flushOutbox($).catch(() => undefined)
+      void quietly($, 'flush')
       if (inflight) return
       // during a long turn: chart once the new prompt is in, then every few minutes
       if (!isWanted && turnStartedAt && (await read($, busyA))) {
         const t = await $.clock.now()
         const since = t - Math.max(turnStartedAt, lastRefreshAt)
-        if ((lastRefreshAt < turnStartedAt && t - turnStartedAt > MID_TURN_FIRST_MS) || since > MID_TURN_EVERY_MS) isWanted = true
+        // the very first chart starts at once: nothing is on screen yet
+        const firstAfter = isCurrent(await read($, mapA)) ? MID_TURN_FIRST_MS : 1_000
+        if ((lastRefreshAt < turnStartedAt && t - turnStartedAt > firstAfter) || since > MID_TURN_EVERY_MS) isWanted = true
       }
       if (!isWanted) return
       isWanted = false
@@ -1548,9 +1561,9 @@ export const register: Register = on => {
       lastSnapSig = ''
       // the cleared conversation's chart must not come back on a later resume
       try {
-        await $.fs.write(await snapPath($), JSON.stringify({ v: SNAP_VERSION, cleared: true }))
+        await $.store.delete(await snapKey($))
       } catch {
-        // no session folder to mark: nothing to restore from either
+        // no store: nothing saved to come back
       }
       await update($, mapA, () => null)
       await update($, grillA, () => [])
@@ -1568,20 +1581,6 @@ export const register: Register = on => {
       const now = await $.clock.now()
       await update($, statsA, () => ({ ...EMPTY_STATS, startedAt: now }))
     }
-    return next(e)
-  })
-
-  // Claude Code's own hook events name the transcript: the snapshot lives beside it
-  on('classic.SessionStart', (_$, e, next) => {
-    noteTranscript(e.transcript_path)
-    return next(e)
-  })
-  on('classic.UserPromptSubmit', (_$, e, next) => {
-    noteTranscript(e.transcript_path)
-    return next(e)
-  })
-  on('classic.Stop', (_$, e, next) => {
-    noteTranscript(e.transcript_path)
     return next(e)
   })
 
@@ -1674,6 +1673,7 @@ export const register: Register = on => {
     await update($, busyA, () => true)
     // instant and free: the new request shows as "now" before any model call
     const request = plain(e.text.replace(/<[^>]+>/g, ' ').replace(/^🧭\s*\[compass[^\]]*\]\s*/u, ''))
+    if (request && !e.text.startsWith('<')) lastRequest = clip(request, 2000)
     // the user's own request only: a turn compass submitted is already in the outbox as sent
     const isOwn = /\[compass\b|^the compass plugin sent a message/i.test(e.text)
     if (request && !e.text.startsWith('<') && !isOwn) await update($, incomingA, () => ({ text: clip(request, 80), at: Date.now() }))
@@ -1733,7 +1733,8 @@ export const register: Register = on => {
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
     const els = $.ui.resolve(e)
     const { Box, Button, Text } = els
-    const Client = 'Client' in els ? els.Client : null
+    // @ts-expect-error Client is drawn on the terminal and desktop; elsewhere it is absent and Buttons stand in
+    const { Client } = els
     const stored = await read($, mapA)
     const map = isCurrent(stored) ? stored : null
     const asks = frontierOf(await read($, grillA)).ask.length
@@ -1746,7 +1747,8 @@ export const register: Register = on => {
     const spin = isRefreshing ? SPIN[Math.floor(now / 120) % SPIN.length] : ''
     // the room left beside the engine's own hint
     // the viewport is the conversation's width; the row under the prompt also spans a docked pane
-    const isDocked = paneCols > 0 && (await $.ui.panes().catch(() => [])).some(p => p.id === PANE)
+    const panes = paneCols > 0 ? await $.ui.panes() : []
+    const isDocked = panes.some(p => p.id === PANE)
     const room = Math.max(24, (e.viewport?.columns ?? 100) + (isDocked ? paneCols + 1 : 0) - glen(e.props.hint ?? '') - 6)
     const chips = hintChips(map, asks, queued, room, incoming?.text ?? null)
     const gap = (key: string) => (
@@ -1820,7 +1822,8 @@ export const register: Register = on => {
     const openPeer = tab === 'chat' && selected?.startsWith('p:') ? selected.slice(2) : null
     const unreadOf = (name: string) => (name === openPeer ? 0 : chat.filter(m => m.peer === name && m.dir === 'in' && m.at > (chatSeen[name] ?? 0)).length)
     const unreadAll = [...new Set(chat.map(m => m.peer))].reduce((n, p) => n + unreadOf(p), 0)
-    const Client = 'Client' in els ? els.Client : null
+    // @ts-expect-error Client is drawn on the terminal and desktop; elsewhere it is absent and Buttons stand in
+    const { Client } = els
     const map = isCurrent(stored) ? stored : null
     const now = await $.clock.now()
     const board = boardOf(map, userTasks)
@@ -2144,7 +2147,7 @@ export const register: Register = on => {
             // the sea chart fills the tab until the first chart lands
             (() => {
               splashAt = now
-              const chartRows = seaChart(width, Math.max(10, e.props.scroll.bodyRows - 11), now, stats.turns > 0)
+              const chartRows = seaChart(width, Math.max(10, e.props.scroll.bodyRows - 11), now, stats.turns > 0 || isRefreshing || incoming !== null)
               return (
                 <Box key="sea" flexDirection="column">
                   {chartRows.map((row, y) => (

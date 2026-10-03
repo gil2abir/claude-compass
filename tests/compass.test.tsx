@@ -71,7 +71,6 @@ test('pane draws the git-flow map, folds, and task board', async ($, on) => {
   mock.env(on, { HOME: '/nonexistent' })
   on('model.fork', () => ({ value: { isAnswered: true, text: JSON.stringify(MAP), usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }) as never)
   on('session.id', () => ({ value: 'sess' }))
-  on('fs.read', () => { throw new Error('none') })
   on('tool.call', () => ({ result: {} as never, text: 'ok' }))
   on('command.register', () => ({ value: undefined }) as never)
   on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
@@ -155,7 +154,6 @@ test('a compass present from the first turn charts once there is history, and /c
       ? { value: { isAnswered: true, text: JSON.stringify(MAP), usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }
       : { value: { isAnswered: false, reason: 'nothing-to-fork' } }) as never)
   on('session.id', () => ({ value: 'sess' }))
-  on('fs.read', () => { throw new Error('none') })
   on('session.messages', () => ({ value: [] }) as never)
   on('session.usage', () => ({ value: { startedAt: 1_000_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
   on('session.start', (_$, e) => e as never)
@@ -211,7 +209,6 @@ test('the agent posts a round, the user answers it, and the round goes back as o
   })
   on('model.fork', () => ({ value: { isAnswered: false, reason: 'nothing-to-fork' } }) as never)
   on('session.id', () => ({ value: 'sess' }))
-  on('fs.read', () => { throw new Error('none') })
   on('session.messages', () => ({ value: [] }) as never)
   on('session.usage', () => ({ value: { startedAt: 1, context: { window: 1, percent: 1 }, rateLimits: [] } }) as never)
   on('session.start', (_$, e) => e as never)
@@ -260,27 +257,25 @@ test('the status crumb never carries broken characters', async () => {
   expect(plain('a\u0007b 🧭 c')).toBe('ab c')
 })
 
-test('a resumed session reopens its chart from the session folder without charting again', async ($, on) => {
+test('a resumed session reopens its chart from the plugin store without charting again', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
-  mock.env(on, { HOME: '/home/u' })
-  const files = new Map<string, string>()
-  on('fs.read', (_$, e) => {
-    const path = (e as unknown as { path: string }).path
-    if (!files.has(path)) throw new Error('missing')
-    return { value: files.get(path)! } as never
-  })
-  on('fs.write', (_$, e) => {
-    const { path, text } = e as unknown as { path: string; text: string }
-    files.set(path, text)
+  const store = new Map<string, unknown>()
+  on('store.get', (_$, e) => ({ value: store.get(e.key) }) as never)
+  on('store.set', (_$, e) => {
+    store.set(e.key, e.value)
     return { value: undefined } as never
   })
+  on('store.delete', (_$, e) => {
+    store.delete(e.key)
+    return { value: undefined } as never
+  })
+  on('store.keys', () => ({ value: [...store.keys()] }) as never)
   let forks = 0
   on('model.fork', () => {
     forks += 1
     return { value: { isAnswered: true, text: JSON.stringify(MAP), usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } } as never
   })
   on('session.id', () => ({ value: 'sess-r' }))
-  on('session.root', () => ({ value: '/Users/u/code' }) as never)
   on('session.messages', () => ({ value: [{ role: 'user', text: 'hi', toolUses: [] }] }) as never)
   on('session.usage', () => ({ value: { startedAt: 1, context: { window: 1, percent: 1 }, rateLimits: [] } }) as never)
   on('session.start', (_$, e) => e as never)
@@ -288,14 +283,16 @@ test('a resumed session reopens its chart from the session folder without charti
   on('ui.toast', () => ({ value: undefined }) as never)
   on('command.register', () => ({ value: undefined }) as never)
   on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
-  on('tool.call', () => ({ result: '' as never, text: '' }))
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
   await clock.advance(6000)
   expect(forks).toBe(1)
-  const path = '/home/u/.claude/projects/-Users-u-code/sess-r/compass/snapshot.json'
-  expect(files.has(path)).toBe(true)
-  expect(JSON.parse(files.get(path)!).sessionId).toBe('sess-r')
+  const saved = store.get('snap:sess-r') as { sessionId?: string } | undefined
+  expect(saved?.sessionId).toBe('sess-r')
+  // a second start (a resume, or a reload) reopens it from the store: no new chart
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true, source: 'resume' } as never)
+  await clock.advance(6000)
+  expect(forks).toBe(1)
 })
 
 test('the status gist is the active cut, fits its budget, and uses plain glyphs only', async () => {
@@ -358,7 +355,6 @@ test('chat marks inbound/outbound, badges new messages, and opens a clickable hi
   const clock = mock.clock(on, { now: 1_000_000 })
   mock.env(on, { HOME: '/nonexistent' })
   on('session.id', () => ({ value: 'sess' }))
-  on('fs.read', () => { throw new Error('none') })
   on('tool.call', () => ({ result: {} as never, text: 'This session is me [abc123]\nLocal sessions (1):\n  Genie prod [2aa26b] · local · idle · 1m' }))
   on('command.register', () => ({ value: undefined }) as never)
   on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
@@ -417,7 +413,6 @@ test('the outbox lists what goes to the session and when, and lets the user reor
   const clock = mock.clock(on, { now: 1_000_000 })
   mock.env(on, { HOME: '/nonexistent' })
   on('session.id', () => ({ value: 'sess' }))
-  on('fs.read', () => { throw new Error('none') })
   on('tool.call', () => ({ result: {} as never, text: '' }))
   on('command.register', () => ({ value: undefined }) as never)
   on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
@@ -476,7 +471,6 @@ test('the sync line says whether the chart has caught up with the session', asyn
       ? { value: { isAnswered: true, text: JSON.stringify(MAP), usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }
       : { value: { isAnswered: false, reason: 'busy' } }) as never)
   on('session.id', () => ({ value: 'sess' }))
-  on('fs.read', () => { throw new Error('none') })
   on('session.messages', () => ({ value: [] }) as never)
   on('session.usage', () => ({ value: { startedAt: 1_000_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
   on('session.start', (_$, e) => e as never)
@@ -514,7 +508,6 @@ test('a steer waits in the outbox with a countdown, can be cancelled, and otherw
   mock.env(on, { HOME: '/nonexistent' })
   on('model.fork', () => ({ value: { isAnswered: false, reason: 'busy' } }) as never)
   on('session.id', () => ({ value: 'sess' }))
-  on('fs.read', () => { throw new Error('none') })
   on('session.messages', () => ({ value: [] }) as never)
   on('session.usage', () => ({ value: { startedAt: 1_000_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
   on('session.start', (_$, e) => e as never)
@@ -552,7 +545,6 @@ test('the outbox is pinned to the bottom of the pane window as it scrolls', asyn
   mock.clock(on, { now: 1_000_000 })
   mock.env(on, { HOME: '/nonexistent' })
   on('session.id', () => ({ value: 'sess' }))
-  on('fs.read', () => { throw new Error('none') })
   for (const offset of [0, 7]) {
     const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE, props: { ...PANE.props, scroll: { offset, bodyRows: 30 } } })
     const foot = await ui.find({ key: 'activity' })
@@ -572,7 +564,6 @@ test('a fork shows the planned path and one branch; taking the branch steers and
     return { value: { isAnswered: true, text: JSON.stringify(ALT), usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } } as never
   })
   on('session.id', () => ({ value: 'sess' }))
-  on('fs.read', () => { throw new Error('none') })
   on('session.messages', () => ({ value: [] }) as never)
   on('session.usage', () => ({ value: { startedAt: 1_000_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
   on('session.start', (_$, e) => e as never)
@@ -620,7 +611,6 @@ test('the fork stays until the user picks, even when the next chart offers no br
   const ALT = { ...MAP, alt: { label: 'ship as a skill', why: 'simpler install', steps: ['write SKILL md', 'drop the plugin'] } }
   on('model.fork', () => ({ value: { isAnswered: true, text: JSON.stringify(withAlt ? ALT : MAP), usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }) as never)
   on('session.id', () => ({ value: 'sess' }))
-  on('fs.read', () => { throw new Error('none') })
   on('session.messages', () => ({ value: [] }) as never)
   on('session.usage', () => ({ value: { startedAt: 1_000_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
   on('session.start', (_$, e) => e as never)
@@ -655,7 +645,6 @@ test('a fork the user decided is not offered again while the work waits, not the
   let n = 0
   on('model.fork', () => ({ value: { isAnswered: true, text: JSON.stringify(replies[Math.min(n++, replies.length - 1)]), usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }) as never)
   on('session.id', () => ({ value: 'sess' }))
-  on('fs.read', () => { throw new Error('none') })
   on('session.messages', () => ({ value: [] }) as never)
   on('session.usage', () => ({ value: { startedAt: 1_000_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
   on('session.start', (_$, e) => e as never)
@@ -694,7 +683,6 @@ test('a grill question can be dismissed: it settles, the agent hears it, and it 
   mock.clock(on, { now: 1_000_000 })
   mock.env(on, { HOME: '/nonexistent' })
   on('session.id', () => ({ value: 'sess' }))
-  on('fs.read', () => { throw new Error('none') })
   on('session.messages', () => ({ value: [] }) as never)
   on('session.usage', () => ({ value: { startedAt: 1_000_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
   on('session.start', (_$, e) => e as never)
@@ -746,7 +734,6 @@ test('skipping a step from the flow and cancelling it in the outbox puts the ste
     return { value: { isAnswered: true, text: JSON.stringify(MAP), usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } } as never
   })
   on('session.id', () => ({ value: 'sess' }))
-  on('fs.read', () => { throw new Error('none') })
   on('session.messages', () => ({ value: [] }) as never)
   on('session.usage', () => ({ value: { startedAt: 1_000_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
   on('session.start', (_$, e) => e as never)
@@ -782,7 +769,6 @@ test('cancelling a grill round in the outbox puts its answers back', async ($, o
   mock.clock(on, { now: 1_000_000 })
   mock.env(on, { HOME: '/nonexistent' })
   on('session.id', () => ({ value: 'sess' }))
-  on('fs.read', () => { throw new Error('none') })
   on('session.messages', () => ({ value: [] }) as never)
   on('session.usage', () => ({ value: { startedAt: 1_000_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
   on('session.start', (_$, e) => e as never)
@@ -820,4 +806,31 @@ test('the row under the prompt is one panel of chips; parts leave a chip before 
     const used = 1 + 11 + hintChips(map, 2, 1, room).reduce((n, c) => n + 1 + c.width, 0) + 1
     expect(used <= room).toBe(true)
   }
+})
+
+test('the first chart lands during the first turn: with nothing to fork yet, it is drawn from the request', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const asked: string[] = []
+  on('model.fork', () => ({ value: { isAnswered: false, reason: 'nothing-to-fork' } }) as never)
+  on('model.complete', (_$, e) => {
+    asked.push((e as { prompt: string }).prompt)
+    return { value: { isAnswered: true, text: JSON.stringify(MAP), usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } } as never
+  })
+  on('session.id', () => ({ value: 'sess' }))
+  on('session.messages', () => ({ value: [] }) as never)
+  on('session.usage', () => ({ value: { startedAt: 1_000_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  await $.turn.start({ text: 'build a compass mod for claude code', turnId: 't1' } as never)
+  await clock.advance(5000)
+  // still in the first turn, and the chart is up
+  expect(asked.length).toBe(1)
+  expect(asked[0]).toMatch(/first request: "build a compass mod for claude code"/)
+  expect(await ui.find({ key: 'node:s4' })).toBeDefined()
+  await ui.unmount()
 })
