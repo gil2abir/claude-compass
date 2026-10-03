@@ -691,6 +691,7 @@ export const mergeGrill = (items: CompassGrillQ[], drafts: GrillDraft[], topic: 
   const dismissed = items.filter(q => q.answer === 'dismissed').map(q => q.title.toLowerCase())
   for (const d of drafts) {
     if (dismissed.includes(d.title.toLowerCase())) continue
+    if (source === 'map' && list.some(q => q.id !== d.id && (isSameWay(q.title, d.title) || isSameWay(`${q.title} ${q.body}`, `${d.title} ${d.body}`)))) continue
     const same = list.find(q => q.id === d.id) ?? (source === 'map' ? list.find(q => q.title.toLowerCase() === d.title.toLowerCase()) : undefined)
     if (same) {
       if (source === 'map') continue
@@ -1011,10 +1012,13 @@ async function refresh($: EngineInterface) {
       (await read($, chatA)).filter(m => m.dir === 'in'),
     )
     const turnsAt = (await read($, statsA)).turns
+    const chartStartedAt = await $.clock.now()
     let reply: ModelForkResult = await $.model.fork({ prompt })
     // the very first turn has no answer yet to fork from: chart from the request itself, fast,
     // so the first chart lands while Claude is still working; the turn's end charts it in full
+    let isQuick = false
     if (!reply.isAnswered && reply.reason === 'nothing-to-fork' && lastRequest) {
+      isQuick = true
       reply = await $.model.complete({
         model: 'haiku',
         system: 'You are COMPASS. Reply with ONLY one minified JSON object, no prose.',
@@ -1049,7 +1053,11 @@ async function refresh($: EngineInterface) {
     await update($, mapA, () => ({ ...charted, alt, declined, turns: turnsAt }))
     // the chart now includes the request the turn started on
     await update($, incomingA, inc => (inc && (isAfterTurn || inc.at <= startedAt) ? null : inc))
-    if (inferred.length) {
+    // the chart's own suggestions: not from the quick first chart (it saw no conversation), not
+    // when Claude posted questions while this chart was being made (it could not see them), and
+    // never one that repeats a question already there
+    const postedMeanwhile = (await read($, grillA)).some(q => q.source === 'agent' && q.at >= chartStartedAt)
+    if (inferred.length && !isQuick && !postedMeanwhile) {
       const at = await $.clock.now()
       await update($, grillA, list => mergeGrill(list, inferred, charted.goal, 'map', at))
     }
@@ -2686,15 +2694,20 @@ export const register: Register = on => {
                 ? decisions land here
               </Text>
               <Text wrap="wrap">Questions that need you appear here as the session moves:</Text>
-              <Text wrap="wrap" dimColor>
-                {'  '}• when Claude plans or hits a choice, it posts them (with its recommendation)
-              </Text>
-              <Text wrap="wrap" dimColor>
-                {'  '}• after every turn, compass looks for new goals, ideas, trade-offs and effects down the road you should decide or know about
-              </Text>
-              <Text wrap="wrap" dimColor>
-                {'  '}• each says whether work waits on it (⏸) or goes on meanwhile (▶)
-              </Text>
+              {[
+                'when Claude plans or hits a choice, it posts them (with its recommendation)',
+                'after every turn, compass looks for new goals, ideas, trade-offs and effects down the road you should decide or know about',
+                'each says whether work waits on it (⏸) or goes on meanwhile (▶)',
+              ].map((line, i) => (
+                <Box key={`g:empty:${i}`}>
+                  <Text dimColor>{'  • '}</Text>
+                  <Box flexShrink={1}>
+                    <Text dimColor wrap="wrap">
+                      {line}
+                    </Text>
+                  </Box>
+                </Box>
+              ))}
               <Text wrap="wrap">Answer any, in any order, when you like: ⏸ park one to let the work go on without it, ✕ to drop it. The session hears every choice.</Text>
             </Box>
           ) : (
