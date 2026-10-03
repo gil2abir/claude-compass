@@ -39,13 +39,36 @@ Commands: `/compass`, `/compass refresh`, `/compass steer <text>`, `/compass tas
 
 ## How it works and what it costs
 
-- The map is made by one extra model call (`$.model.fork`) that reuses the session's prompt cache: after each turn, 20 s into a turn, and every 3 min during long ones. The stats tab shows compass's own token use.
+- The map is made by one extra model call (`$.model.fork`) that reuses the session's prompt cache: 3 s after each prompt (so the first chart arrives while Claude is still working on your first request), again when each turn ends, and every 3 min during long turns. The stats tab shows compass's own token use.
 - The agent gets a `grill` tool and short instructions in its system prompt for asking you questions without blocking.
-- The chart is saved in Claude Code's own folder for the session (`~/.claude/projects/<project>/<session-id>/compass/snapshot.json`), so `claude --resume` reopens it without charting again, and it is removed when Claude Code cleans up the session.
+- The chart is saved in the plugin's own store (`$.store`), so `claude --resume` reopens it without charting again; the 12 most recent sessions are kept.
 
-## Trust
+## What compass reads, sends, runs and stores
 
-A mod runs on your machine with the same access Claude Code has. Read the source (`hooks/register.tsx`, `hooks/board.tsx`, `hooks/brand.tsx`) before installing.
+A mod runs on your machine with the same access Claude Code has. Read the source (`hooks/register.tsx`, `hooks/board.tsx`, `hooks/brand.tsx`, `hooks/pill.tsx`) before installing. In short:
+
+**Prompts it submits.** Only what you put in the outbox, exactly as the outbox previews it (click an item to see the text): steers you type or pick (go, skip, later, retry, take a branch), task changes you make on the board, your grill answers and dismissals. Each waits 8 s in the outbox and can be removed. They go in as a new turn (`prompt.submit`), into the running turn (`session.append`), or as context on your next prompt. Compass never puts file contents in a prompt.
+
+**Model calls.** To draw the chart it makes one extra call to the session's own model (`model.fork`): it sees the session's conversation, which is already with that model, plus compass's state (the current chart, tasks, sent steers, grill questions, decided forks, messages from other agents). Nothing is added to your session's history.
+
+**Tools it calls itself.** `ListAgents`, to list your other sessions and agents in the chat tab (when the pane opens and every 15 s while the chat tab is shown), and `SendMessage` (through `session.send`) when you send a message from the chat tab. It registers one tool of its own, `grill`, which the agent uses to post questions; compass's `tool.call` hook answers that tool and no other.
+
+**Hooks, and what each does.** All pass the event on unchanged unless noted:
+- `tool.call` (every tool): counts tools and errors for the stats tab, notes edited files, reads TodoWrite/TaskCreate for the task board, reads ListAgents results for the chat tab. Answers only its own `grill` tool.
+- `command.run`: `/compass` is compass's own command (it answers it); `/btw` is recorded as a side question and passed on.
+- `prompt.submit`: adds your queued "with your next prompt" notes as context; records `/btw`.
+- `prompt.compose`: adds the grilling guide and the steers you sent to the system prompt.
+- `session.send` / `session.receive`: records chat messages to and from other sessions.
+- `session.start` / `session.end`, `turn.start` / `turn.complete`: keep the chart current; `/clear` starts the compass over.
+- `ui.render`, `ui.message`, `ui.scroll`: draw the pane and the row under the prompt.
+
+**What it reads.** The session's messages and usage (`session.messages`, `session.usage`) for the chart and the stats. It reads no files, no environment variables and no credentials.
+
+**What it writes.** No files. It keeps each session's compass in its own plugin store (`$.store`, a JSON file Claude Code keeps for the plugin) so `claude --resume` reopens it; the 12 most recent sessions are kept and `/clear` removes the current one.
+
+**Network.** None of its own. The `repository` link in `plugin.json` is metadata.
+
+The `types` field in `plugin.json` names the mod's state contract (`types/index.d.ts`), which `claude plugin validate` checks; Claude Code itself ignores it. `tests/` is the test suite for `claude plugin test`: its hooks stand in for the engine (they answer tool calls, the store and model calls with fixed data).
 
 ## Update
 
