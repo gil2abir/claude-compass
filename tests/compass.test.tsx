@@ -983,3 +983,50 @@ test('a session too long to fork is charted from a digest; an interrupted turn i
   expect(asked.length).toBe(1)
   await ui.unmount()
 })
+
+test('pane actions settle inside compass: an answer unblocks at once, a quick reconcile follows, a full chart wins', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const BLOCKED = { ...MAP, milestones: MAP.milestones.map(m => (m.id === 'm2' ? { ...m, steps: m.steps.map(st => (st.id === 's5' ? { ...st, state: 'blocked', why: 'waiting on Q1' } : st)) } : m)), grill: [] }
+  let forks = 0
+  on('model.fork', () => {
+    forks += 1
+    return { value: { isAnswered: true, text: JSON.stringify(BLOCKED), usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } } as never
+  })
+  const quick: string[] = []
+  on('model.complete', (_$, e) => {
+    quick.push((e as { prompt: string }).prompt)
+    const reconciled = { ...MAP, recap: ['reconciled with your answer'], moot: [] }
+    return { value: { isAnswered: true, text: JSON.stringify(reconciled), usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } } as never
+  })
+  on('session.id', () => ({ value: 'sess' }))
+  on('session.messages', () => ({ value: [] }) as never)
+  on('session.usage', () => ({ value: { startedAt: 1, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }) as never)
+  on('turn.complete', (_$, e) => ({ text: e.answer }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('ui.toast', () => ({ value: undefined }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  await $.tool.call({ tool: 'mcp__compass__grill', topic: 't', questions: [{ id: 'q1', title: 'Pick a store', body: 'Which?', options: ['a', 'b'], recommendation: 'a', blocking: true }] } as never)
+  await $.turn.start({ text: 'go', turnId: 't1' } as never)
+  await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+  await clock.advance(1500)
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  expect(await ui.find({ text: /run tests · waiting on Q1/ })).toBeDefined()
+  // answer it: the step stops waiting at once, with no model call
+  await tap(ui, 'tab:grill')
+  await tap(ui, 'gopt:q1:0')
+  await tap(ui, 'tab:flow')
+  expect(await ui.find({ text: /waiting on Q1/ })).toBeUndefined()
+  expect(quick.length).toBe(0)
+  // once the user pauses, one quick reconcile brings the rest of the chart along
+  await clock.advance(4000)
+  expect(quick.length).toBe(1)
+  expect(quick[0]).toMatch(/The user just acted in the compass pane/)
+  await tap(ui, 'tab:recap')
+  expect(await ui.find({ text: /reconciled with your answer/ })).toBeDefined()
+  expect(forks).toBe(1)
+  await ui.unmount()
+})
