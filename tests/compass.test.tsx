@@ -1162,3 +1162,57 @@ test('a new request is on the chart in seconds even while a slow full chart is r
   expect(forks).toBe(3)
   await ui.unmount()
 })
+
+test('while Claude works, new tool calls trigger a quick course check that moves "now"; nothing moved leaves the chart alone; a turn end catches up at once', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+  on('model.fork', () => ({ value: { isAnswered: true, text: JSON.stringify(MAP), usage } }) as never)
+  const quick: string[] = []
+  let answer = '{"same":true}'
+  on('model.complete', (_$, e) => {
+    quick.push((e as { prompt: string }).prompt)
+    return { value: { isAnswered: true, text: answer, usage } } as never
+  })
+  on('session.id', () => ({ value: 'sess' }))
+  on('session.messages', () => ({ value: [{ role: 'user', text: 'build v2', toolUses: [] }, { role: 'assistant', text: 'register is written; running the tests now', toolUses: [] }] }) as never)
+  on('session.usage', () => ({ value: { startedAt: 1, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }) as never)
+  on('turn.complete', (_$, e) => ({ text: e.answer }) as never)
+  on('tool.call', () => ({ result: {} as never, text: 'ok' }))
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('ui.toast', () => ({ value: undefined }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  await $.turn.start({ text: 'build v2', turnId: 't1' } as never)
+  await clock.advance(5000)
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  expect(await ui.find({ text: /run tests/ })).toBeDefined()
+  const base = quick.length
+
+  // no tool calls yet: no check
+  await clock.advance(15_000)
+  expect(quick.length).toBe(base)
+  // calls finish: one check, which sees them and Claude's latest words; nothing moved
+  await $.tool.call({ tool: 'Write', tool_use_id: 'w1', file_path: '/src/register.tsx' } as never)
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'b1', command: 'bun test' } as never)
+  await clock.advance(2000)
+  expect(quick.length).toBe(base + 1)
+  expect(quick[base]).toMatch(/Bash ok: bun test/)
+  expect(quick[base]).toMatch(/running the tests now/)
+  // the next calls move the work on: "now" moves to the tests step
+  answer = JSON.stringify({ ...MAP, milestones: MAP.milestones.map(m => (m.id === 'm2' ? { ...m, steps: m.steps.map(st => (st.id === 's4' ? { ...st, state: 'done' } : st.id === 's5' ? { ...st, state: 'active' } : st)) } : m)) })
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'b2', command: 'bun test --watch' } as never)
+  await clock.advance(13_000)
+  expect(quick.length).toBe(base + 2)
+  expect(await ui.find({ key: 'now:s5' })).toBeDefined()
+
+  // the turn ends: a catch-up check right away, before the full chart
+  answer = '{"same":true}'
+  await $.turn.complete({ answer: 'done', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+  await clock.advance(10)
+  expect(quick.length).toBe(base + 3)
+  expect(quick[base + 2]).toMatch(/its turn just ended/)
+  await ui.unmount()
+})

@@ -815,6 +815,12 @@ let requestAt = 0
 let quickAt = 0
 let landedFrom = 0
 let isQuickCharting = false
+let quickWhat = ''
+// the course check while Claude works: at most every PULSE_EVERY_MS, and only after new tool calls
+const PULSE_EVERY_MS = 12_000
+let pulseAt = 0
+let pulseSeen = 0
+let checkedAt = 0
 const RECONCILE_AFTER_MS = 2_500
 let lastRefreshAt = 0
 // the first request of a turn is on the wire within a few seconds; the fork then sees the new prompt
@@ -1108,27 +1114,59 @@ async function reconcile($: EngineInterface) {
 }
 
 /**
- * The user's new request, on the chart in seconds: haiku adds it to the current chart (the work it
- * starts becomes "now") without marking anything done. The full chart a few seconds into the turn
- * sees the conversation and replaces it when it lands.
+ * The quick chart (haiku, small prompt), for what moves the course between full charts:
+ * - request: the user's new request becomes the work now
+ * - pulse: the tool calls since the chart, checked every few seconds while Claude works
+ * - turn: the turn just ended, before the slower full chart lands
+ * It says when nothing moved ({"same":true}) and never marks done what the session has not shown.
+ * The full chart replaces it when it lands; one that started before the user's request is stale.
  */
-async function chartRequest($: EngineInterface, request: string) {
+async function quickChart($: EngineInterface, why: 'request' | 'pulse' | 'turn', request = '') {
   const stored = await read($, mapA)
   if (!isCurrent(stored) || isQuickCharting) return
   isQuickCharting = true
+  quickWhat = why === 'request' ? 'charting your new message' : why === 'turn' ? 'catching up with the turn' : 'checking the course'
   const startedAt = Date.now()
+  const since = Math.max(stored.at, stored.reconciledAt ?? 0, checkedAt) - 1000
   await update($, tickA, n => n + 1)
   try {
-    const prompt = [
-      'You are COMPASS. Reply with ONLY one minified JSON object in the same shape as the chart below (goal, milestones, tasks, recap, alt, moot).',
-      'The user just sent the session a new request (below). Update the chart so it shows that request as the work now: if it continues the active milestone, add its steps there; otherwise add a new milestone for it after the finished ones. Mark the new work active (its first step active, the rest pending) and the step that was active before pending unless the request finishes it. Do NOT mark anything done the session has not shown. Keep every existing id; new ids are short and unique. Keep the goal unless the request changes it.',
-      `The chart: ${JSON.stringify({ goal: stored.goal, milestones: stored.milestones, tasks: stored.tasks, recap: stored.recap, alt: stored.alt ?? null })}`,
-      `The new request: ${JSON.stringify(clip(request, 1500))}`,
-    ].join('\n')
+    const live = await read($, liveA)
+    pulseSeen = live.filter(p => p.status !== 'running').length
+    pulseAt = await $.clock.now()
+    const calls = live
+      .filter(p => p.at >= since && p.status !== 'running')
+      .slice(-30)
+      .map(p => `${p.tool}${p.agent ? ' (subagent)' : ''} ${p.status === 'ok' || p.status === 'bgdone' ? 'ok' : p.status}: ${clip(p.what, 90)}`)
+    const last = why === 'request' ? '' : [...(await $.session.messages())].reverse().find(m => m.role === 'assistant' && typeof m.text === 'string' && m.text.trim())?.text ?? ''
+    const chart = `The chart: ${JSON.stringify({ goal: stored.goal, milestones: stored.milestones, tasks: stored.tasks, recap: stored.recap, alt: stored.alt ?? null })}`
+    const shape = 'You are COMPASS. Reply with ONLY one minified JSON object in the same shape as the chart below (goal, milestones, tasks, recap, alt, moot).'
+    const keep = 'Keep every existing id; new ids are short and unique. Keep the goal unless the work changed it.'
+    const prompt = (why === 'request'
+      ? [
+          shape,
+          'The user just sent the session a new request (below). Update the chart so it shows that request as the work now: if it continues the active milestone, add its steps there; otherwise add a new milestone for it after the finished ones. Mark the new work active (its first step active, the rest pending) and the step that was active before pending unless the request finishes it. Do NOT mark anything done the session has not shown.',
+          keep,
+          chart,
+          `The new request: ${JSON.stringify(clip(request, 1500))}`,
+        ]
+      : [
+          shape,
+          `Below is what the session did since this chart was drawn${why === 'turn' ? ' (its turn just ended)' : ' (Claude is still working)'}: its tool calls, oldest first, and Claude's latest words. Decide whether the course moved: a step finished, the work moved on to another step, a new step or milestone appeared, or the plan changed.`,
+          'If "now" and what comes next are unchanged, reply exactly {"same":true}. Otherwise reply the updated chart: mark a step done only when these calls or words show it finished, mark the step being worked on active, add steps the work clearly took on, and do NOT invent progress.',
+          keep,
+          chart,
+          calls.length ? `Tool calls since: ${JSON.stringify(calls)}` : 'No tool calls since.',
+          last ? `Claude's latest words: ${JSON.stringify(clip(last, 1500))}` : '',
+        ]
+    ).filter(Boolean).join('\n')
     const reply = await $.model.complete({ model: 'haiku', system: 'You are COMPASS. Reply with ONLY one minified JSON object, no prose.', prompt, maxTokens: 2500, effort: 'low' })
     await countOwn($, reply)
-    // a full chart that started after this one already landed: it saw the request, it counts
+    // a full chart that started after this one already landed: it saw more, it counts
     if (!reply.isAnswered || landedFrom > startedAt) return
+    if (why !== 'request' && /^\s*\{\s*"same"\s*:\s*true\s*\}\s*$/.test(reply.text)) {
+      checkedAt = Date.now()
+      return
+    }
     const map = parseMap(reply.text, await $.clock.now())
     if (!map || !map.milestones.length) return
     const { grill: _ignored, moot: _moot, ...charted } = map
@@ -1136,10 +1174,13 @@ async function chartRequest($: EngineInterface, request: string) {
     void _moot
     const at = await $.clock.now()
     await update($, mapA, m => (m && isCurrent(m) ? { ...m, goal: charted.goal || m.goal, milestones: charted.milestones, tasks: charted.tasks, recap: charted.recap.length ? charted.recap : m.recap, reconciledAt: at } : m))
-    quickAt = Date.now()
-    await update($, incomingA, () => null)
+    checkedAt = Date.now()
+    if (why === 'request') {
+      quickAt = Date.now()
+      await update($, incomingA, () => null)
+    }
   } catch {
-    // the full chart a few seconds into the turn covers it
+    // the next full chart covers it
   } finally {
     isQuickCharting = false
   }
@@ -1245,22 +1286,19 @@ async function refresh($: EngineInterface) {
   }
 }
 
-type ActionPatch = Partial<CompassAction>
-
 const LANES_ORDER = LANES
 const ROUTE_GLYPH = { queued: '⋯', sent: '↗', rejected: '✗' } as const
 
-async function setAction($: EngineInterface, id: string, patch: ActionPatch) {
-  await update($, actionsA, list => list.map((a): CompassAction => (a.id === id ? { ...a, ...patch } : a)))
-}
+/** The outbox list with one action changed: what `update` writes when an action moves on. */
+const patched = (id: string, patch: Partial<CompassAction>) => (list: CompassAction[]) => list.map((a): CompassAction => (a.id === id ? { ...a, ...patch } : a))
 
 /** Writes into the running turn now; the model reads it at its next step. */
 async function appendNow($: EngineInterface, a: CompassAction) {
   try {
     const r = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: a.text }] } })
     if ('deny' in r && r.deny) throw new Error(r.deny)
-    const sentNow: ActionPatch = { status: 'sent', route: 'running turn', at: Date.now() }
-    await setAction($, a.id, sentNow)
+    const sentNow: Partial<CompassAction> = { status: 'sent', route: 'running turn', at: Date.now() }
+    await update($, actionsA, patched(a.id, sentNow))
     $.ui.toast(`↗ sent into the running turn · ${clip(a.label, 50)}`)
   } catch (err) {
     await reject($, a, err)
@@ -1269,8 +1307,8 @@ async function appendNow($: EngineInterface, a: CompassAction) {
 
 async function reject($: EngineInterface, a: CompassAction, err: unknown) {
   const reason = err instanceof Error ? err.message.slice(0, 60) : String(err).slice(0, 60)
-  const rejected: ActionPatch = { status: 'rejected', reason, at: Date.now() }
-  await setAction($, a.id, rejected)
+  const rejected: Partial<CompassAction> = { status: 'rejected', reason, at: Date.now() }
+  await update($, actionsA, patched(a.id, rejected))
   const prev = a.prev
   if (a.ref && (LANES as readonly string[]).includes(prev)) {
     await editMap($, mp => ({ ...mp, tasks: mp.tasks.map(x => (x.id === a.ref ? { ...x, lane: prev as CompassLane } : x)) }))
@@ -1286,13 +1324,13 @@ async function enqueue($: EngineInterface, kind: CompassAction['kind'], label: s
   await update($, actionsA, list => [...list, a].slice(-40))
   const isBusy = await read($, busyA)
   if (kind === 'note') {
-    const withPrompt: ActionPatch = { route: 'next prompt' }
-    await setAction($, a.id, withPrompt)
+    const withPrompt: Partial<CompassAction> = { route: 'next prompt' }
+    await update($, actionsA, patched(a.id, withPrompt))
     $.ui.toast(`⋯ queued for your next prompt · ${clip(a.label, 44)}`)
     return
   }
-  const routed: ActionPatch = { route: kind === 'steer' && isBusy ? 'running turn' : 'new turn' }
-  await setAction($, a.id, routed)
+  const routed: Partial<CompassAction> = { route: kind === 'steer' && isBusy ? 'running turn' : 'new turn' }
+  await update($, actionsA, patched(a.id, routed))
   $.ui.toast(`⋯ sends in ${SEND_GRACE_MS / 1000}s · ${clip(a.label, 44)} · ✕ in the pane cancels`)
 }
 
@@ -1302,8 +1340,8 @@ async function forceAction($: EngineInterface, id: string) {
   if (!a || a.status !== 'queued') return
   if (await read($, busyA)) return appendNow($, a)
   try {
-    const sentTurn: ActionPatch = { status: 'sent', route: 'new turn', at: Date.now() }
-    await setAction($, a.id, sentTurn)
+    const sentTurn: Partial<CompassAction> = { status: 'sent', route: 'new turn', at: Date.now() }
+    await update($, actionsA, patched(a.id, sentTurn))
     await $.prompt.submit({ text: a.text })
     $.ui.toast(`↗ sent now as a new turn · ${clip(a.label, 44)}`)
   } catch (err) {
@@ -1732,6 +1770,12 @@ export const register: Register = on => {
       if ((await read($, tabA)) === 'chat' && Date.now() - (await read($, peersAtA)) > 15_000) void refreshPeers($)
       void quietly($, 'flush')
       if ((await read($, liveA)).some(p => p.status === 'running' || p.status === 'bg') && ['flow', 'live'].includes(await read($, tabA))) await update($, tickA, n => n + 1)
+      // while Claude works: once new tool calls have finished, check the course with haiku
+      const clockNow = await $.clock.now()
+      if (!isQuickCharting && (await read($, busyA)) && clockNow - pulseAt > PULSE_EVERY_MS && clockNow - turnStartedAt > PULSE_EVERY_MS) {
+        const done = (await read($, liveA)).filter(p => p.status !== 'running').length
+        if (done > pulseSeen) void quickChart($, 'pulse')
+      }
       if (inflight) return
       // during a long turn: chart once the new prompt is in, then every few minutes
       if (!isWanted && turnStartedAt && (await read($, busyA))) {
@@ -1922,7 +1966,7 @@ export const register: Register = on => {
     if (request && !e.text.startsWith('<') && !isOwn) {
       await update($, incomingA, () => ({ text: clip(request, 80), at: Date.now() }))
       requestAt = Date.now()
-      void chartRequest($, request)
+      void quickChart($, 'request', request)
     }
     return next(e)
   })
@@ -1943,7 +1987,10 @@ export const register: Register = on => {
       tokensOut: s.tokensOut + (u?.output_tokens ?? 0),
       tokensCached: s.tokensCached + (u?.cache_read_input_tokens ?? 0),
     }))
-    if (!e.isAborted) wantRefresh()
+    if (!e.isAborted) {
+      wantRefresh()
+      void quickChart($, 'turn')
+    }
     return done
   })
 
@@ -2033,7 +2080,7 @@ export const register: Register = on => {
           {gap('hp:l')}
           {/* a Button draws one engine colour: where a Client can be drawn, the gold brand is one and takes the click */}
           {hasClient ? (
-            <Client key="compass-crumb" module="./brand.tsx" props={{ color: GOLD, bg: TONE.gold.bg, spin }} />
+            <Client module="./brand.tsx" key="compass-crumb" props={{ color: GOLD, bg: TONE.gold.bg, spin }} />
           ) : (
             <Button key="compass-crumb" plain label="◈ compass" onPress={() => void togglePane($)} />
           )}
@@ -2160,7 +2207,7 @@ export const register: Register = on => {
       presses.set(key, onPress)
       return hasClient ? (
         <Box key={`${key}:box`} flexShrink={0}>
-          <Client key={key} module="./pill.tsx" props={{ label, fg: TONE[tone].fg, bg: TONE[tone].bg, isOn }} />
+          <Client module="./pill.tsx" key={key} props={{ label, fg: TONE[tone].fg, bg: TONE[tone].bg, isOn }} />
         </Box>
       ) : (
         <Button key={key} plain dimColor={!isOn} label={label} onPress={() => void onPress()} />
@@ -2176,7 +2223,7 @@ export const register: Register = on => {
     const syncLine = ((): { tone: Tone; glyph: string; text: string; detail: string; canRefresh: boolean } => {
       const update = { canRefresh: true }
       const wait = { canRefresh: false }
-      if (isQuickCharting) return { tone: 'cyan', glyph: spin, text: 'charting your new message', detail: 'a few seconds · nothing to do', ...wait }
+      if (isQuickCharting) return { tone: 'cyan', glyph: spin, text: quickWhat || 'checking the course', detail: 'a few seconds · nothing to do', ...wait }
       if (isRefreshing) return { tone: 'cyan', glyph: spin, text: 'charting now', detail: 'nothing to do', ...wait }
       if (isReconciling) return { tone: 'cyan', glyph: spin, text: 'applying your changes', detail: 'a few seconds · nothing to do', ...wait }
       if (!map && stats.turns === 0 && !isBusy) return { tone: 'dim', glyph: '◌', text: 'waiting for your first prompt', detail: 'the chart starts seconds after you send one', ...wait }
@@ -2782,8 +2829,8 @@ export const register: Register = on => {
         body = (
           <Box flexDirection="column" key="tasks">
             <Client
-              key="board"
               module="./board.tsx"
+              key="board"
               width={width}
               props={{
                 wip: 3,
@@ -3428,7 +3475,7 @@ export const register: Register = on => {
         {pill('sync:state', `${syncLine.glyph} ${syncLine.text}`, syncLine.tone, true)}
         {map ? (
           <Box flexShrink={0}>
-            <Text dimColor>{` ◷ ${span(now - map.at)}`}</Text>
+            <Text dimColor>{` ◷ ${span(now - Math.max(map.at, map.reconciledAt ?? 0, checkedAt))}`}</Text>
           </Box>
         ) : null}
         <Box flexGrow={1} flexShrink={1}>
