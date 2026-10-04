@@ -91,16 +91,18 @@ export type CompassUserTask = { id: string; text: string; at: number }
  */
 export type CompassAction = {
   id: string
-  kind: 'steer' | 'turn' | 'note'
+  kind: 'steer' | 'turn' | 'note' | 'message'
   label: string
   text: string
   status: 'queued' | 'sent' | 'rejected'
-  route: '' | 'running turn' | 'new turn' | 'next prompt'
+  route: '' | 'running turn' | 'new turn' | 'next prompt' | 'agent'
   reason: string
   at: number
   /** the task it moved, and its lane before, for a rollback if it is rejected */
   ref: string
   prev: string
+  /** a message's recipient: the agent or session it goes to (kind message) */
+  to?: string
 }
 
 /** A session or agent ListAgents reports, this one excluded. */

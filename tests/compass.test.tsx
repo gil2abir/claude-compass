@@ -368,7 +368,7 @@ test('chat marks inbound/outbound, badges new messages, and opens a clickable hi
   on('ui.status', () => ({ value: undefined }) as never)
   on('ui.toast', () => ({ value: undefined }) as never)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
-  await $.session.receive({ origin: { kind: 'peer' }, text: '<cross-session-message from="uds:/tmp/cc-socks/1.sock" from-name="Docs agent" from-mode="prompting">can you run the benchmark? Use the faster runner and send me the per-file timings when it finishes.</cross-session-message>' })
+  await $.session.receive({ origin: { kind: 'peer' }, text: '<cross-session-message from="uds:/tmp/cc-socks/1.sock" from-name="Docs agent" from-mode="prompting">can you run the benchmark? Send me the per-file timings when it finishes.</cross-session-message>' })
   await clock.advance(1000)
   await $.session.send({ to: 'uds:/tmp/cc-socks/1.sock', text: 'running it now', origin: { kind: 'model' } } as never)
 
@@ -1215,4 +1215,78 @@ test('while Claude works, new tool calls trigger a quick course check that moves
   expect(quick.length).toBe(base + 3)
   expect(quick[base + 2]).toMatch(/its turn just ended/)
   await ui.unmount()
+})
+
+test('the agents tab: ✉ message on an online agent opens its thread; a message waits 8 s in the outbox, ✕ cancels it, otherwise it goes by SendMessage', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  on('session.id', () => ({ value: 'sess' }))
+  on('tool.call', () => ({ result: {} as never, text: 'This session is me [abc123]\nLocal sessions (1):\n  Docs agent [2aa26b] · local · busy · 1m' }))
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
+  on('ui.panes', () => ({ value: [] }))
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  on('session.messages', () => ({ value: [] }) as never)
+  on('session.usage', () => ({ value: { startedAt: 500_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('session.start', (_$, e) => e as never)
+  const sent: { to: string; text: string }[] = []
+  on('session.send', (_$, e) => {
+    sent.push({ to: (e as { to: string }).to, text: (e as { text: string }).text })
+    return { isDelivered: true as const }
+  })
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('ui.toast', () => ({ value: undefined }) as never)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  await tap(ui, 'tab:chat')
+  expect(JSON.stringify(await ui.find({ key: 'tab:chat' }))).toMatch(/⇄ agents/)
+  await tap(ui, 'peers-refresh')
+  await clock.advance(1000)
+  expect(await ui.find({ key: 'msg:Docs agent' })).toBeDefined()
+  await tap(ui, 'msg:Docs agent')
+  await ui.input({ key: 'chat:Docs agent', text: 'pause the deploy until I say go' })
+  // queued, not sent: the outbox shows it with its countdown
+  expect(sent.length).toBe(0)
+  expect(await ui.find({ text: /✉ Docs agent: pause the/ })).toBeDefined()
+  await ui.input({ key: 'chat:Docs agent', text: 'never mind' })
+  const drops = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').filter(k => k.startsWith('drop:'))
+  await tap(ui, drops[drops.length - 1]!)
+  await clock.advance(8100)
+  expect(sent.length).toBe(1)
+  expect(sent[0]!.text).toBe('pause the deploy until I say go')
+  expect(await ui.find({ text: /▸ 1 out/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('every prompt compass sends a model carries the compact ASD-STE100 rules', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+  const prompts: string[] = []
+  on('model.fork', (_$, e) => {
+    prompts.push((e as { prompt: string }).prompt)
+    return { value: { isAnswered: true, text: JSON.stringify(MAP), usage } } as never
+  })
+  on('model.complete', (_$, e) => {
+    prompts.push((e as { prompt: string }).prompt)
+    return { value: { isAnswered: true, text: '{"same":true}', usage } } as never
+  })
+  on('session.id', () => ({ value: 'sess' }))
+  on('session.messages', () => ({ value: [{ role: 'user', text: 'build v2', toolUses: [] }] }) as never)
+  on('session.usage', () => ({ value: { startedAt: 1, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }) as never)
+  on('turn.complete', (_$, e) => ({ text: e.answer }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('ui.toast', () => ({ value: undefined }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
+  on('prompt.compose', (_$, e) => ({ sections: [] }) as never)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  await $.turn.start({ text: 'build v2', turnId: 't1' } as never)
+  await clock.advance(5000)
+  await $.turn.start({ text: 'now the docs', turnId: 't2' } as never)
+  await clock.advance(1000)
+  await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't2', reason: 'answer' } as never)
+  await clock.advance(3000)
+  expect(prompts.length).toBeGreaterThan(2)
+  for (const p of prompts) expect(p).toMatch(/ASD-STE100 Simplified Technical English/)
 })

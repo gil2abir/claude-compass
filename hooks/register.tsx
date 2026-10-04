@@ -278,7 +278,7 @@ const TABS: { id: CompassTab; icon: string; label: string }[] = [
   { id: 'live', icon: '↯', label: 'live' },
   { id: 'tasks', icon: '☑', label: 'tasks' },
   { id: 'grill', icon: '?', label: 'grill' },
-  { id: 'chat', icon: '⇄', label: 'chat' },
+  { id: 'chat', icon: '⇄', label: 'agents' },
   { id: 'stats', icon: '∑', label: 'stats' },
   { id: 'recap', icon: '≡', label: 'recap' },
 ]
@@ -745,6 +745,20 @@ export const roundMessage = (round: number, handled: CompassGrillQ[]) =>
     'These settle the decisions above. Recompute the frontier and post the next round with the grill tool, or askConfirm when the frontier is empty. Look facts up yourself; do not act on a plan before the user confirms.',
   ].join('\n')
 
+/**
+ * Compact ASD-STE100 (Simplified Technical English) for every word compass writes with a model:
+ * labels, reasons, recap lines, grill questions. Relayed text (the user's words, messages,
+ * commands, names) stays as it is.
+ */
+export const STE = [
+  'Write every label, reason, recap line, task and question in ASD-STE100 Simplified Technical English, compact:',
+  '- Labels: verb first, imperative, no punctuation ("Add the CLI flag", "Fix the parser test"). Reasons and recap: short sentences, max 20 words, one idea each.',
+  '- Active voice. Simple present, simple past or simple future only. No "has been", "would have", stacked modals.',
+  '- Common words with one meaning; use the same word for the same thing. "use" not "utilize", "start" not "initiate", "stop" not "terminate", "do" not "execute", "to" not "in order to", "before" not "prior to".',
+  '- No -ing words as nouns, no noun stacks of more than 3 words, no phrasal verbs when a single verb exists, no contractions, no "e.g.", "i.e." or "etc.".',
+  '- Keep names, file paths, commands, ids, numbers and the user\'s own quoted words exactly as they are.',
+].join('\n')
+
 const GRILL_GUIDE = `# Compass grill — ask the user asynchronously
 The user answers your questions in the compass pane's grill tab while you work. Use the ${GRILL_TOOL} tool, following the grilling method:
 - Keep a design tree of the decisions in play: when planning, and whenever several options are on the table for work in progress.
@@ -755,7 +769,8 @@ The user answers your questions in the compass pane's grill tab while you work. 
 - When the frontier is empty, call the tool with askConfirm; do not act on a plan until the user confirms the shared understanding.
 - Mark each question blocking: true only when work truly waits on it; otherwise blocking: false and keep working on your recommendation, ready to adjust when the answer comes.
 - Keep checking as the work moves: new goals, ideas, trade-offs, or second-order effects down the road that the user should decide or know about are new questions.
-- The user answers what they want, when they want, in any order. A parked question means: do not wait for it and do not ask again now; proceed with your recommendation and keep it open. A dismissed question is dropped.`
+- The user answers what they want, when they want, in any order. A parked question means: do not wait for it and do not ask again now; proceed with your recommendation and keep it open. A dismissed question is dropped.
+- Write each title, body, option and recommendation in ASD-STE100 Simplified Technical English: short active sentences (max 20 words), common words with one meaning, titles of at most 5 words; keep names, paths and commands exact.`
 
 const mapPrompt = (
   prev: CompassMap | null,
@@ -769,6 +784,7 @@ const mapPrompt = (
   [
     'You are COMPASS, a silent observer of this session. Do NOT continue the task, call tools, or address the user.',
     'Reply with ONLY one minified JSON object (no prose, no fence). Be terse: the whole reply must stay under 2500 characters.',
+    STE,
     '{"goal":s,"milestones":[{"id":s,"label":s,"state":"done|active|pending|abandoned","why":s,"steps":[{"id":s,"label":s,"kind":"step|attempt|decision|aside","state":"done|active|pending|abandoned|blocked","why":s}]}],"tasks":[{"id":s,"text":s,"lane":"now|next|later|done","by":"agent|user","from":s}],"recap":[s],"moot":[s],"alt":{"label":s,"why":s,"steps":[s]}|null,"grill":[{"id":s,"title":s,"body":s,"options":[s],"recommendation":s,"dependsOn":[s],"from":s,"blocking":b}]}',
     'Model = version tree + phase chunking:',
     '- goal: the session goal, ≤6 words.',
@@ -1091,6 +1107,7 @@ async function reconcile($: EngineInterface) {
     const acts = (await read($, actionsA)).filter(a => a.at > stored.at - 1000).map(a => `${a.status === 'queued' ? 'queued' : 'sent'}: ${a.label}`)
     const prompt = [
       'You are COMPASS. Reply with ONLY one minified JSON object in the same shape as the chart below (goal, milestones, tasks, recap, alt, moot).',
+      STE,
       'The user just acted in the compass pane (below). Update the chart to reflect ONLY what those actions imply: steps no longer waiting on a question that is answered, parked or dismissed; pending steps a steer or a chosen branch changes; tasks the user moved or added; grill questions the answers made moot (moot: their ids). Do NOT mark work done or add progress the session has not made. Keep every id.',
       `The chart: ${JSON.stringify({ goal: stored.goal, milestones: stored.milestones, tasks: stored.tasks, recap: stored.recap, alt: stored.alt ?? null })}`,
       `The grill ([id, Q, title, state, answer]): ${JSON.stringify(grill.map(q => [q.id, q.n, q.title, q.state, q.answer]))}`,
@@ -1140,7 +1157,7 @@ async function quickChart($: EngineInterface, why: 'request' | 'pulse' | 'turn',
     const last = why === 'request' ? '' : [...(await $.session.messages())].reverse().find(m => m.role === 'assistant' && typeof m.text === 'string' && m.text.trim())?.text ?? ''
     const chart = `The chart: ${JSON.stringify({ goal: stored.goal, milestones: stored.milestones, tasks: stored.tasks, recap: stored.recap, alt: stored.alt ?? null })}`
     const shape = 'You are COMPASS. Reply with ONLY one minified JSON object in the same shape as the chart below (goal, milestones, tasks, recap, alt, moot).'
-    const keep = 'Keep every existing id; new ids are short and unique. Keep the goal unless the work changed it.'
+    const keep = `Keep every existing id; new ids are short and unique. Keep the goal unless the work changed it.\n${STE}`
     const prompt = (why === 'request'
       ? [
           shape,
@@ -1338,6 +1355,7 @@ async function enqueue($: EngineInterface, kind: CompassAction['kind'], label: s
 async function forceAction($: EngineInterface, id: string) {
   const a = (await read($, actionsA)).find(x => x.id === id)
   if (!a || a.status !== 'queued') return
+  if (a.kind === 'message') return sendMessage($, a)
   if (await read($, busyA)) return appendNow($, a)
   try {
     const sentTurn: Partial<CompassAction> = { status: 'sent', route: 'new turn', at: Date.now() }
@@ -1467,8 +1485,11 @@ async function removeAction($: EngineInterface, id: string) {
 /** The poller's job: queued steers and turns go out together once the session is idle. */
 async function flushOutbox($: EngineInterface) {
   const t = await $.clock.now()
-  const waiting = (await read($, actionsA)).filter(a => a.status === 'queued' && a.kind !== 'note')
-  if (waiting.some(a => t - a.at < SEND_GRACE_MS) || isReconciling || isQuickCharting || (await read($, refreshingA))) await update($, tickA, n => n + 1)
+  const queued = (await read($, actionsA)).filter(a => a.status === 'queued' && a.kind !== 'note')
+  if (queued.some(a => t - a.at < SEND_GRACE_MS) || isReconciling || isQuickCharting || (await read($, refreshingA))) await update($, tickA, n => n + 1)
+  // messages to other agents go when their wait is over, whether or not Claude is working
+  for (const a of queued) if (a.kind === 'message' && t - a.at >= SEND_GRACE_MS) await sendMessage($, a)
+  const waiting = queued.filter(a => a.kind !== 'message')
   if (await read($, busyA)) {
     for (const a of waiting) if (a.route === 'running turn' && t - a.at >= SEND_GRACE_MS) await appendNow($, a)
     return
@@ -1589,6 +1610,22 @@ async function chatSend($: EngineInterface, peer: string, text: string) {
     await update($, chatA, list => [...list, { peer, dir: 'out' as const, text: t, at, status: 'rejected' as const }].slice(-200))
     $.ui.toast(`✗ rejected · ${peer} · ${err instanceof Error ? err.message.slice(0, 60) : 'failed'}`)
   }
+}
+
+/** A message to another agent or session waits in the outbox like everything else, then goes by SendMessage. */
+async function queueMessage($: EngineInterface, peer: string, text: string) {
+  const t = text.trim()
+  if (!t) return
+  const a: CompassAction = { id: `a${Date.now()}${Math.floor(Math.random() * 1e4)}`, kind: 'message', label: clip(`✉ ${peer}: ${t}`, 80), text: t, status: 'queued', route: 'agent', reason: '', at: await $.clock.now(), ref: '', prev: '', to: peer }
+  await update($, actionsA, list => [...list, a].slice(-40))
+  $.ui.toast(`⋯ to ${clip(peer, 24)} in ${SEND_GRACE_MS / 1000}s · ✕ in the pane cancels`)
+}
+
+/** Sends a queued message now; the thread records it either way. */
+async function sendMessage($: EngineInterface, a: CompassAction) {
+  const sent: Partial<CompassAction> = { status: 'sent', at: Date.now() }
+  await update($, actionsA, patched(a.id, sent))
+  await chatSend($, a.to ?? '', a.text)
 }
 
 async function addUserTask($: EngineInterface, text: string) {
@@ -2950,6 +2987,7 @@ export const register: Register = on => {
                 <Box flexGrow={1} />
                 {pill(`pk:${p.id}`, `${p.kind}${p.status ? ` · ${p.status}` : ''}`, 'dim')}
                 {counts(p.name)}
+                <Box marginLeft={1} flexShrink={0}>{pillBtn(`msg:${p.name}`, '✉ message', sel === p.name ? 'cyan' : 'blue', openThread(p.name), sel === p.name)}</Box>
               </Box>
               {p.group && /remote/i.test(p.group) ? <Text dimColor>{'  '}{p.group}</Text> : null}
               {lastLine(p.name)}
@@ -3008,7 +3046,7 @@ export const register: Register = on => {
                   </Box>
                 )
               })}
-              {input(`chat:${sel}`, `message ${clip(sel, 20)}…`, 'send', v => void chatSend($, sel, v))}
+              {input(`chat:${sel}`, `message ${clip(sel, 20)}… · waits 8 s in the outbox`, 'queue', v => void queueMessage($, sel, v))}
             </Box>
           )}
         </Box>
@@ -3370,10 +3408,10 @@ export const register: Register = on => {
     await read($, tickA)
     const queued = actions.filter(a => a.status === 'queued')
     const sent = actions.filter(a => a.status !== 'queued' && now - a.at < 600_000).reverse()
-    const WHEN = { 'running turn': ['↪', 'cyan'], 'new turn': ['⏭', 'yellow'], 'next prompt': ['✎', 'purple'], '': ['⋯', 'yellow'] } as const
+    const WHEN = { 'running turn': ['↪', 'cyan'], 'new turn': ['⏭', 'yellow'], 'next prompt': ['✎', 'purple'], agent: ['✉', 'blue'], '': ['⋯', 'yellow'] } as const
     const footRows: RenderElement[] = []
-    const groups = (['running turn', 'new turn', 'next prompt'] as const).filter(r => queued.some(a => a.route === r))
-    const groupName = { 'running turn': 'into this turn', 'new turn': isBusy ? 'after this turn' : 'next turn', 'next prompt': 'with next prompt' } as const
+    const groups = (['running turn', 'new turn', 'next prompt', 'agent'] as const).filter(r => queued.some(a => a.route === r))
+    const groupName = { 'running turn': 'into this turn', 'new turn': isBusy ? 'after this turn' : 'next turn', 'next prompt': 'with next prompt', agent: 'to agents' } as const
     const failed = sent.filter(a => a.status === 'rejected').length
     footRows.push(
       <Box key="f:head" backgroundColor={PANEL}>
