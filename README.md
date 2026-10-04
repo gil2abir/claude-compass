@@ -2,7 +2,7 @@
 
 <p align="center"><b>Watch your Claude Code session think. Steer it while it works.</b></p>
 
-<p align="center"><img src="https://raw.githubusercontent.com/gil2abir/claude-compass/media/demo.gif" alt="compass beside a Claude Code session: the sea chart, the plan as live milestones, Claude's questions in the grill, the live feed of tool calls, a steer landing on the chart" width="900"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/gil2abir/claude-compass/media/demo.gif" alt="compass beside a Claude Code session: the sea chart, the plan as live milestones, Claude's questions in the grill, the live feed of tool calls, a fork in the plan and picking a route, a steer landing on the chart" width="900"></p>
 
 <p align="center"><a href="https://raw.githubusercontent.com/gil2abir/claude-compass/media/demo.mp4">Full-quality video (MP4)</a> · <a href="#install">Install</a> · <a href="#what-compass-reads-sends-runs-and-stores">What it can touch</a></p>
 
