@@ -1,27 +1,15 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelForkResult, Register, RenderElement } from 'claude-code'
+import type { CompassAction, CompassAlt, CompassChatMsg, CompassPeer, CompassAgentTodo, CompassBrief, CompassEvent, CompassGrillQ, CompassLane, CompassMap, CompassMilestone, CompassPulse, CompassReport, CompassState, CompassStats, CompassStep, CompassStepKind, CompassTab, CompassTask } from '../types'
+import { PANE, TITLE, PAST_KEEP, FUTURE_KEEP, GRILL_TOOL, GOLD, TONE, TRACK, PANEL, SPIN, barText, dotsText, span, seaChart } from './kit'
+import type { Tone } from './kit'
+import { isSameWay, isDecided, pulseWhat, bgIdOf, graphemes, clip, plain, wordWrap, leadOf, ago, kfmt, str, strs, LANES, grillDrafts, parseMap, todoCourse, locate, plannedAhead, recIndex, crumb, glen, gist, BAR_CELLS, hintChips, boardOf, frontierOf, mergeGrill, RELEASE_TAIL, HOLD_TAIL, roundMessage, compactRow, STE, GRILL_GUIDE } from './helpers'
+import { mergeExtra, briefOf, briefSig, briefText, CONTRACT_GUIDE, mapPrompt } from './contract'
 
-import type {
-  CompassAction,
-  CompassAlt,
-  CompassChatMsg,
-  CompassPeer,
-  CompassAgentTodo,
-  CompassBrief,
-  CompassEvent,
-  CompassGrillQ,
-  CompassLane,
-  CompassMap,
-  CompassMilestone,
-  CompassPulse,
-  CompassReport,
-  CompassState,
-  CompassStats,
-  CompassStep,
-  CompassStepKind,
-  CompassTab,
-  CompassTask,
-} from '../types'
+// the pure parts live in their own files; their exports stay reachable from here (the tests import them)
+export * from './kit'
+export * from './helpers'
+export * from './contract'
 
 // 🧭 compass — where we were, where we are, where we're headed.
 //
@@ -32,195 +20,6 @@ import type {
 // · ≤4 hues, every colour doubled by a glyph (Healey, Ware)
 // The grill tab runs mattpocock/skills `grilling`: a design tree asked in rounds of its
 // frontier, each question with a recommendation; facts are the agent's, decisions the user's.
-
-const PANE = 'compass'
-const TITLE = '🧭 compass'
-const PAST_KEEP = 2
-const FUTURE_KEEP = 3
-const GRILL_TOOL = 'mcp__compass__grill'
-const GOLD = '#E8B53A'
-// ── the widget kit: indicators are drawn, information stays text ──
-
-/** Pill colours, after the reference: a tinted fill with a bright label of the same hue. */
-const TONE = {
-  gold: { fg: '#E8B53A', bg: '#3b321c' },
-  green: { fg: '#86d4ab', bg: '#1d3a2f' },
-  purple: { fg: '#b9a6f2', bg: '#2e2946' },
-  red: { fg: '#f2a093', bg: '#442728' },
-  blue: { fg: '#97b1f5', bg: '#243049' },
-  cyan: { fg: '#83d6e8', bg: '#1b3940' },
-  yellow: { fg: '#f0d27a', bg: '#3e381d' },
-  gray: { fg: '#c4c4c4', bg: '#333438' },
-  dim: { fg: '#8a8a8a', bg: '#2a2b2e' },
-} as const
-type Tone = keyof typeof TONE
-const TRACK = '#3a3b3f'
-const PANEL = '#2b2c31'
-const SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-
-/** A level as a smooth bar `cells` wide: whole blocks, then an eighth-block edge. */
-export const barText = (frac: number, cells: number) => {
-  const f = Math.max(0, Math.min(1, Number.isFinite(frac) ? frac : 0)) * cells
-  // an edge that rounds up to a whole eighth is one more full block
-  const eighths = Math.round(f * 8)
-  const full = Math.floor(eighths / 8)
-  const part = eighths % 8
-  const edge = full < cells ? (part ? ' ▏▎▍▌▋▊▉'[part]! : ' ') : ''
-  return `${'█'.repeat(full)}${edge}${' '.repeat(Math.max(0, cells - full - 1))}`.slice(0, cells)
-}
-
-/** A countdown as pixels going out: `left` lit of `total`. */
-export const dotsText = (left: number, total: number) => `${'●'.repeat(Math.max(0, Math.min(total, left)))}${'·'.repeat(Math.max(0, total - Math.max(0, left)))}`
-
-/** A short duration: 2h 40m, 1d 7h, 45s. */
-export const span = (ms: number) => {
-  const m = Math.max(0, Math.round(ms / 60000))
-  if (ms < 60000) return `${Math.max(0, Math.round(ms / 1000))}s`
-  if (m < 60) return `${m}m`
-  if (m < 1440) return `${Math.floor(m / 60)}h ${m % 60}m`
-  return `${Math.floor(m / 1440)}d ${Math.floor((m % 1440) / 60)}h`
-}
-
-// ── the sea chart: the flow tab before the first chart lands ──
-
-export type ChartRun = [text: string, color: string, bold?: boolean]
-
-const SEA = {
-  dark: '#E8B53A',
-  light: '#9c7426',
-  ring: '#7d5f33',
-  tick: '#b08a45',
-  letter: '#f5d88a',
-  core: '#fff1c2',
-  cloud: '#8e98a6',
-  gull: '#e8e8e8',
-  wave: '#4f86bd',
-  deep: '#2e5f8f',
-  hint: '#83d6e8',
-  blank: '#000000',
-} as const
-type SeaInk = keyof typeof SEA
-
-const HINTS = [
-  'charting the course',
-  'reading the stars',
-  'taking soundings',
-  'trimming the sails',
-  'plotting the heading',
-  'consulting the log',
-]
-
-/**
- * The opening sea chart, `width` by `height` cells, at moment `t` (ms): a 32-point compass rose
- * in the middle (each point dark on one side, light on the other, as on old charts), clouds,
- * seagulls, rolling waves, and a gull crossing the chart while the first chart is made.
- */
-export const seaChart = (width: number, height: number, t: number, isCharting: boolean, note = 'waiting for your first prompt'): ChartRun[][] => {
-  const W = Math.max(20, width)
-  const H = Math.max(8, height)
-  const grid: { ch: string; ink: SeaInk; bold?: boolean }[][] = Array.from({ length: H }, () => Array.from({ length: W }, () => ({ ch: ' ', ink: 'blank' as SeaInk })))
-  const put = (x: number, y: number, ch: string, ink: SeaInk, bold = false) => {
-    if (y >= 0 && y < H && x >= 0 && x < W) grid[y]![x] = { ch, ink, bold }
-  }
-  const text = (x: number, y: number, str: string, ink: SeaInk, bold = false) => [...str].forEach((c, i) => c !== ' ' && put(x + i, y, c, ink, bold))
-
-  // the sky (clouds, gulls) on top, the sea at the bottom, the rose in between as big as fits
-  const seaRows = H >= 18 ? 3 : 2
-  const sky = H >= 16 ? 4 : H >= 11 ? 2 : 0
-  const room = H - seaRows - sky - 3
-  const fit = Math.max(5, Math.min(room, Math.floor((W - 8) / 2.1)))
-  const roseRows = fit % 2 ? fit : fit - 1
-  const ry = (roseRows - 1) / 2
-  const rx = ry * 2.1
-  const cx = Math.floor(W / 2)
-  const cy = sky + 1 + Math.ceil(ry) + Math.max(0, Math.floor((room - roseRows) / 2))
-  // 32 points: 4 cardinal, 4 intercardinal, 8 and 16 between, each a kite from the centre
-  const POINTS: [number, number, number][] = []
-  for (let k = 0; k < 32; k++) {
-    const level = k % 8 === 0 ? 0 : k % 4 === 0 ? 1 : k % 2 === 0 ? 2 : 3
-    POINTS.push([(k * Math.PI) / 16, [0.9, 0.7, 0.52, 0.4][level]!, [0.24, 0.17, 0.11, 0.08][level]!])
-  }
-  for (let y = Math.floor(cy - ry - 1); y <= Math.ceil(cy + ry + 1); y++) {
-    for (let x = Math.floor(cx - rx - 2); x <= Math.ceil(cx + rx + 2); x++) {
-      const dx = (x - cx) / rx
-      const dy = (y - cy) / ry
-      const r = Math.hypot(dx, dy)
-      const th = Math.atan2(dx, -dy)
-      // the outer ring with a tick at each of the 32 points, the inner ring dotted
-      if (Math.abs(r - 1) < 0.5 / ry) {
-        const off = Math.abs(((((th * 16) / Math.PI) % 1) + 1.5) % 1 - 0.5)
-        put(x, y, off < 0.12 ? '•' : '·', off < 0.12 ? 'tick' : 'ring', off < 0.12)
-        continue
-      }
-      if (Math.abs(r - 0.93) < 0.4 / ry) {
-        put(x, y, '∙', 'ring')
-        continue
-      }
-      // longest point first; dark on its left half, light on its right, as on old charts
-      for (const [a, len, half] of POINTS) {
-        const along = dx * Math.sin(a) - dy * Math.cos(a)
-        const perp = dx * Math.cos(a) + dy * Math.sin(a)
-        if (along > 0 && along <= len && Math.abs(perp) <= half * (1 - along / len)) {
-          const isMain = len >= 0.68
-          put(x, y, perp < 0 ? (isMain ? '█' : '▓') : isMain ? '▒' : '░', perp < 0 ? 'dark' : 'light')
-          break
-        }
-      }
-    }
-  }
-  put(cx, cy, '✦', 'core', true)
-  text(cx, Math.round(cy - ry) - 1, 'N', 'letter', true)
-  text(cx, Math.round(cy + ry) + 1, 'S', 'letter', true)
-  text(Math.round(cx - rx) - 2, cy, 'W', 'letter', true)
-  text(Math.round(cx + rx) + 2, cy, 'E', 'letter', true)
-
-  // clouds drifting slowly across the sky, gulls far off, and one gull crossing while compass works
-  if (sky >= 4) {
-    const drift = Math.floor(t / 3000)
-    const lane = Math.max(1, W - 10)
-    ;[' .--. ', '(    ).', '`-..-`'].forEach((row, i) => text((2 + drift) % lane, i, row, 'cloud'))
-    ;[' .-~~-.', '(  __  )'].forEach((row, i) => text((((W - 12 - drift) % lane) + lane) % lane, i, row, 'cloud'))
-    text(Math.floor(W * 0.3), 1, '⌄', 'gull')
-    text(Math.floor(W * 0.72), 2, '⌄', 'gull')
-  }
-  const flap = Math.floor(t / 350) % 2 === 0
-  const gx = (Math.floor(t / (isCharting ? 160 : 320)) % (W + 6)) - 3
-  const gy = Math.max(0, Math.min(Math.max(0, sky - 1), 1 + Math.round(Math.sin(t / 900))))
-  text(gx, gy, flap ? '\\v/' : '-v-', 'gull', true)
-
-  // the sea: rolling waves along the bottom
-  const phase = Math.floor(t / 300)
-  const swell = '~^~ ˜ ~^~  ~ ˜^~ '
-  for (let i = 0; i < seaRows; i++) {
-    const y = H - seaRows + i
-    for (let x = 0; x < W; x++) {
-      const L = swell.length
-      const c = swell[(((x + phase * (i % 2 ? -1 : 1) + i * 5) % L) + L) % L]!
-      if (c !== ' ') put(x, y, c, i === seaRows - 1 ? 'deep' : 'wave')
-    }
-  }
-
-  // the hint, centred under the rose
-  const word = HINTS[Math.floor(t / 2800) % HINTS.length]!
-  const dots = '.'.repeat(1 + (Math.floor(t / 450) % 3))
-  const hint = isCharting ? `${SPIN[Math.floor(t / 120) % SPIN.length]} ${word}${dots}` : note
-  // wrapped, never cut: a narrow pane gets it on two rows
-  const hintRows = wordWrap(hint, W - 2)
-  const hy = Math.min(H - seaRows - hintRows.length, Math.round(cy + ry) + 2)
-  hintRows.forEach((row, i) => text(Math.max(0, Math.floor((W - glen(row)) / 2)), hy + i, row, 'hint', true))
-
-  // runs of one ink per row
-  return grid.map(row => {
-    const runs: ChartRun[] = []
-    for (const c of row) {
-      const last = runs[runs.length - 1]
-      const color = c.ink === 'blank' ? '' : SEA[c.ink]
-      if (last && last[1] === color && !!last[2] === !!c.bold) last[0] += c.ch
-      else runs.push([c.ch, color, c.bold])
-    }
-    return runs
-  })
-}
 
 /** Handlers of the pill buttons drawn this render, by key: a pill's 'press' post runs its own. */
 const presses = new Map<string, () => unknown>()
@@ -341,711 +140,6 @@ const markOf = (kind: CompassStepKind, state: CompassState): Mark => {
   if (kind === 'attempt' && state === 'done') return { glyph: '⊕', color: 'green' }
   return STEP_MARK[state]
 }
-
-// ── pure helpers ─────────────────────────────────────────────────────────
-
-/** A tool call in a few words for the live tab: the command, the file's name, the pattern, the task. */
-export const pulseWhat = (input: Record<string, unknown>): string => {
-  const s = (k: string) => (typeof input[k] === 'string' ? (input[k] as string) : '')
-  const base = (p: string) => p.split('/').filter(Boolean).pop() ?? p
-  const pick =
-    s('description') && (input.tool === 'Agent' || input.tool === 'Monitor' || input.tool === 'Bash' && !s('command')) ? s('description')
-    : s('command') ? s('command')
-    : s('file_path') ? base(s('file_path'))
-    : s('notebook_path') ? base(s('notebook_path'))
-    : s('pattern') ? s('pattern')
-    : s('url') ? s('url').replace(/^https?:\/\//, '')
-    : s('query') ? s('query')
-    : s('subject') ? s('subject')
-    : s('description') || s('prompt') || s('skill') || s('to') || ''
-  return pick.replace(/\s+/g, ' ').trim()
-}
-
-/** The background task id a tool's answer names (a shell's, a monitor's, an agent's), if any. */
-export const bgIdOf = (text: string): string | undefined =>
-  /(?:\bID|task[ _-]?id|agentId|shell[ _-]?id)\s*[:=]\s*["'`]?([A-Za-z0-9_-]{4,})/i.exec(text)?.[1] ?? /\(task ([A-Za-z0-9_-]{4,})\b/.exec(text)?.[1]
-
-
-/** User-perceived characters, so a cut never splits an emoji or an accent (no "�"). */
-const graphemes = (text: string): string[] => {
-  try {
-    return Array.from(new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text), g => g.segment)
-  } catch {
-    return Array.from(text)
-  }
-}
-
-const clip = (text: string, n: number) => {
-  const g = graphemes(text)
-  return g.length > n ? `${g.slice(0, Math.max(1, n - 1)).join('')}…` : text
-}
-
-const clipLeft = (text: string, n: number) => {
-  const g = graphemes(text)
-  return g.length > n ? `…${g.slice(g.length - n + 1).join('')}` : text
-}
-
-/** Model text made safe for one terminal row: no emoji, controls, zero-width or replacement chars. */
-export const plain = (text: string) =>
-  text
-    .replace(/\s+/g, ' ')
-    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufe00-\ufe0f\ufffd]/g, '')
-    .replace(/\p{Extended_Pictographic}/gu, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-
-/** Rows of at most `width` cells, broken between words; only a word wider than a row is split. */
-export const wordWrap = (text: string, width: number): string[] => {
-  const w = Math.max(4, width)
-  const rows: string[] = []
-  let row = ''
-  for (const word of text.split(/\s+/).filter(Boolean)) {
-    const g = graphemes(word)
-    if (g.length > w) {
-      if (row) rows.push(row)
-      for (let i = 0; i < g.length; i += w) rows.push(g.slice(i, i + w).join(''))
-      row = rows.pop() ?? ''
-      continue
-    }
-    const joined = row ? `${row} ${word}` : word
-    if (graphemes(joined).length > w) {
-      rows.push(row)
-      row = word
-    } else row = joined
-  }
-  if (row) rows.push(row)
-  return rows.length ? rows : ['']
-}
-
-/** A message's lead: its first sentence or line, whole; long ones end at a word with "…". */
-export const leadOf = (text: string, max = 140) => {
-  const flat = plain(text)
-  const first = /^(.+?[.!?])(\s|$)/.exec(flat)?.[1] ?? flat
-  if (graphemes(first).length <= max) return { lead: first, hasMore: first.length < flat.length }
-  const cut = wordWrap(first, max - 1)[0] ?? ''
-  return { lead: `${cut}…`, hasMore: true }
-}
-
-const ago = (ms: number) => {
-  const s = Math.max(0, Math.round(ms / 1000))
-  if (s < 60) return `${s}s`
-  if (s < 3600) return `${Math.round(s / 60)}m`
-  return `${(s / 3600).toFixed(1)}h`
-}
-
-const kfmt = (n: number) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`)
-
-const str = (v: unknown, n: number) => (typeof v === 'string' ? clip(plain(v), n) : '')
-
-const strs = (v: unknown, max: number, n: number) =>
-  (Array.isArray(v) ? v : []).filter((x): x is string => typeof x === 'string' && plain(x) !== '').slice(0, max).map(x => clip(plain(x), n))
-
-const objs = (v: unknown): Record<string, unknown>[] =>
-  Array.isArray(v) ? v.filter((x): x is Record<string, unknown> => typeof x === 'object' && x !== null) : []
-
-const oneOf = <T extends string>(v: unknown, all: readonly T[], fallback: T): T =>
-  all.includes(v as T) ? (v as T) : fallback
-
-const STATES = ['done', 'active', 'pending', 'abandoned', 'blocked'] as const
-const KINDS = ['step', 'attempt', 'decision', 'aside'] as const
-const LANES = ['now', 'next', 'later', 'done'] as const
-
-/** Closes a JSON text the model cut short (an output cap mid-object), so most of it still reads. */
-export const repairJson = (src: string) => {
-  let out = ''
-  const closers: string[] = []
-  let isInString = false
-  let isEscaped = false
-  for (const ch of src) {
-    out += ch
-    if (isInString) {
-      if (isEscaped) isEscaped = false
-      else if (ch === '\\') isEscaped = true
-      else if (ch === '"') isInString = false
-      continue
-    }
-    if (ch === '"') isInString = true
-    else if (ch === '{') closers.push('}')
-    else if (ch === '[') closers.push(']')
-    else if (ch === '}' || ch === ']') closers.pop()
-  }
-  if (isInString) out += '"'
-  out = out.replace(/[\s,:]+$/, '').replace(/([{,])\s*"[^"]*"$/, '$1').replace(/[\s,]+$/, '')
-  return out + closers.reverse().join('')
-}
-
-/** The first JSON object in a reply: fenced, chatty or cut short. */
-export const parseLoose = (text: string): Record<string, unknown> | null => {
-  const start = text.indexOf('{')
-  if (start < 0) return null
-  const body = text.slice(start)
-  const end = body.lastIndexOf('}')
-  for (const candidate of [end >= 0 ? body.slice(0, end + 1) : '', repairJson(body)]) {
-    if (!candidate) continue
-    try {
-      const v: unknown = JSON.parse(candidate)
-      if (typeof v === 'object' && v !== null && !Array.isArray(v)) return v as Record<string, unknown>
-    } catch {
-      // try the next reading
-    }
-  }
-  return null
-}
-
-type GrillDraft = Pick<CompassGrillQ, 'id' | 'title' | 'body' | 'options' | 'rec' | 'dependsOn' | 'mode' | 'from' | 'blocking'>
-
-const grillDrafts = (v: unknown, fallbackMode: 'plan' | 'work'): GrillDraft[] =>
-  objs(v)
-    .slice(0, 12)
-    .map((q, i) => ({
-      id: str(q.id, 32) || `g${i}`,
-      title: str(q.title, 40) || '…',
-      body: str(q.body, 400),
-      options: strs(q.options, 4, 40),
-      rec: str(q.recommendation ?? q.rec, 160),
-      dependsOn: strs(q.dependsOn, 6, 32),
-      mode: q.mode === 'plan' || q.mode === 'work' ? q.mode : fallbackMode,
-      from: str(q.from, 30),
-      blocking: q.blocking === true,
-    }))
-
-/** Coerces a fork reply into a CompassMap, plus any decisions it inferred for the grill. */
-/**
- * Exactly one "now", whatever the model wrote: the first active milestone stays active and holds
- * the one active step; any other milestone or step marked active waits as pending.
- */
-export const oneNow = (milestones: CompassMilestone[]): CompassMilestone[] => {
-  // blocked steps (waiting on the user) may sit beside the active one; only "active" is limited
-  const live = (st: CompassState) => st === 'active'
-  const at = milestones.findIndex(m => live(m.state))
-  return milestones.map((m, i) => {
-    const isHere = i === at
-    let seen = false
-    const steps = m.steps.map((st): CompassStep => {
-      if (!live(st.state)) return st
-      if (isHere && !seen) {
-        seen = true
-        return st
-      }
-      return { ...st, state: 'pending' }
-    })
-    return { ...m, state: live(m.state) && !isHere ? 'pending' : m.state, steps }
-  })
-}
-
-export const parseMap = (text: string, at: number): (CompassMap & { grill: GrillDraft[]; moot: string[] }) | null => {
-  const o = parseLoose(text)
-  if (!o || !Array.isArray(o.milestones)) return null
-  const milestones: CompassMilestone[] = objs(o.milestones)
-    .slice(0, 10)
-    .map((m, i) => ({
-      id: str(m.id, 24) || `m${i}`,
-      label: str(m.label, 40) || '…',
-      state: oneOf(m.state, STATES, 'pending'),
-      why: str(m.why, 80),
-      steps: objs(m.steps)
-        .slice(0, 14)
-        .map((s, j): CompassStep => ({
-          id: str(s.id, 24) || `m${i}s${j}`,
-          label: str(s.label, 40) || '…',
-          kind: oneOf(s.kind, KINDS, 'step'),
-          state: oneOf(s.state, STATES, 'pending'),
-          why: str(s.why, 80),
-        })),
-    }))
-  const tasks: CompassTask[] = objs(o.tasks)
-    .slice(0, 30)
-    .map((t, i) => ({
-      id: str(t.id, 24) || `t${i}`,
-      text: str(t.text, 70) || '…',
-      lane: oneOf(t.lane, LANES, 'next'),
-      by: t.by === 'user' ? 'user' : 'agent',
-      from: str(t.from, 30),
-    }))
-  const a = o.alt && typeof o.alt === 'object' ? (o.alt as Record<string, unknown>) : null
-  const altSteps = a ? strs(a.steps, 4, 40) : []
-  const alt: CompassAlt | null = a && str(a.label, 40) && altSteps.length ? { label: str(a.label, 40), why: str(a.why, 80), steps: altSteps } : null
-  return { goal: str(o.goal, 60), milestones: oneNow(milestones), tasks, recap: strs(o.recap, 7, 140), at, alt, grill: grillDrafts(o.grill, 'work'), moot: strs(o.moot, 12, 32) }
-}
-
-/** The agent's own course from its TodoWrite list: the item in progress, then the next pending one. */
-export const todoCourse = (todos: readonly CompassAgentTodo[]): { now: string; next: string } | null => {
-  const doing = todos.find(t => t.status === 'in_progress')
-  if (!doing) return null
-  const after = todos.slice(todos.indexOf(doing) + 1).find(t => t.status === 'pending') ?? todos.find(t => t.status === 'pending')
-  return { now: clip(plain(doing.text), 60), next: after ? clip(plain(after.text), 60) : '' }
-}
-
-/** The active milestone and its active (or blocked) step: the "you are here". */
-export const locate = (map: CompassMap | null) => {
-  const ms = map?.milestones ?? []
-  const milestone = ms.find(m => m.state === 'active') ?? ms.find(m => m.state === 'blocked') ?? ms.find(m => m.state === 'pending') ?? ms[ms.length - 1]
-  const steps = milestone?.steps ?? []
-  const step = steps.find(s => s.state === 'active') ?? steps.find(s => s.state === 'blocked')
-  const after = step ? steps.slice(steps.indexOf(step) + 1) : steps
-  const nextStep = after.find(s => s.state === 'pending' && s.kind !== 'aside')
-  const nextMilestone = milestone ? ms.slice(ms.indexOf(milestone) + 1).find(m => m.state === 'pending') : undefined
-  return { milestone, step, upcoming: nextStep?.label ?? nextMilestone?.label }
-}
-
-/**
- * What lies ahead on the planned course, as the fork's left card shows it: the active milestone's
- * pending steps, then the milestones after it (so the card is never empty when the active milestone
- * has no steps left).
- */
-export const plannedAhead = (map: CompassMap, n = 4): string[] => {
-  const { milestone } = locate(map)
-  const steps = (milestone?.steps ?? []).filter(st => st.state === 'pending' && st.kind !== 'aside').map(st => `○ ${st.label}`)
-  const ms = map.milestones
-  const later = milestone ? ms.slice(ms.indexOf(milestone) + 1).filter(m => m.state === 'pending').map(m => `⚑ M${ms.indexOf(m) + 1} ${m.label}`) : []
-  return [...steps, ...later].slice(0, n)
-}
-
-/**
- * Which option the recommendation names: the one whose text it starts with, the longest match
- * winning ("GitHub rules + HTML ids" over "GitHub rules only"); -1 when it names none.
- */
-export const recIndex = (rec: string, options: string[]): number => {
-  const r = rec.toLowerCase()
-  let best = -1
-  let bestLen = 0
-  options.forEach((o, i) => {
-    const t = o.toLowerCase()
-    let n = 0
-    while (n < t.length && n < r.length && t[n] === r[n]) n += 1
-    // the whole option, or at least its first 12 letters, opens the recommendation
-    if ((n === t.length || n >= 12) && n > bestLen) {
-      best = i
-      bestLen = n
-    }
-  })
-  return best
-}
-
-/** `goal › milestone › [step] → next`, clipped from the left so "now" survives. */
-export const crumb = (map: CompassMap | null, width: number) => {
-  if (!map) return 'charting…'
-  const { milestone, step, upcoming } = locate(map)
-  const head = [map.goal, milestone?.label ?? ''].filter(Boolean).map(plain).join(' › ')
-  const here = step ? ` › [${plain(step.label)}]` : ''
-  const tail = upcoming ? ` → ${plain(upcoming)}` : ''
-  const full = `${head}${here}${tail}`
-  if (full.length <= width) return full
-  return clipLeft(`${plain(milestone?.label ?? '')}${here}${tail}`, width)
-}
-
-export type GistPart = { text: string; tone: 'brand' | 'past' | 'now' | 'blocked' | 'next' | 'sep' | 'ask' | 'need' | 'queue' }
-
-const glen = (t: string) => graphemes(t).length
-
-/**
- * The status-line gist: the active cut of the workflow — the last step done, the step now,
- * the step next — then only what needs the user. Fits `budget` cells exactly; plain glyphs only.
- */
-export const gist = (map: CompassMap | null, asks: number, queued: number, budget: number, incoming: string | null = null): GistPart[] => {
-  const brand: GistPart = { text: '◈ compass', tone: 'brand' }
-  if (!map && !incoming) return [brand, { text: '  charting…', tone: 'past' }]
-  if (!map) map = { goal: '', milestones: [], tasks: [], recap: [], at: 0 }
-  const { milestone, step, upcoming } = locate(map)
-  const steps = (milestone?.steps ?? []).filter(s => s.kind !== 'aside')
-  const here = step ? steps.indexOf(step) : -1
-  const pastStep = [...(here >= 0 ? steps.slice(0, here) : steps)].reverse().find(s => s.state === 'done')
-  const pastMilestone = [...map.milestones].reverse().find(m => m.state === 'done')
-  const isBlocked = step?.state === 'blocked'
-  let past = plain(pastStep?.label ?? pastMilestone?.label ?? '')
-  let now = plain(step?.label ?? milestone?.label ?? '')
-  let ahead = plain(upcoming ?? '')
-  if (incoming) {
-    // a turn just started on a new request: it is "now" until the chart catches up
-    past = now || past
-    now = plain(incoming)
-    ahead = 'updating…'
-  }
-  const progress = here >= 0 && steps.length > 1 ? `step ${here + 1}/${steps.length}` : ''
-  // what needs the user: words when they fit, a glyph when they do not
-  const needs = (isShort: boolean): GistPart[] => [
-    // blocked: the step itself turns red; the words only when there is room
-    ...(isBlocked && !isShort ? [{ text: '! needs you', tone: 'need' as const }] : []),
-    ...(asks ? [{ text: isShort ? `?${asks}` : `? ${asks} to answer`, tone: 'ask' as const }] : []),
-    ...(map?.alt && !map.altPick ? [{ text: isShort ? '⑂' : '⑂ 2 ways', tone: 'ask' as const }] : []),
-    ...(queued && !isShort ? [{ text: `${queued} queued`, tone: 'queue' as const }] : []),
-  ]
-  // every label is shown whole or not at all: a cut label reads as noise, a dropped one is still on the map
-  const build = (showPast: boolean, nowText: string, showAhead: boolean, isShort: boolean) => {
-    const parts: GistPart[] = [brand, { text: '  ', tone: 'sep' }]
-    if (showPast && past) parts.push({ text: `✓ ${past}`, tone: 'past' }, { text: ' › ', tone: 'sep' })
-    if (nowText) parts.push({ text: `● ${nowText}`, tone: isBlocked ? 'blocked' : 'now' })
-    if (showAhead && ahead) parts.push({ text: ' › ', tone: 'sep' }, { text: `○ ${ahead}`, tone: 'next' })
-    for (const r of needs(isShort)) parts.push({ text: '  ', tone: 'sep' }, r)
-    return parts
-  }
-  const size = (parts: GistPart[]) => parts.reduce((n, p) => n + glen(p.text), 0)
-  const tries: [boolean, string, boolean, boolean][] = [
-    [true, now, true, false],
-    [false, now, true, false],
-    [false, now, false, false],
-    [true, now, true, true],
-    [false, now, true, true],
-    [false, now, false, true],
-    [false, progress, false, true],
-    [false, '', false, true],
-  ]
-  for (const t of tries) {
-    const parts = build(...t)
-    if (size(parts) <= budget) return parts
-  }
-  return [brand]
-}
-
-export type HintPart = { text?: string; bar?: number; color?: string; isDim?: boolean; isBold?: boolean }
-export type HintChip = { key: string; tone: Tone; parts: HintPart[]; width: number }
-
-const BAR_CELLS = 5
-const partWidth = (x: HintPart) => (x.bar !== undefined ? BAR_CELLS : glen(x.text ?? ''))
-
-/**
- * The row under the prompt as one panel of chips, after the reference: the course in one chip
- * (✓ last │ ● now │ ○ next), step progress in another, then what needs the user. When room runs
- * short, parts leave from inside a chip first (last step, next step, long labels), then whole
- * chips by priority, so every chip stays one unit. `room` counts the panel's own padding.
- */
-export const hintChips = (map: CompassMap | null, asks: number, queued: number, room: number, incoming: string | null = null, blocking = 0, hasTurns = false, doing: { now: string; next: string } | null = null): HintChip[] => {
-  const SEP: HintPart = { text: ' │ ', isDim: true }
-  const chip = (key: string, tone: Tone, parts: HintPart[]): HintChip => ({ key, tone, parts, width: 2 + parts.reduce((n, x) => n + partWidth(x), 0) })
-  const BRAND = 11
-  const fits = (chips: HintChip[]) => 1 + BRAND + chips.reduce((n, c) => n + 1 + c.width, 0) + 1 <= room
-  if (!map && !incoming) {
-    const wait = [chip('wait', 'dim', [{ text: hasTurns ? '◌ no chart yet · ↻ update in the pane' : '◌ charting after your first prompt' }])]
-    return fits(wait) ? wait : []
-  }
-  const { milestone, step, upcoming } = locate(map)
-  const steps = (milestone?.steps ?? []).filter(s => s.kind !== 'aside')
-  const done = steps.filter(s => s.state === 'done').length
-  const past = incoming ? plain(step?.label ?? '') : plain([...steps].reverse().find(s => s.state === 'done')?.label ?? '')
-  const isBlocked = step?.state === 'blocked'
-  // the agent's TodoWrite item in progress is "now" with no model call; a new request comes first
-  const nowText = plain(incoming ?? doing?.now ?? step?.label ?? milestone?.label ?? '')
-  const ahead = plain(incoming ? 'updating…' : (doing ? doing.next || upcoming : upcoming) ?? '')
-  const course = (withPast: boolean, withNext: boolean) => {
-    const parts: HintPart[] = []
-    if (withPast && past) parts.push({ text: `✓ ${past}`, color: TONE.green.fg }, SEP)
-    parts.push({ text: `${isBlocked ? '!' : '●'} ${nowText}`, color: isBlocked ? TONE.red.fg : '#e6e6e6', isBold: true })
-    if (withNext && ahead) parts.push(SEP, { text: `○ ${ahead}`, isDim: true })
-    return chip('course', isBlocked ? 'red' : 'blue', parts)
-  }
-  const mNo = map && milestone ? map.milestones.indexOf(milestone) + 1 : 0
-  const progress =
-    steps.length > 1 && !incoming
-      ? chip('steps', 'green', [{ text: `⚑ M${mNo} `, isBold: true }, { bar: done / steps.length }, { text: ` ${done}/${steps.length}`, isBold: true }, { text: ' steps', isDim: true }])
-      : null
-  const needs = (isShort: boolean, keep: string[]) =>
-    [
-      isBlocked ? chip('need', 'red', [{ text: isShort ? '!' : '! needs you', isBold: true }]) : null,
-      blocking ? chip('block', 'red', [{ text: isShort ? `⏸ ${blocking}` : `⏸ ${blocking} waits on you`, isBold: true }]) : null,
-      asks - blocking > 0 ? chip('ask', 'yellow', [{ text: isShort ? `? ${asks - blocking}` : `? ${asks - blocking} open`, isBold: true }]) : null,
-      map?.alt && !map.altPick ? chip('fork', 'purple', [{ text: isShort ? '⑂' : '⑂ 2 ways', isBold: true }]) : null,
-      queued ? chip('queue', 'gray', [{ text: isShort ? `⇣ ${queued}` : `⇣ ${queued} queued` }]) : null,
-    ].filter((c): c is HintChip => c !== null && keep.includes(c.key))
-  const ALL = ['need', 'block', 'ask', 'fork', 'queue']
-  const p = progress ? [progress] : []
-  // richest first; each step down gives up the least: parts of a chip, then words, then whole chips
-  const tries: HintChip[][] = [
-    [course(true, true), ...p, ...needs(false, ALL)],
-    [course(false, true), ...p, ...needs(false, ALL)],
-    [course(false, false), ...p, ...needs(false, ALL)],
-    [course(false, false), ...p, ...needs(true, ALL)],
-    [course(false, false), ...needs(true, ALL)],
-    [course(false, false), ...needs(true, ['need', 'block', 'ask', 'fork'])],
-    [course(false, false), ...needs(true, ['need', 'block', 'ask'])],
-    [course(false, false)],
-    needs(true, ['need', 'block', 'ask']),
-  ]
-  return tries.find(fits) ?? []
-}
-
-/** Tasks the board shows: the agent's list, plus user tasks it has not picked up yet. */
-export const boardOf = (map: CompassMap | null, userTasks: { id: string; text: string }[]) => {
-  const tasks = map?.tasks ?? []
-  const known = tasks.map(t => t.text.toLowerCase())
-  const queued = userTasks
-    .filter(u => !known.some(k => k.includes(u.text.toLowerCase().slice(0, 24))))
-    .map((u): CompassTask & { isQueued: true } => ({ id: u.id, text: u.text, lane: 'now', by: 'user', from: '', isQueued: true }))
-  const all: (CompassTask & { isQueued?: true })[] = [...queued, ...tasks]
-  const byLane = (lane: CompassLane) => all.filter(t => t.lane === lane).sort((a, b) => (a.by === b.by ? 0 : a.by === 'user' ? -1 : 1))
-  return { now: byLane('now'), next: byLane('next'), later: byLane('later'), done: byLane('done') }
-}
-
-/** The grilling frontier: open questions whose prerequisites are all settled. */
-export const frontierOf = (items: CompassGrillQ[]) => {
-  const ids = new Set(items.map(q => q.id))
-  const settled = new Set(items.filter(q => q.state === 'settled' || q.state === 'parked').map(q => q.id))
-  const isReady = (q: CompassGrillQ) => q.dependsOn.every(d => !ids.has(d) || settled.has(d))
-  const live = items.filter(q => q.state !== 'settled' && q.state !== 'parked')
-  return {
-    parked: items.filter(q => q.state === 'parked'),
-    ask: live.filter(q => q.state === 'open' && isReady(q)),
-    handled: live.filter(q => q.state === 'answered' || q.state === 'followup'),
-    waiting: live.filter(q => q.state === 'open' && !isReady(q)),
-    sent: live.filter(q => q.state === 'sent'),
-    settled: items.filter(q => q.state === 'settled'),
-  }
-}
-
-/** Adds or re-asks questions by id; a re-asked question keeps its number and follow-ups. */
-export const mergeGrill = (items: CompassGrillQ[], drafts: GrillDraft[], topic: string, source: 'agent' | 'map', at: number) => {
-  let list = [...items]
-  const dismissed = items.filter(q => q.answer === 'dismissed').map(q => q.title.toLowerCase())
-  for (const d of drafts) {
-    if (dismissed.includes(d.title.toLowerCase())) continue
-    if (source === 'map' && list.some(q => q.id !== d.id && (isSameWay(q.title, d.title) || isSameWay(`${q.title} ${q.body}`, `${d.title} ${d.body}`)))) continue
-    const same = list.find(q => q.id === d.id) ?? (source === 'map' ? list.find(q => q.title.toLowerCase() === d.title.toLowerCase()) : undefined)
-    if (same) {
-      if (source === 'map') continue
-      list = list.map((q): CompassGrillQ =>
-        q === same ? { ...q, ...d, topic: topic || q.topic, state: q.state === 'settled' || q.state === 'parked' ? q.state : 'open', answer: q.state === 'settled' ? q.answer : '', at } : q,
-      )
-    } else {
-      const n = list.reduce((m, q) => Math.max(m, q.n), 0) + 1
-      list.push({ ...d, n, topic, source, state: 'open', answer: '', followups: [], at })
-    }
-  }
-  return list.slice(-60)
-}
-
-const ROUND_TAIL = 'These settle the decisions above.'
-const RELEASE_TAIL = ' · RELEASED: this was blocking; continue the work that waited on it.'
-const HOLD_TAIL = ' · BLOCKING again: stop the work that depends on it until its answer comes.'
-
-/** One round's answers, in the grilling shape the agent reads back. */
-export const roundMessage = (round: number, handled: CompassGrillQ[]) =>
-  [
-    `🧭 [compass grill · round ${round} — answers from the user]`,
-    ...handled.map(q =>
-      q.state === 'followup'
-        ? `❓ Q${q.n} (${q.id}) ${q.title} → FOLLOW-UP from the user: "${q.followups[q.followups.length - 1] ?? ''}". Keep it open: answer the follow-up, then re-ask it with ${GRILL_TOOL} (same id) with a clarified body.`
-        : `❓ Q${q.n} (${q.id}) ${q.title} → ${q.answer}${q.blocking ? RELEASE_TAIL : ''}`,
-    ),
-    `${ROUND_TAIL} Recompute the frontier and post the next round with the grill tool, or askConfirm when the frontier is empty. Look facts up yourself; do not act on a plan before the user confirms.`,
-  ].join('\n')
-
-/**
- * A compass turn as the transcript draws it: the brief and the instructions meant for the model
- * left out, the release marks short. Display only: the model reads the stored text whole.
- */
-export const compactRow = (text: string) => {
-  const cut = text.indexOf('🧭 [compass brief · rev')
-  return (cut >= 0 ? text.slice(0, cut) : text)
-    .split('\n')
-    .filter(l => !l.startsWith(ROUND_TAIL))
-    .join('\n')
-    .split(RELEASE_TAIL).join(' · released')
-    .split(HOLD_TAIL).join(' · holds')
-    .trim()
-}
-
-/**
- * Compact ASD-STE100 (Simplified Technical English) for every word compass writes with a model:
- * labels, reasons, recap lines, grill questions. Relayed text (the user's words, messages,
- * commands, names) stays as it is.
- */
-export const STE = [
-  'Write every label, reason, recap line, task and question in ASD-STE100 Simplified Technical English, compact:',
-  '- Labels: verb first, imperative, no punctuation ("Add the CLI flag", "Fix the parser test"). Reasons and recap: short sentences, max 20 words, one idea each.',
-  '- Active voice. Simple present, simple past or simple future only. No "has been", "would have", stacked modals.',
-  '- Common words with one meaning; use the same word for the same thing. "use" not "utilize", "start" not "initiate", "stop" not "terminate", "do" not "execute", "to" not "in order to", "before" not "prior to".',
-  '- No -ing words as nouns, no noun stacks of more than 3 words, no phrasal verbs when a single verb exists, no contractions, no "e.g.", "i.e." or "etc.".',
-  '- Keep names, file paths, commands, ids, numbers and the user\'s own quoted words exactly as they are.',
-].join('\n')
-
-const GRILL_GUIDE = `# Compass grill — ask the user asynchronously
-The user answers your questions in the compass pane's grill tab while you work. Use the ${GRILL_TOOL} tool, following the grilling method:
-- Keep a design tree of the decisions in play: when planning, and whenever several options are on the table for work in progress.
-- Work in rounds. The frontier is every decision whose prerequisites are settled. Post the whole frontier in one call: each question with a stable id, a short title, a body with the choices, and your recommended answer. A question that depends on another still-open one waits for a later round (or name it in dependsOn).
-- Facts are your job: read files, run tools, dispatch sub-agents rather than asking. Decisions are the user's: never answer them yourself.
-- Do not block: after posting, continue only with work that does not depend on the open answers, else end your turn. Answers arrive as a user message (into the running turn, or as a new turn), one round at a time.
-- A follow-up keeps its question open: answer it, then re-ask the question with the same id and a clarified body.
-- When the frontier is empty, call the tool with askConfirm; do not act on a plan until the user confirms the shared understanding.
-- Mark each question blocking: true only when work truly waits on it; otherwise blocking: false and keep working on your recommendation, ready to adjust when the answer comes.
-- Blocking is a handshake: compass acknowledges each blocking question ("ACK BLOCKING"). Then stop all work that depends on it; if nothing else is left, end your turn. Continue only after compass releases it ("RELEASED": an answer, a park or a dismissal), which reaches you at once. "BLOCKING again" means it holds once more.
-- Keep checking as the work moves: new goals, ideas, trade-offs, or second-order effects down the road that the user should decide or know about are new questions.
-- The user answers what they want, when they want, in any order. A parked question means: do not wait for it and do not ask again now; proceed with your recommendation and keep it open. A dismissed question is dropped.
-- Write each title, body, option and recommendation in ASD-STE100 Simplified Technical English: short active sentences (max 20 words), common words with one meaning, titles of at most 5 words; keep names, paths and commands exact.`
-
-
-// ── the contract: each side passes the other a fixed object, rebuilt whole at every step ──
-//
-// session → compass (CompassReport): what compass needs to chart the session. Rebuilt from the
-// session's own signals at every lifecycle event, and again whenever a model prompt reads it.
-// compass → session (CompassBrief): what the session needs from compass until the next step.
-// Refreshed whenever it is read; its rev moves only when its content does, and the session gets
-// it whole with each prompt, compass turn, steer and grill answer while it changed. `extra` on
-// each side carries what only this session's workflow needs.
-
-const EXTRA_KEYS = 12
-
-/** Merges notes into an extra map: an empty text drops its key; keys and texts are kept short. */
-export const mergeExtra = (extra: Record<string, string>, notes: unknown): Record<string, string> => {
-  if (!notes || typeof notes !== 'object' || Array.isArray(notes)) return extra
-  const out = { ...extra }
-  for (const [k, v] of Object.entries(notes as Record<string, unknown>)) {
-    const key = clip(plain(k), 24)
-    if (!key) continue
-    const text = typeof v === 'string' ? clip(plain(v), 300) : ''
-    if (text) out[key] = text
-    else delete out[key]
-  }
-  return Object.fromEntries(Object.entries(out).slice(-EXTRA_KEYS))
-}
-
-const qRef = (q: CompassGrillQ) => `Q${q.n} (${q.id}) ${q.title}${q.rec ? ` → recommended: ${q.rec}` : ''}`
-
-/** compass → session, without rev and time: the brief as compass's state reads now. */
-export const briefOf = (o: {
-  map: CompassMap | null
-  grill: CompassGrillQ[]
-  steers: { text: string }[]
-  userTasks: { text: string }[]
-  actions: CompassAction[]
-  confirm: string | null
-  round?: number
-  doing?: { now: string; next: string } | null
-}): Omit<CompassBrief, 'rev' | 'at'> => {
-  const { milestone, step, upcoming } = locate(o.map)
-  const front = frontierOf(o.grill)
-  const alt = o.map?.alt
-  const fork = alt && o.map?.altPick ? (o.map.altPick === 'branch' ? `took the branch: ${alt.label}` : `stays on the planned course, not: ${alt.label}`) : ''
-  return {
-    course: { goal: o.map?.goal ?? '', milestone: milestone?.label ?? '', now: o.doing?.now || step?.label || '', next: (o.doing ? o.doing.next || upcoming : upcoming) ?? '' },
-    steers: o.steers.slice(-6).map(x => x.text),
-    blocking: front.ask.filter(q => q.blocking).map(qRef),
-    open: [...front.ask.filter(q => !q.blocking), ...front.waiting].map(qRef),
-    parked: front.parked.map(qRef),
-    userTasks: boardOf(o.map, o.userTasks.map((u, i) => ({ id: `${i}`, text: u.text }))).now.filter(t => t.isQueued).map(t => t.text),
-    fork,
-    outbox: o.actions.filter(a => a.status === 'queued').map(a => `${a.route || 'queued'}: ${a.label}`),
-    confirm: o.confirm ?? '',
-    extra: extraOf(o.map, o.actions, o.round ?? 1),
-  }
-}
-
-/**
- * What compass holds for this session beyond the fixed fields, from its own state: a branch on
- * screen the user has not picked, outbox items that failed to reach the session, forks already
- * decided, the next grill round. A key is present only while it has something to say.
- */
-export const extraOf = (map: CompassMap | null, actions: CompassAction[], round: number): Record<string, string> => {
-  const out: Record<string, string> = {}
-  const alt = map?.alt
-  if (alt && !map?.altPick) out['fork offered'] = `the user sees a branch "${alt.label}" (${alt.steps.join(' → ')}) and has not picked; stay on the plan until they do`
-  const failed = actions.filter(a => a.status === 'rejected').slice(-3)
-  if (failed.length) out.rejected = `these did not reach you: ${failed.map(a => `${a.label}${a.reason ? ` (${a.reason})` : ''}`).join('; ')}`
-  if (map?.declined?.length) out['declined forks'] = `do not propose these again: ${[...new Set(map.declined)].slice(-4).join('; ')}`
-  if (round > 1) out['grill round'] = `the next answers arrive as round ${round}`
-  return out
-}
-
-/**
- * The brief's actionable content, for "did it change": rev, time and the course left out. The course
- * is compass's own reading of the session's work, which the session already knows: a change to it
- * alone does not move the rev, so it never rides a tool result. Prompts and compass turns carry it.
- */
-export const briefSig = (b: Omit<CompassBrief, 'rev' | 'at'> | CompassBrief) => {
-  const { rev: _r, at: _a, course: _c, ...rest } = b as CompassBrief
-  void _r
-  void _a
-  void _c
-  return JSON.stringify(rest)
-}
-
-/**
- * The brief as the session reads it, compact: a field with content gets its own line, the empty ones
- * are named together on one "none:" line, so every field is still named. What each label means is
- * in CONTRACT_GUIDE (the system prompt), not repeated in every brief.
- */
-const QUESTION_FIELDS = new Set(['BLOCKING', 'open', 'parked'])
-
-export const briefText = (b: CompassBrief) => {
-  const c = b.course
-  const extra = Object.entries(b.extra).map(([k, v]) => `${k}: ${v}`)
-  const fields: [string, string[]][] = [
-    ['steering', b.steers],
-    ['BLOCKING', b.blocking],
-    ['open', b.open],
-    ['parked', b.parked],
-    ['user tasks', b.userTasks],
-    ['fork', b.fork ? [b.fork] : []],
-    ['outbox', b.outbox],
-    ['confirm', b.confirm ? [b.confirm] : []],
-    ['extra', extra],
-  ]
-  const full = fields.filter(([, xs]) => xs.length)
-  const empty = fields.filter(([, xs]) => !xs.length).map(([k]) => k)
-  return [
-    `🧭 [compass brief · rev ${b.rev}]`,
-    `- course: ${c.goal ? `goal "${c.goal}" · ` : ''}milestone "${c.milestone || '?'}" · now "${c.now || '?'}" · next "${c.next || '?'}"`,
-    // questions always as a list, so each one reads on its own line; any other single entry inline
-    ...full.map(([k, xs]) => (xs.length === 1 && !QUESTION_FIELDS.has(k) ? `- ${k}: ${xs[0]}` : `- ${k}:${xs.map(x => `\n  - ${x}`).join('')}`)),
-    ...(empty.length ? [`- none: ${empty.join(', ')}`] : []),
-  ].join('\n')
-}
-
-/** The report as a model prompt reads it: what the session holds as of its latest step. */
-export const reportLines = (r: CompassReport) =>
-  [
-    `Session report (rev ${r.rev}, after ${r.event}; ${r.turns} turns done; ${r.isBusy ? 'Claude is working' : 'Claude is idle'}):`,
-    r.request ? `- the user's latest request: ${JSON.stringify(clip(r.request, 1500))}` : '',
-    r.todos.length ? `- agent TodoWrite list (ground truth for task status): ${JSON.stringify(r.todos.map(t => `${t.status}: ${t.text}`))}` : '',
-    r.btw.length ? `- user /btw side questions this session (kind aside): ${JSON.stringify(r.btw)}` : '',
-    r.inbox.length ? `- messages received from other agents/sessions (sender: text): ${JSON.stringify(r.inbox)}` : '',
-    r.blockedOn.length ? `- the session stopped work that waits on blocking questions: ${JSON.stringify(r.blockedOn)}` : '',
-    Object.keys(r.extra).length ? `- the session's own notes for compass (this workflow only): ${JSON.stringify(r.extra)}` : '',
-  ]
-    .filter(Boolean)
-    .join('\n')
-
-/** The contract in the system prompt: fixed text, so the prompt cache holds. */
-const CONTRACT_GUIDE = `# Compass brief and report
-Compass keeps a contract with this session. With each user prompt, compass turn, steer and grill answer you get a "🧭 [compass brief · rev N]": the course as compass charts it, the steering in force, the questions work waits on, open and parked questions, user tasks not yet on your list, the fork the user decided, what is still in the outbox, a pending confirmation, and more that only this session needs (a branch on offer, sends that failed, forks already decided). The newest brief replaces any earlier one; no brief means the last one still holds. While you work, a brief that changed also arrives with a tool result. Act on it; do not repeat it back, and do not mention the brief, its rev or compass acknowledgements to the user.
-Brief labels: steering = the user's steers in force, newest last · BLOCKING = questions work waits on: stop all work that depends on them, do other work only if it does not, if nothing is left end your turn; a message releases each one · open = go on with the recommendation · parked = go on with the recommendation, do not ask again now · user tasks = user tasks not yet on your list · fork = the fork the user decided · outbox = still in the outbox, on its way to you · confirm = a confirmation you asked for, not given yet · extra = more from compass for this session · none = the fields that are empty now.
-Compass reads your side from the session itself: your requests, tool calls, TodoWrite list and words. To give compass facts that only this session's workflow needs (a target, a constraint, an external id), pass them as notes (key → short text) to ${GRILL_TOOL}; questions may be left out.`
-
-const mapPrompt = (
-  prev: CompassMap | null,
-  report: CompassReport,
-  userTasks: string[],
-  steers: string[],
-  grill: CompassGrillQ[],
-) =>
-  [
-    'You are COMPASS, a silent observer of this session. Do NOT continue the task, call tools, or address the user.',
-    "This request is compass's own, not part of the session: the session never sees it. The session's instructions about the compass grill tool and the compass brief are for the session, not for you. Never call a tool (every tool is refused here); put questions in the JSON's \"grill\".",
-    'Reply with ONLY one minified JSON object (no prose, no fence). Be terse: the whole reply must stay under 2500 characters.',
-    STE,
-    '{"goal":s,"milestones":[{"id":s,"label":s,"state":"done|active|pending|abandoned","why":s,"steps":[{"id":s,"label":s,"kind":"step|attempt|decision|aside","state":"done|active|pending|abandoned|blocked","why":s}]}],"tasks":[{"id":s,"text":s,"lane":"now|next|later|done","by":"agent|user","from":s}],"recap":[s],"moot":[s],"alt":{"label":s,"why":s,"steps":[s]}|null,"grill":[{"id":s,"title":s,"body":s,"options":[s],"recommendation":s,"dependsOn":[s],"from":s,"blocking":b}]}',
-    'Model = version tree + phase chunking:',
-    '- goal: the session goal, ≤6 words.',
-    '- milestones: 3-7 phases in order — done ones, exactly ONE active, then planned pending ones. abandoned = a dropped phase (why = reason ≤6 words).',
-    '- steps (per milestone, chronological): ≤5 per done milestone (merge small ones). The active milestone holds exactly one step with state active (or blocked when waiting on the user), then planned pending steps.',
-    '  kind step = committed work; attempt = exploratory try (done = adopted, abandoned = dead end, why = reason); decision = a choice that was made (why = rationale ≤8 words); aside = a /btw side question the user asked, placed where it was asked.',
-    '- every label ≤5 words, verb first, no punctuation. why ≤8 words or "".',
-    '- tasks: the running task list. KEEP every previous task id; move finished work to done; add newly revealed work; lane now ≤3, next ≤5, later = deferred ideas/backlog/follow-ups. User-added tasks keep by "user" and go to now unless finished.',
-    '- recap: 3-6 bullets, ≤18 words each, what happened and where things stand.',
-    '- alt: when the last turns show the work could go another way (a different goal, requirement or approach the user hinted at or the agent raised), the single most plausible OTHER trajectory from now: label ≤5 words, why ≤10 words (what it trades off), steps 2-4 labels ≤5 words, verb first. The main trajectory is the active milestone\'s pending steps. Otherwise null.',
-    '- from: when a task or grill question originated in another agent\'s or session\'s message, that sender\'s name; else "".',
-    '- grill: decision or steering points the user should decide or know about that are NOT already in the grill list below: open choices, new goals or ideas raised, trade-offs, implications and second-order effects down the road. Frontier only (nothing that depends on an unanswered question). ≤3, each with a recommendation and blocking (true only when work is waiting on the answer). Usually [] when nothing new came up.',
-    '- moot: ids from the grill list below that the conversation has since settled or made irrelevant (else []).',
-    '- steps that wait on an open blocking grill question: state blocked, why "waiting on Q<n>".',
-    prev ? `Previous map — keep ids stable: ${JSON.stringify({ m: prev.milestones.map(m => [m.id, m.label, m.state]), t: prev.tasks.map(t => [t.id, t.text, t.lane, t.by]) })}` : '',
-    reportLines(report),
-    userTasks.length ? `User-added tasks (by "user"): ${JSON.stringify(userTasks)}` : '',
-    steers.length ? `User steering directives, newest last — reflect them in pending steps: ${JSON.stringify(steers)}` : '',
-    prev?.declined?.length
-      ? `Forks the user already decided (both the chosen and the other side): never offer these, or their reverse, as alt again, even while the work waits on an event or a decision: ${JSON.stringify(prev.declined)}`
-      : '',
-    grill.length ? `Grill list already tracked (do not repeat; [id, Q number, title, state, blocking]): ${JSON.stringify(grill.map(q => [q.id, q.n, q.title, q.state, !!q.blocking]))}` : '',
-  ]
-    .filter(Boolean)
-    .join('\n')
 
 // ── shared actions (top level: $ is passed only to functions declared here) ──
 
@@ -1363,14 +457,19 @@ async function addBtw($: EngineInterface, text: string) {
   if (t) await update($, btwA, list => (list.includes(t) ? list : [...list, t].slice(-30)))
 }
 
-async function countOwn($: EngineInterface, reply: ModelForkResult) {
+/** What a compass model call was for, as the stats tab counts it. */
+export type OwnKind = 'chart' | 'digest' | 'request' | 'check' | 'turn' | 'reconcile' | 'summary'
+
+async function countOwn($: EngineInterface, reply: ModelForkResult, kind: OwnKind) {
   if (!('usage' in reply)) return
   const u = reply.usage
   await update($, statsA, s => {
     const own = s.own ?? EMPTY_STATS.own
+    const k = own.byKind?.[kind] ?? { calls: 0, tokens: 0 }
     return {
       ...s,
       own: {
+        byKind: { ...own.byKind, [kind]: { calls: k.calls + 1, tokens: k.tokens + u.input_tokens + u.output_tokens + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) } },
         calls: own.calls + 1,
         input: own.input + u.input_tokens,
         output: own.output + u.output_tokens,
@@ -1450,7 +549,7 @@ async function reconcile($: EngineInterface) {
       acts.length ? `The user's pane actions since this chart: ${JSON.stringify(acts)}` : '',
     ].filter(Boolean).join('\n')
     const reply = await $.model.complete({ model: 'haiku', system: 'You are COMPASS. Reply with ONLY one minified JSON object, no prose.', prompt, maxTokens: 2500, effort: 'low' })
-    await countOwn($, reply)
+    await countOwn($, reply, 'reconcile')
     if (!reply.isAnswered || epoch !== chartEpoch || courseAt > startedAt) return
     const map = parseMap(reply.text, await $.clock.now())
     if (!map || !map.milestones.length) return
@@ -1512,7 +611,7 @@ async function quickChart($: EngineInterface, why: 'request' | 'pulse' | 'turn',
         ]
     ).filter(Boolean).join('\n')
     const reply = await $.model.complete({ model: 'haiku', system: 'You are COMPASS. Reply with ONLY one minified JSON object, no prose.', prompt, maxTokens: 2500, effort: 'low' })
-    await countOwn($, reply)
+    await countOwn($, reply, why === 'pulse' ? 'check' : why)
     // a chart that started after this one already landed: it saw more, it counts
     if (!reply.isAnswered || landedFrom > startedAt || courseAt > startedAt) return
     if (why !== 'request' && /^\s*\{\s*"same"\s*:\s*true\s*\}\s*$/.test(reply.text)) {
@@ -1584,12 +683,12 @@ async function refresh($: EngineInterface) {
         })
       }
     }
-    await countOwn($, reply)
+    await countOwn($, reply, isQuick ? 'digest' : 'chart')
     let map = reply.isAnswered ? parseMap(reply.text, await $.clock.now()) : null
     if (reply.isAnswered && !map) {
       // one retry, asking for less: the usual cause is a reply cut short
       reply = await $.model.fork({ prompt: `${prompt}\nYour previous reply was not valid JSON. Reply again with ONLY the JSON object, at most 1500 characters.` })
-      await countOwn($, reply)
+      await countOwn($, reply, 'chart')
       map = reply.isAnswered ? parseMap(reply.text, await $.clock.now()) : null
     }
     if (!reply.isAnswered) {
@@ -1625,8 +724,11 @@ async function refresh($: EngineInterface) {
     // the chart's own suggestions: not from the quick first chart (it saw no conversation), not
     // when Claude posted questions while this chart was being made (it could not see them), and
     // never one that repeats a question already there
-    const postedMeanwhile = (await read($, grillA)).some(q => q.source === 'agent' && q.at >= chartStartedAt)
-    if (inferred.length && !isQuick && !postedMeanwhile) {
+    // nor while Claude has questions of its own open: compass holds back, so the two never clash
+    const grillNow = await read($, grillA)
+    const postedMeanwhile = grillNow.some(q => q.source === 'agent' && q.at >= chartStartedAt)
+    const agentAsks = grillNow.some(q => q.source === 'agent' && (q.state === 'open' || q.state === 'followup'))
+    if (inferred.length && !isQuick && !postedMeanwhile && !agentAsks) {
       const at = await $.clock.now()
       await update($, grillA, list => mergeGrill(list, inferred, charted.goal, 'map', at))
     }
@@ -1730,21 +832,6 @@ export const moveIn = (list: CompassAction[], id: string, dir: -1 | 1) => {
 async function moveAction($: EngineInterface, id: string, dir: -1 | 1) {
   await update($, actionsA, list => moveIn(list, id, dir))
 }
-
-const words = (t: string) => new Set(t.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(w => w.length > 2))
-
-/** Whether two ways read as the same one: most of their words in common. */
-export const isSameWay = (a: string, b: string) => {
-  const x = words(a)
-  const y = words(b)
-  if (!x.size || !y.size) return a.trim().toLowerCase() === b.trim().toLowerCase()
-  const shared = [...x].filter(w => y.has(w)).length
-  return shared / Math.min(x.size, y.size) >= 0.6
-}
-
-/** A new branch that repeats a fork the user already decided (either side of it) is no branch. */
-export const isDecided = (alt: CompassAlt, decided: string[]) =>
-  decided.some(d => isSameWay(alt.label, d) || isSameWay(alt.steps.join(' '), d))
 
 /** At a fork: stay on the planned path (a quiet note) or take the branch (a steer, redrawn at once). */
 async function pickTrajectory($: EngineInterface, way: 'main' | 'branch') {
@@ -1993,7 +1080,7 @@ async function gistOf($: EngineInterface, peer: string, at: number, text: string
       maxTokens: 120,
       effort: 'low',
     })
-    await countOwn($, reply)
+    await countOwn($, reply, 'summary')
     const gist = reply.isAnswered ? clip(plain(reply.text).replace(/^["'“]+|["'”]+$/g, ''), 160) : ''
     if (gist) await update($, chatA, list => list.map(m => (m.peer === peer && m.at === at && m.dir === 'in' ? { ...m, gist } : m)))
   } catch {
@@ -2108,6 +1195,13 @@ async function answerGrill($: EngineInterface, id: string, text: string) {
 
 function editMap($: EngineInterface, fn: (m: CompassMap) => CompassMap) {
   return update($, mapA, m => (m && isCurrent(m) ? fn(m) : m))
+}
+
+/** Switches the pane's tab, counting each visit for the stats tab (kept on this machine only). */
+async function openTab($: EngineInterface, tab: CompassTab) {
+  if ((await read($, tabA)) === tab) return
+  await update($, tabA, () => tab)
+  await update($, statsA, s => ({ ...s, tabs: { ...s.tabs, [tab]: (s.tabs?.[tab] ?? 0) + 1 } }))
 }
 
 function toggleIn($: EngineInterface, key: string) {
@@ -2787,7 +1881,7 @@ export const register: Register = on => {
           </Box>
           <Box flexShrink={0} columnGap={1}>
             {pillBtn('legend', '? key', isOpen('legend') ? 'cyan' : 'dim', async () => {
-              await update($, tabA, () => 'flow')
+              await openTab($, 'flow')
               await toggleIn($, 'legend')
             }, isOpen('legend'))}
             <Button key="close" plain dimColor label="✕" role="dismiss" onPress={() => void togglePane($)} />
@@ -2799,7 +1893,7 @@ export const register: Register = on => {
             const count = t.id === 'grill' ? front.ask.length : t.id === 'chat' ? unreadAll : 0
             return (
               <Box key={`tabbox:${t.id}`} marginRight={1}>
-                {pillBtn(`tab:${t.id}`, `${t.icon} ${t.label}`, isOn ? 'blue' : 'dim', () => update($, tabA, () => t.id), isOn)}
+                {pillBtn(`tab:${t.id}`, `${t.icon} ${t.label}`, isOn ? 'blue' : 'dim', () => openTab($, t.id), isOn)}
                 {count > 0 ? pill(`tabn:${t.id}`, `${count}`, t.id === 'grill' ? 'yellow' : 'cyan', true) : null}
                 {t.id === 'chat' ? <Text color={isRemote ? TONE.green.fg : TONE.red.fg}>●</Text> : null}
               </Box>
@@ -2932,7 +2026,7 @@ export const register: Register = on => {
                 {`  ${state}`}
               </Text>
             </Box>
-            {onFlow && pillBtn('strip:open', '↯ live ▸', 'dim', () => update($, tabA, () => 'live'))}
+            {onFlow && pillBtn('strip:open', '↯ live ▸', 'dim', () => openTab($, 'live'))}
           </Box>
           {runningNow.slice(0, rows).map(p => pulseRow(p, `strip:${p.id}`))}
           {runningNow.length > rows ? <Text dimColor>{`  +${runningNow.length - rows} more running`}</Text> : null}
@@ -3130,7 +2224,7 @@ export const register: Register = on => {
             if (!live.length && !answered.length && !front.parked.length) return null
             const open = (id: string) => async () => {
               await update($, selectedA, () => `g:${id}`)
-              await update($, tabA, () => 'grill')
+              await openTab($, 'grill')
             }
             const row = (key: string, glyph: string, tone: Tone, state: string, label: string, onPress: () => unknown) => {
               const w = wrapped(`fd:${key}`, label, width - glen(state) - 6, onPress, { indent: glen(state) + 4 })
@@ -3167,7 +2261,7 @@ export const register: Register = on => {
           {board.now.length > 0 && (
             <Box key="flow:t" flexDirection="column">
               {(() => {
-                const w = wrapped('flow:tbtn', `${board.now[0]!.from ? `⇄${board.now[0]!.from} ` : ''}${board.now[0]!.text}`, width - 9, () => update($, tabA, () => 'tasks'))
+                const w = wrapped('flow:tbtn', `${board.now[0]!.from ? `⇄${board.now[0]!.from} ` : ''}${board.now[0]!.text}`, width - 9, () => openTab($, 'tasks'))
                 return [
                   <Box key="flow:trow">
                     {pill('flow:tp', '▶ doing', 'cyan', true)}
@@ -3571,7 +2665,9 @@ export const register: Register = on => {
               </Text>
             </Box>
             <Box columnGap={1} flexShrink={0}>
-              <Text dimColor>{q.mode}</Text>
+              <Text key={`gsrc:${q.id}`} color={q.source === 'map' ? GOLD : undefined} dimColor={q.source !== 'map'}>
+                {q.source === 'map' ? '◈ compass' : 'Claude'} · {q.mode}
+              </Text>
               {pillBtn(`gpark:${q.id}`, '⏸ park', 'dim', () => parkGrill($, q.id))}
               <Button key={`gdrop:${q.id}`} plain dimColor label="✕" onPress={() => void dismissGrill($, q.id)} />
             </Box>
@@ -3867,6 +2963,16 @@ export const register: Register = on => {
             <Text dimColor wrap="wrap">
               {own.calls ? `≈ ${Math.round((own.cacheRead / Math.max(1, own.input + own.cacheRead + own.cacheWrite)) * 100)}% served from cache` : 'no map calls yet'}
             </Text>
+            {own.byKind && Object.keys(own.byKind).length ? (
+              <Text key="own-kinds" dimColor wrap="wrap">
+                by kind: {Object.entries(own.byKind).sort((a, b) => b[1].tokens - a[1].tokens).map(([k, v]) => `${k} ${v.calls}× ${kfmt(v.tokens)}`).join(' · ')}
+              </Text>
+            ) : null}
+            {stats.tabs && Object.keys(stats.tabs).length ? (
+              <Text key="tab-visits" dimColor wrap="wrap">
+                tabs opened: {Object.entries(stats.tabs).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k} ${n}`).join(' · ')}
+              </Text>
+            ) : null}
             <Text key="contract" dimColor wrap="wrap">
               ⇄ contract: ◂ report r{contract.report.rev} ({contract.report.event}) · ▸ brief r{contract.brief.rev} · session has r{contract.sent}
               {Object.keys(contract.report.extra ?? {}).length + Object.keys(contract.brief.extra ?? {}).length ? ` · notes ${Object.keys(contract.report.extra ?? {}).length}◂ ${Object.keys(contract.brief.extra ?? {}).length}▸` : ''}

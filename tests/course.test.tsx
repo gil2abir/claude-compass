@@ -263,3 +263,60 @@ test('the chart fork cannot post grill questions: its tool call is refused while
   expect(await ui.find({ text: /Chart prompt leak/ })).toBeUndefined()
   await ui.unmount()
 })
+
+test('the stats tab counts compass model calls by kind and tab visits, on this machine', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  base(on)
+  on('model.fork', () => ({ value: { isAnswered: true, text: JSON.stringify(MAP), usage } }) as never)
+  on('model.complete', () => ({ value: { isAnswered: true, text: '{"same":true}', usage } }) as never)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  await $.turn.start({ text: 'build v2', turnId: 't1' } as never)
+  await clock.advance(5000)
+  await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+  await clock.advance(2000)
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  await tap(ui, 'tab:live')
+  await tap(ui, 'tab:grill')
+  await tap(ui, 'tab:stats')
+  const kinds = JSON.stringify(await ui.find({ text: /by kind:/ }))
+  expect(kinds).toMatch(/chart 2×/)
+  expect(kinds).toMatch(/turn 1×/)
+  const tabs = JSON.stringify(await ui.find({ text: /tabs opened:/ }))
+  expect(tabs).toMatch(/live 1/)
+  expect(tabs).toMatch(/stats 1/)
+  await ui.unmount()
+})
+
+test("compass marks its own questions, and holds them back while Claude's questions are open", async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  base(on)
+  const asked = { ...MAP, grill: [{ id: 'cache', title: 'Keep the cache warm', body: 'Warm it at start?', options: ['yes', 'no'], recommendation: 'yes' }] }
+  on('model.fork', () => ({ value: { isAnswered: true, text: JSON.stringify(asked), usage } }) as never)
+  on('model.complete', () => ({ value: { isAnswered: true, text: '{"same":true}', usage } }) as never)
+  let context: readonly string[] = []
+  on('prompt.submit', (_$, e) => {
+    context = (e as { context?: readonly string[] }).context ?? []
+    return { text: e.text } as never
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  // Claude has a question open: the chart's own question waits
+  await $.tool.call({ tool: 'mcp__compass__grill', questions: [{ id: 'db', title: 'Pick the database', body: 'Which?', recommendation: 'sqlite' }] } as never)
+  await $.turn.start({ text: 'build v2', turnId: 't1' } as never)
+  await clock.advance(5000)
+  await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+  await clock.advance(2000)
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  await tap(ui, 'tab:grill')
+  expect(await ui.find({ text: /Keep the cache warm/ })).toBeUndefined()
+  // Claude's question is settled: the next chart may ask, marked as compass's
+  await tap(ui, 'gdrop:db')
+  await $.turn.start({ text: 'go on', turnId: 't2' } as never)
+  await clock.advance(5000)
+  await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't2', reason: 'answer' } as never)
+  await clock.advance(2000)
+  expect(await ui.find({ text: /Keep the cache warm/ })).toBeDefined()
+  expect(await ui.find({ text: /◈ compass · work/ })).toBeDefined()
+  await $.prompt.submit({ text: 'next' } as never)
+  expect(context.join('\n')).toMatch(/Keep the cache warm → recommended: yes \[asked by compass\]/)
+  await ui.unmount()
+})

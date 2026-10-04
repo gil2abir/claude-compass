@@ -129,7 +129,17 @@ export type CompassStats = {
   /** the account's usage windows (5h, 7d): percent used and when each resets */
   limits?: { kind: string; pct: number; resetsAt: string }[]
   /** compass's own map-making model calls, apart from the session's work */
-  own: { calls: number; input: number; output: number; cacheRead: number; cacheWrite: number }
+  own: {
+    calls: number
+    input: number
+    output: number
+    cacheRead: number
+    cacheWrite: number
+    /** the same calls by what they were for (chart, check, request, turn, reconcile, digest, summary): calls and all tokens */
+    byKind?: Record<string, { calls: number; tokens: number }>
+  }
+  /** how often each pane tab was opened, kept on this machine only */
+  tabs?: Record<string, number>
 }
 
 /**
