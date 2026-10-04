@@ -7,11 +7,14 @@ import type {
   CompassChatMsg,
   CompassPeer,
   CompassAgentTodo,
+  CompassBrief,
+  CompassEvent,
   CompassGrillQ,
   CompassLane,
   CompassMap,
   CompassMilestone,
   CompassPulse,
+  CompassReport,
   CompassState,
   CompassStats,
   CompassStep,
@@ -274,6 +277,11 @@ const refreshingA = atom({ plugin: 'compass', key: 'isRefreshing' } as const, fa
 const busyA = atom({ plugin: 'compass', key: 'isBusy' } as const, false)
 const errorA = atom({ plugin: 'compass', key: 'lastError' } as const, null)
 const liveA = atom({ plugin: 'compass', key: 'live' } as const, [])
+export const EMPTY_REPORT: CompassReport = { rev: 0, event: 'session.start', at: 0, turns: 0, isBusy: false, request: '', reply: '', calls: [], todos: [], inbox: [], btw: [], posted: [], blockedOn: [], extra: {} }
+export const EMPTY_BRIEF: CompassBrief = { rev: 0, at: 0, course: { goal: '', milestone: '', now: '', next: '' }, steers: [], blocking: [], open: [], parked: [], userTasks: [], fork: '', outbox: [], confirm: '', extra: {} }
+const reportA = atom({ plugin: 'compass', key: 'report' } as const, EMPTY_REPORT)
+const briefA = atom({ plugin: 'compass', key: 'brief' } as const, EMPTY_BRIEF)
+const briefSentA = atom({ plugin: 'compass', key: 'briefSent' } as const, 0)
 const LIVE_KEEP = 200
 
 // Text-presentation symbols only (no emoji), one per tab subject.
@@ -802,7 +810,7 @@ export const roundMessage = (round: number, handled: CompassGrillQ[]) =>
     ...handled.map(q =>
       q.state === 'followup'
         ? `❓ Q${q.n} (${q.id}) ${q.title} → FOLLOW-UP from the user: "${q.followups[q.followups.length - 1] ?? ''}". Keep it open: answer the follow-up, then re-ask it with ${GRILL_TOOL} (same id) with a clarified body.`
-        : `❓ Q${q.n} (${q.id}) ${q.title} → ${q.answer}`,
+        : `❓ Q${q.n} (${q.id}) ${q.title} → ${q.answer}${q.blocking ? ' · RELEASED: this was blocking; continue the work that waited on it.' : ''}`,
     ),
     'These settle the decisions above. Recompute the frontier and post the next round with the grill tool, or askConfirm when the frontier is empty. Look facts up yourself; do not act on a plan before the user confirms.',
   ].join('\n')
@@ -830,18 +838,135 @@ The user answers your questions in the compass pane's grill tab while you work. 
 - A follow-up keeps its question open: answer it, then re-ask the question with the same id and a clarified body.
 - When the frontier is empty, call the tool with askConfirm; do not act on a plan until the user confirms the shared understanding.
 - Mark each question blocking: true only when work truly waits on it; otherwise blocking: false and keep working on your recommendation, ready to adjust when the answer comes.
+- Blocking is a handshake: compass acknowledges each blocking question ("ACK BLOCKING"). Then stop all work that depends on it; if nothing else is left, end your turn. Continue only after compass releases it ("RELEASED": an answer, a park or a dismissal), which reaches you at once. "BLOCKING again" means it holds once more.
 - Keep checking as the work moves: new goals, ideas, trade-offs, or second-order effects down the road that the user should decide or know about are new questions.
 - The user answers what they want, when they want, in any order. A parked question means: do not wait for it and do not ask again now; proceed with your recommendation and keep it open. A dismissed question is dropped.
 - Write each title, body, option and recommendation in ASD-STE100 Simplified Technical English: short active sentences (max 20 words), common words with one meaning, titles of at most 5 words; keep names, paths and commands exact.`
 
+
+// ── the contract: each side passes the other a fixed object, rebuilt whole at every step ──
+//
+// session → compass (CompassReport): what compass needs to chart the session. Rebuilt from the
+// session's own signals at every lifecycle event, and again whenever a model prompt reads it.
+// compass → session (CompassBrief): what the session needs from compass until the next step.
+// Refreshed whenever it is read; its rev moves only when its content does, and the session gets
+// it whole with each prompt, compass turn, steer and grill answer while it changed. `extra` on
+// each side carries what only this session's workflow needs.
+
+const EXTRA_KEYS = 12
+
+/** Merges notes into an extra map: an empty text drops its key; keys and texts are kept short. */
+export const mergeExtra = (extra: Record<string, string>, notes: unknown): Record<string, string> => {
+  if (!notes || typeof notes !== 'object' || Array.isArray(notes)) return extra
+  const out = { ...extra }
+  for (const [k, v] of Object.entries(notes as Record<string, unknown>)) {
+    const key = clip(plain(k), 24)
+    if (!key) continue
+    const text = typeof v === 'string' ? clip(plain(v), 300) : ''
+    if (text) out[key] = text
+    else delete out[key]
+  }
+  return Object.fromEntries(Object.entries(out).slice(-EXTRA_KEYS))
+}
+
+const qRef = (q: CompassGrillQ) => `Q${q.n} (${q.id}) ${q.title}${q.rec ? ` → recommended: ${q.rec}` : ''}`
+
+/** compass → session, without rev and time: the brief as compass's state reads now. */
+export const briefOf = (o: {
+  map: CompassMap | null
+  grill: CompassGrillQ[]
+  steers: { text: string }[]
+  userTasks: { text: string }[]
+  actions: CompassAction[]
+  confirm: string | null
+  round?: number
+}): Omit<CompassBrief, 'rev' | 'at'> => {
+  const { milestone, step, upcoming } = locate(o.map)
+  const front = frontierOf(o.grill)
+  const alt = o.map?.alt
+  const fork = alt && o.map?.altPick ? (o.map.altPick === 'branch' ? `took the branch: ${alt.label}` : `stays on the planned course, not: ${alt.label}`) : ''
+  return {
+    course: { goal: o.map?.goal ?? '', milestone: milestone?.label ?? '', now: step?.label ?? '', next: upcoming ?? '' },
+    steers: o.steers.slice(-6).map(x => x.text),
+    blocking: front.ask.filter(q => q.blocking).map(qRef),
+    open: [...front.ask.filter(q => !q.blocking), ...front.waiting].map(qRef),
+    parked: front.parked.map(qRef),
+    userTasks: boardOf(o.map, o.userTasks.map((u, i) => ({ id: `${i}`, text: u.text }))).now.filter(t => t.isQueued).map(t => t.text),
+    fork,
+    outbox: o.actions.filter(a => a.status === 'queued').map(a => `${a.route || 'queued'}: ${a.label}`),
+    confirm: o.confirm ?? '',
+    extra: extraOf(o.map, o.actions, o.round ?? 1),
+  }
+}
+
+/**
+ * What compass holds for this session beyond the fixed fields, from its own state: a branch on
+ * screen the user has not picked, outbox items that failed to reach the session, forks already
+ * decided, the next grill round. A key is present only while it has something to say.
+ */
+export const extraOf = (map: CompassMap | null, actions: CompassAction[], round: number): Record<string, string> => {
+  const out: Record<string, string> = {}
+  const alt = map?.alt
+  if (alt && !map?.altPick) out['fork offered'] = `the user sees a branch "${alt.label}" (${alt.steps.join(' → ')}) and has not picked; stay on the plan until they do`
+  const failed = actions.filter(a => a.status === 'rejected').slice(-3)
+  if (failed.length) out.rejected = `these did not reach you: ${failed.map(a => `${a.label}${a.reason ? ` (${a.reason})` : ''}`).join('; ')}`
+  if (map?.declined?.length) out['declined forks'] = `do not propose these again: ${[...new Set(map.declined)].slice(-4).join('; ')}`
+  if (round > 1) out['grill round'] = `the next answers arrive as round ${round}`
+  return out
+}
+
+/** The brief's content, for "did it change": rev and time left out. */
+export const briefSig = (b: Omit<CompassBrief, 'rev' | 'at'> | CompassBrief) => {
+  const { rev: _r, at: _a, ...rest } = b as CompassBrief
+  void _r
+  void _a
+  return JSON.stringify(rest)
+}
+
+/** The brief as the session reads it: every field named, an empty one said so. */
+export const briefText = (b: CompassBrief) => {
+  const list = (xs: string[]) => (xs.length ? xs.map(x => `\n  - ${x}`).join('') : ' none')
+  const c = b.course
+  return [
+    `🧭 [compass brief · rev ${b.rev}] What compass holds for this session now; it replaces any earlier brief.`,
+    `- course: ${c.goal ? `goal "${c.goal}" · ` : ''}milestone "${c.milestone || '?'}" · now "${c.now || '?'}" · next "${c.next || '?'}"`,
+    `- steering in force, newest last:${list(b.steers)}`,
+    `- BLOCKING questions: stop all work that depends on them; do other work only if it does not; if nothing is left, end your turn. Their answers come back as a message that releases them:${list(b.blocking)}`,
+    `- open questions, go on with the recommendation:${list(b.open)}`,
+    `- parked, go on with the recommendation, do not ask again now:${list(b.parked)}`,
+    `- user tasks not yet on your list:${list(b.userTasks)}`,
+    `- fork decided by the user: ${b.fork || 'none'}`,
+    `- still in the outbox, on its way to you:${list(b.outbox)}`,
+    `- confirmation you asked for, not given yet: ${b.confirm || 'none'}`,
+    `- more from compass for this session:${list(Object.entries(b.extra).map(([k, v]) => `${k}: ${v}`))}`,
+  ].join('\n')
+}
+
+/** The report as a model prompt reads it: what the session holds as of its latest step. */
+export const reportLines = (r: CompassReport) =>
+  [
+    `Session report (rev ${r.rev}, after ${r.event}; ${r.turns} turns done; ${r.isBusy ? 'Claude is working' : 'Claude is idle'}):`,
+    r.request ? `- the user's latest request: ${JSON.stringify(clip(r.request, 1500))}` : '',
+    r.todos.length ? `- agent TodoWrite list (ground truth for task status): ${JSON.stringify(r.todos.map(t => `${t.status}: ${t.text}`))}` : '',
+    r.btw.length ? `- user /btw side questions this session (kind aside): ${JSON.stringify(r.btw)}` : '',
+    r.inbox.length ? `- messages received from other agents/sessions (sender: text): ${JSON.stringify(r.inbox)}` : '',
+    r.blockedOn.length ? `- the session stopped work that waits on blocking questions: ${JSON.stringify(r.blockedOn)}` : '',
+    Object.keys(r.extra).length ? `- the session's own notes for compass (this workflow only): ${JSON.stringify(r.extra)}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
+
+/** The contract in the system prompt: fixed text, so the prompt cache holds. */
+const CONTRACT_GUIDE = `# Compass brief and report
+Compass keeps a contract with this session. With each user prompt, compass turn, steer and grill answer you get a "🧭 [compass brief · rev N]": the course as compass charts it, the steering in force, the questions work waits on, open and parked questions, user tasks not yet on your list, the fork the user decided, what is still in the outbox, a pending confirmation, and more that only this session needs (a branch on offer, sends that failed, forks already decided). The newest brief replaces any earlier one; "unchanged" means the last one still holds. While you work, a brief that changed also arrives with a tool result. Act on it; do not repeat it back.
+Compass reads your side from the session itself: your requests, tool calls, TodoWrite list and words. To give compass facts that only this session's workflow needs (a target, a constraint, an external id), pass them as notes (key → short text) to ${GRILL_TOOL}; questions may be left out.`
+
 const mapPrompt = (
   prev: CompassMap | null,
-  todos: CompassAgentTodo[],
+  report: CompassReport,
   userTasks: string[],
   steers: string[],
-  btw: string[],
   grill: CompassGrillQ[],
-  inbox: CompassChatMsg[] = [],
 ) =>
   [
     'You are COMPASS, a silent observer of this session. Do NOT continue the task, call tools, or address the user.',
@@ -862,15 +987,13 @@ const mapPrompt = (
     '- moot: ids from the grill list below that the conversation has since settled or made irrelevant (else []).',
     '- steps that wait on an open blocking grill question: state blocked, why "waiting on Q<n>".',
     prev ? `Previous map — keep ids stable: ${JSON.stringify({ m: prev.milestones.map(m => [m.id, m.label, m.state]), t: prev.tasks.map(t => [t.id, t.text, t.lane, t.by]) })}` : '',
-    todos.length ? `Agent TodoWrite list (ground truth for task status): ${JSON.stringify(todos.map(t => `${t.status}: ${t.text}`))}` : '',
+    reportLines(report),
     userTasks.length ? `User-added tasks (by "user"): ${JSON.stringify(userTasks)}` : '',
     steers.length ? `User steering directives, newest last — reflect them in pending steps: ${JSON.stringify(steers)}` : '',
-    btw.length ? `User /btw side questions this session (kind aside): ${JSON.stringify(btw)}` : '',
     prev?.declined?.length
       ? `Forks the user already decided (both the chosen and the other side): never offer these, or their reverse, as alt again, even while the work waits on an event or a decision: ${JSON.stringify(prev.declined)}`
       : '',
     grill.length ? `Grill list already tracked (do not repeat; [id, Q number, title, state, blocking]): ${JSON.stringify(grill.map(q => [q.id, q.n, q.title, q.state, !!q.blocking]))}` : '',
-    inbox.length ? `Messages received from other agents/sessions (sender: text): ${JSON.stringify(inbox.slice(-8).map(m => `${m.peer}: ${m.text.slice(0, 160)}`))}` : '',
   ]
     .filter(Boolean)
     .join('\n')
@@ -907,6 +1030,68 @@ const MID_TURN_EVERY_MS = 180_000
 
 const wantRefresh = () => {
   isWanted = true
+}
+
+
+/** The latest words Claude wrote, from the transcript. */
+const latestReply = (messages: readonly { role: string; text: string }[]) =>
+  [...messages].reverse().find(m => m.role === 'assistant' && typeof m.text === 'string' && m.text.trim())?.text ?? ''
+
+/**
+ * session → compass. With an event: a lifecycle step, the rev moves and `patch` sets what only
+ * that step knows (the request, Claude's reply, the grill ids, the session's notes). Without one:
+ * a read, which rebuilds every fixed field from the session's signals as they are now.
+ */
+async function sessionReport($: EngineInterface, event?: CompassEvent, patch: Partial<Pick<CompassReport, 'request' | 'reply' | 'posted' | 'extra'>> = {}): Promise<CompassReport> {
+  const [prev, map, stats, isBusy, todos, chat, btw, live, grill] = await Promise.all([read($, reportA), read($, mapA), read($, statsA), read($, busyA), read($, agentTodosA), read($, chatA), read($, btwA), read($, liveA), read($, grillA)])
+  const since = isCurrent(map) ? Math.max(map.at, map.reconciledAt ?? 0, checkedAt) - 1000 : 0
+  const next: CompassReport = {
+    ...EMPTY_REPORT,
+    ...prev,
+    ...patch,
+    rev: prev.rev + (event ? 1 : 0),
+    event: event ?? prev.event,
+    at: event ? await $.clock.now() : prev.at,
+    turns: stats.turns,
+    isBusy,
+    calls: live
+      .filter(p => p.at >= since && p.status !== 'running')
+      .slice(-30)
+      .map(p => `${p.tool}${p.agent ? ' (subagent)' : ''} ${p.status === 'ok' || p.status === 'bgdone' ? 'ok' : p.status}: ${clip(p.what, 90)}`),
+    todos,
+    inbox: chat.filter(m => m.dir === 'in').slice(-8).map(m => `${m.peer}: ${clip(plain(m.text), 160)}`),
+    btw,
+    blockedOn: grill.filter(q => q.blocking && (q.state === 'open' || q.state === 'followup' || q.state === 'sent')).map(q => q.id),
+    extra: patch.extra ?? prev.extra ?? {},
+  }
+  // a plain read writes only when something moved, so the poller's rebuild costs no redraw
+  if (event || JSON.stringify({ ...next, at: 0 }) !== JSON.stringify({ ...prev, at: 0 })) await update($, reportA, () => next)
+  return next
+}
+
+/** compass → session: rebuilt from compass's state; the rev moves only when the content does. */
+async function compassBrief($: EngineInterface): Promise<CompassBrief> {
+  const [stored, grill, userTasks, actions, confirm, prev, round] = await Promise.all([read($, mapA), read($, grillA), read($, userTasksA), read($, actionsA), read($, grillConfirmA), read($, briefA), read($, grillRoundA)])
+  const body = briefOf({ map: isCurrent(stored) ? stored : null, grill, steers: await sentSteers($), userTasks, actions, confirm, round })
+  // rev 0 was never built: the first read always issues rev 1, so the session gets a whole brief first
+  if (prev.rev > 0 && briefSig(body) === briefSig(prev)) return prev
+  const next: CompassBrief = { ...body, rev: prev.rev + 1, at: await $.clock.now() }
+  await update($, briefA, () => next)
+  return next
+}
+
+/** What the session gets of the brief at a handoff: all of it while it changed, else one line. */
+async function briefFor($: EngineInterface): Promise<string> {
+  const b = await compassBrief($)
+  if (b.rev <= (await read($, briefSentA))) return `🧭 [compass brief · rev ${b.rev}] unchanged.`
+  await update($, briefSentA, () => b.rev)
+  return briefText(b)
+}
+
+/** The brief, only when it moved since the session last got it; '' otherwise. */
+async function briefIfChanged($: EngineInterface): Promise<string> {
+  const b = await compassBrief($)
+  return b.rev > (await read($, briefSentA)) ? briefFor($) : ''
 }
 
 /** A map from an older compass build counts as no map. */
@@ -991,12 +1176,15 @@ type Snap = {
   stats: CompassStats
   chat: CompassChatMsg[]
   actions: CompassAction[]
+  /** the contract's parts that are not rebuilt from the session: both sides' notes, the last request */
+  contract?: { request: string; reply: string; extra: Record<string, string> }
 }
 
 /** Saves the session's compass when something in it changed; cheap enough for the poller. */
 async function snapshot($: EngineInterface) {
   const map = await read($, mapA)
   if (!isCurrent(map)) return
+  const rep = await read($, reportA)
   const [grill, grillRound, grillConfirm, agentTodos, userTasks, steers, btw, stats, chat, actions] = await Promise.all([
     read($, grillA),
     read($, grillRoundA),
@@ -1009,7 +1197,7 @@ async function snapshot($: EngineInterface) {
     read($, chatA),
     read($, actionsA),
   ])
-  const sig = JSON.stringify([map.at, grill.map(q => q.state + q.id), grillRound, grillConfirm, userTasks.length, steers.length, btw.length, chat.length, actions.map(a => a.status), stats.turns, stats.refreshes])
+  const sig = JSON.stringify([map.at, grill.map(q => q.state + q.id), grillRound, grillConfirm, userTasks.length, steers.length, btw.length, chat.length, actions.map(a => a.status), stats.turns, stats.refreshes, rep.extra, rep.request])
   if (sig === lastSnapSig) return
   lastSnapSig = sig
   const id = await $.session.id()
@@ -1028,6 +1216,7 @@ async function snapshot($: EngineInterface) {
     stats,
     chat: chat.slice(-60),
     actions: actions.filter(a => a.status === 'queued' || Date.now() - a.at < 600_000).slice(-20),
+    contract: { request: rep.request, reply: clip(rep.reply, 1500), extra: rep.extra ?? {} },
   }
   try {
     await $.store.set(await snapKey($), { ...snap, sessionId: id })
@@ -1040,10 +1229,14 @@ async function snapshot($: EngineInterface) {
 }
 
 /** Runs the poller's periodic work; a failure waits for the next tick. */
-async function quietly($: EngineInterface, job: 'snapshot' | 'flush') {
+async function quietly($: EngineInterface, job: 'snapshot' | 'flush' | 'contract') {
   try {
     if (job === 'snapshot') await snapshot($)
-    else await flushOutbox($)
+    else if (job === 'contract') {
+      // both sides follow every chart, pane action and event, as the tabs do
+      await sessionReport($)
+      await compassBrief($)
+    } else await flushOutbox($)
   } catch {
     // the next tick tries again
   }
@@ -1080,6 +1273,10 @@ async function restore($: EngineInterface): Promise<Snap | null> {
   await update($, statsA, s => ({ ...EMPTY_STATS, ...snap.stats, own: snap.stats?.own ?? s.own ?? EMPTY_STATS.own }))
   await update($, chatA, () => snap.chat ?? [])
   await update($, actionsA, () => snap.actions ?? [])
+  const c = snap.contract
+  if (c) {
+    await update($, reportA, r => ({ ...r, request: c.request ?? '', reply: c.reply ?? '', extra: c.extra ?? {} }))
+  }
   chartedMessages = snap.messages ?? 0
   lastSnapSig = ''
   return snap
@@ -1206,17 +1403,14 @@ async function quickChart($: EngineInterface, why: 'request' | 'pulse' | 'turn',
   isQuickCharting = true
   quickWhat = why === 'request' ? 'charting your new message' : why === 'turn' ? 'catching up with the turn' : 'checking the course'
   const startedAt = Date.now()
-  const since = Math.max(stored.at, stored.reconciledAt ?? 0, checkedAt) - 1000
   await update($, tickA, n => n + 1)
   try {
-    const live = await read($, liveA)
-    pulseSeen = live.filter(p => p.status !== 'running').length
+    pulseSeen = (await read($, liveA)).filter(p => p.status !== 'running').length
     pulseAt = await $.clock.now()
-    const calls = live
-      .filter(p => p.at >= since && p.status !== 'running')
-      .slice(-30)
-      .map(p => `${p.tool}${p.agent ? ' (subagent)' : ''} ${p.status === 'ok' || p.status === 'bgdone' ? 'ok' : p.status}: ${clip(p.what, 90)}`)
-    const last = why === 'request' ? '' : [...(await $.session.messages())].reverse().find(m => m.role === 'assistant' && typeof m.text === 'string' && m.text.trim())?.text ?? ''
+    // the report holds the calls since the chart; a course check also brings Claude's latest words in
+    const r = why === 'request' ? await sessionReport($) : await sessionReport($, undefined, { reply: latestReply(await $.session.messages()) })
+    const calls = r.calls
+    const last = why === 'request' ? '' : r.reply
     const chart = `The chart: ${JSON.stringify({ goal: stored.goal, milestones: stored.milestones, tasks: stored.tasks, recap: stored.recap, alt: stored.alt ?? null })}`
     const shape = 'You are COMPASS. Reply with ONLY one minified JSON object in the same shape as the chart below (goal, milestones, tasks, recap, alt, moot).'
     const keep = `Keep every existing id; new ids are short and unique. Keep the goal unless the work changed it.\n${STE}`
@@ -1280,12 +1474,10 @@ async function refresh($: EngineInterface) {
     const stored = await read($, mapA)
     const prompt = mapPrompt(
       isCurrent(stored) ? stored : null,
-      await read($, agentTodosA),
+      await sessionReport($),
       (await read($, userTasksA)).map(u => u.text),
       (await sentSteers($)).slice(-6).map(s => s.text),
-      await read($, btwA),
       await read($, grillA),
-      (await read($, chatA)).filter(m => m.dir === 'in'),
     )
     const turnsAt = (await read($, statsA)).turns
     const chartStartedAt = await $.clock.now()
@@ -1377,7 +1569,7 @@ const patched = (id: string, patch: Partial<CompassAction>) => (list: CompassAct
 /** Writes into the running turn now; the model reads it at its next step. */
 async function appendNow($: EngineInterface, a: CompassAction) {
   try {
-    const r = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: a.text }] } })
+    const r = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: `${a.text}\n\n${await briefFor($)}` }] } })
     if ('deny' in r && r.deny) throw new Error(r.deny)
     const sentNow: Partial<CompassAction> = { status: 'sent', route: 'running turn', at: Date.now() }
     await update($, actionsA, patched(a.id, sentNow))
@@ -1425,7 +1617,7 @@ async function forceAction($: EngineInterface, id: string) {
   try {
     const sentTurn: Partial<CompassAction> = { status: 'sent', route: 'new turn', at: Date.now() }
     await update($, actionsA, patched(a.id, sentTurn))
-    await $.prompt.submit({ text: a.text })
+    await $.prompt.submit({ text: `${a.text}\n\n${await briefFor($)}` })
     $.ui.toast(`↗ sent now as a new turn · ${clip(a.label, 44)}`)
   } catch (err) {
     await reject($, a, err)
@@ -1564,7 +1756,8 @@ async function flushOutbox($: EngineInterface) {
   const ids = new Set(due.map(a => a.id))
   await update($, actionsA, list => list.map((a): CompassAction => (ids.has(a.id) ? { ...a, status: 'sent', route: 'new turn', at: Date.now() } : a)))
   try {
-    await $.prompt.submit({ text: due.map(a => a.text).join('\n\n') })
+    // compass's own turn skips its own prompt.submit hook: the brief rides in the text
+    await $.prompt.submit({ text: `${due.map(a => a.text).join('\n\n')}\n\n${await briefFor($)}` })
   } catch (err) {
     for (const a of due) await reject($, a, err)
   }
@@ -1739,11 +1932,24 @@ async function sendRound($: EngineInterface) {
   if (!handled.length) return
   const round = await read($, grillRoundA)
   const before = JSON.stringify(handled.map(q => [q.id, q.state]))
-  await enqueue($, 'turn', `grill round ${round}: ${handled.length} answer${handled.length > 1 ? 's' : ''}`, roundMessage(round, handled), 'grill', before)
+  // a blocking answer releases the session: it goes into the running turn, or wakes an idle one
+  const isRelease = handled.some(q => q.blocking && q.state === 'answered')
+  await enqueue($, isRelease ? 'steer' : 'turn', `grill round ${round}: ${handled.length} answer${handled.length > 1 ? 's' : ''}`, roundMessage(round, handled), 'grill', before)
   const ids = new Set(handled.map(q => q.id))
   await update($, grillA, list => list.map((q): CompassGrillQ => (ids.has(q.id) ? { ...q, state: q.state === 'followup' ? 'sent' : 'settled' } : q)))
   await update($, grillRoundA, r => r + 1)
   await update($, selectedA, () => null)
+}
+
+/**
+ * What the user did to a grill question, told to the session. A blocking one holds the session's
+ * work, so its release (park, dismissal) or its hold again (reopened) goes at once: into the running
+ * turn, or as a new turn when idle. A non-blocking one rides the next prompt, as before.
+ */
+async function grillNotice($: EngineInterface, q: CompassGrillQ, text: string, release: boolean) {
+  if (!q.blocking) return queueNote($, text)
+  const tail = release ? ' · RELEASED: this was blocking; continue the work that waited on it.' : ' · BLOCKING again: stop the work that depends on it until its answer comes.'
+  await enqueue($, 'steer', `${clip(text, 60)}${release ? ' · released' : ' · holds'}`, `🧭 [compass grill — from the user] ${text}${tail}`)
 }
 
 /** Sets a question aside: the session goes on without it (on the recommendation) and does not ask again now. */
@@ -1753,7 +1959,7 @@ async function parkGrill($: EngineInterface, id: string) {
   await update($, grillA, list => list.map((x): CompassGrillQ => (x.id === id ? { ...x, state: 'parked' } : x)))
   await unblockOn($, q.n)
   await paneActed($)
-  await queueNote($, `Parked grill question Q${q.n} "${q.title}": do not wait for it or ask again now; proceed with ${q.rec ? `the recommendation (${q.rec})` : 'your best judgement'} and keep it open`)
+  await grillNotice($, q, `Parked grill question Q${q.n} "${q.title}": do not wait for it or ask again now; proceed with ${q.rec ? `the recommendation (${q.rec})` : 'your best judgement'} and keep it open`, true)
   const { ask, handled } = frontierOf(await read($, grillA))
   await update($, selectedA, () => (ask[0] ? `g:${ask[0].id}` : null))
   if (!ask.length && handled.length) await sendRound($)
@@ -1766,7 +1972,7 @@ async function unparkGrill($: EngineInterface, id: string) {
   await update($, grillA, list => list.map((x): CompassGrillQ => (x.id === id ? { ...x, state: 'open' } : x)))
   await paneActed($)
   await update($, selectedA, () => `g:${id}`)
-  await queueNote($, `Reopened grill question Q${q.n} "${q.title}": the user will answer it`)
+  await grillNotice($, q, `Reopened grill question Q${q.n} "${q.title}": the user will answer it`, false)
 }
 
 /** Drops a question that no longer matters; the agent hears it with the next prompt, and it is not asked again. */
@@ -1776,7 +1982,7 @@ async function dismissGrill($: EngineInterface, id: string) {
   await update($, grillA, list => list.map((x): CompassGrillQ => (x.id === id ? { ...x, state: 'settled', answer: 'dismissed' } : x)))
   await unblockOn($, q.n)
   await paneActed($)
-  await queueNote($, `Dismissed grill question Q${q.n} "${q.title}": no longer relevant, drop it`)
+  await grillNotice($, q, `Dismissed grill question Q${q.n} "${q.title}": no longer relevant, drop it`, true)
   const { ask, handled } = frontierOf(await read($, grillA))
   await update($, selectedA, () => (ask[0] ? `g:${ask[0].id}` : null))
   if (!ask.length && handled.length) await sendRound($)
@@ -1803,7 +2009,9 @@ async function answerGrill($: EngineInterface, id: string, text: string) {
   await paneActed($)
   const { ask } = frontierOf(await read($, grillA))
   await update($, selectedA, () => (ask[0] ? `g:${ask[0].id}` : null))
-  if (!ask.length) await sendRound($)
+  const answered = (await read($, grillA)).find(x => x.id === id)
+  // the session waits on a blocking answer: it goes now, without waiting for the open non-blocking ones
+  if (!ask.length || (answered?.blocking && !isFollowup)) await sendRound($)
 }
 
 function editMap($: EngineInterface, fn: (m: CompassMap) => CompassMap) {
@@ -1862,6 +2070,11 @@ export const register: Register = on => {
           },
           settle: { type: 'array', items: { type: 'string' }, description: 'Ids that became moot or were settled elsewhere' },
           askConfirm: { type: 'boolean', description: 'The frontier is empty: ask the user to confirm the shared understanding' },
+          notes: {
+            type: 'object',
+            additionalProperties: { type: 'string' },
+            description: "Facts about this session's own workflow that compass should keep and chart by (key → short text; an empty text drops the key). Optional; questions may be left out.",
+          },
         },
       },
     })
@@ -1885,6 +2098,7 @@ export const register: Register = on => {
         $.ui.toast(`🧭 compass restored from ${ago(Date.now() - snap.at)} ago${isBehind ? ' · catching up' : ''}`)
       }
     }
+    await sessionReport($, 'session.start')
     void refreshPeers($)
     // a reload (or a resume) may have missed a turn's end: chart again when the chart is behind
     {
@@ -1901,6 +2115,7 @@ export const register: Register = on => {
       if (++ticks % 5 === 0) void quietly($, 'snapshot')
       if ((await read($, tabA)) === 'chat' && Date.now() - (await read($, peersAtA)) > 15_000) void refreshPeers($)
       void quietly($, 'flush')
+      void quietly($, 'contract')
       if ((await read($, liveA)).some(p => p.status === 'running' || p.status === 'bg') && ['flow', 'live'].includes(await read($, tabA))) await update($, tickA, n => n + 1)
       // while Claude works: once new tool calls have finished, check the course with haiku
       const clockNow = await $.clock.now()
@@ -1942,13 +2157,16 @@ export const register: Register = on => {
       mergeGrill(list, drafts, topic, 'agent', at).map((q): CompassGrillQ => (settle.includes(q.id) ? { ...q, state: 'settled', answer: q.answer || 'moot' } : q)),
     )
     if (input.askConfirm === true) await update($, grillConfirmA, () => topic || 'the plan')
+    const prevReport = await read($, reportA)
+    await sessionReport($, 'grill.post', { posted: [...drafts.map(d => d.id), ...settle], extra: mergeExtra(prevReport.extra ?? {}, input.notes) })
     const { ask, waiting } = frontierOf(await read($, grillA))
+    const holds = (await read($, grillA)).filter(q => q.blocking && drafts.some(d => d.id === q.id) && q.state !== 'settled' && q.state !== 'parked')
     if (ask.length) {
       await update($, selectedA, s => (s?.startsWith('g:') ? s : `g:${ask[0]!.id}`))
       $.ui.toast(`? ${ask.length} question${ask.length > 1 ? 's' : ''} in the grill tab`)
     }
     // a plugin tool's result is a string (or blocks): the model reads it as the tool's answer
-    const text = `Posted to the user's compass grill tab: ${ask.length} on the frontier, ${waiting.length} waiting on prerequisites${input.askConfirm === true ? ', plus a confirmation request' : ''}. Do not wait: for blocking ones, continue only with work that does not depend on them; for the others, go on with your recommendation. The user answers when they choose, in any order, and may park or dismiss; answers arrive as a new user turn, parks and dismissals as notes.`
+    const text = `Posted to the user's compass grill tab: ${ask.length} on the frontier, ${waiting.length} waiting on prerequisites${input.askConfirm === true ? ', plus a confirmation request' : ''}. Do not wait: for blocking ones, continue only with work that does not depend on them; for the others, go on with your recommendation. The user answers when they choose, in any order, and may park or dismiss; answers arrive as a new user turn; parks and dismissals of non-blocking ones as notes.${holds.length ? `\nACK BLOCKING: ${holds.map(q => `Q${q.n} (${q.id})`).join(', ')}. Stop all work that depends on ${holds.length > 1 ? 'them' : 'it'} now. Compass releases each one with its answer, a park or a dismissal, sent to you at once (into this turn if you still work, else as a new turn); continue that work only after the release.` : ''}\n\n${await briefFor($)}`
     return { result: text as never, text }
   })
 
@@ -1997,7 +2215,10 @@ export const register: Register = on => {
       await update($, liveA, () => [])
       const now = await $.clock.now()
       await update($, statsA, () => ({ ...EMPTY_STATS, startedAt: now }))
-    }
+      await update($, reportA, () => EMPTY_REPORT)
+      await update($, briefA, () => EMPTY_BRIEF)
+      await update($, briefSentA, () => 0)
+    } else await sessionReport($, 'session.end')
     return next(e)
   })
 
@@ -2014,6 +2235,7 @@ export const register: Register = on => {
       await update($, chatA, list => [...list, { peer, dir: 'in' as const, text, at, status: 'received' as const, addr }].slice(-200))
       if (kind !== 'bridge' && needsGist(text)) void gistOf($, peer, at, text)
       if (kind !== 'bridge' || from.name) $.ui.toast(`◂ inbound from ${peer}`)
+      await sessionReport($, 'inbound')
     }
     return next(e)
   })
@@ -2080,12 +2302,16 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     if (e.text.startsWith('/btw ')) await addBtw($, e.text.slice(5))
     const pending = (await read($, actionsA)).filter(a => a.status === 'queued' && a.kind === 'note')
-    if (!pending.length) return next(e)
     const ids = new Set(pending.map(a => a.id))
-    await update($, actionsA, list => list.map((a): CompassAction => (ids.has(a.id) ? { ...a, status: 'sent', route: 'next prompt', at: Date.now() } : a)))
+    if (pending.length) await update($, actionsA, list => list.map((a): CompassAction => (ids.has(a.id) ? { ...a, status: 'sent', route: 'next prompt', at: Date.now() } : a)))
     // the whole note, not the outbox's short label
-    const note = `🧭 Compass — updates the user made in the compass pane since last turn (user-added tasks come first):\n${pending.map(a => `- ${a.text.replace(/^🧭\s*\[compass[^\]]*\]\s*/u, '')}`).join('\n')}`
-    return next({ ...e, context: [...(e.context ?? []), note] })
+    const note = pending.length
+      ? [`🧭 Compass — updates the user made in the compass pane since last turn (user-added tasks come first):\n${pending.map(a => `- ${a.text.replace(/^🧭\s*\[compass[^\]]*\]\s*/u, '')}`).join('\n')}`]
+      : []
+    // the brief, built after the notes went out, so its outbox no longer lists them; a turn that
+    // already carries one (compass's own) gets no second copy
+    const withBrief = e.text.includes('[compass brief · rev') ? [] : [await briefFor($)]
+    return next({ ...e, context: [...(e.context ?? []), ...note, ...withBrief] })
   })
 
   // ── keep the map current ──
@@ -2101,8 +2327,9 @@ export const register: Register = on => {
     if (request && !e.text.startsWith('<') && !isOwn) {
       await update($, incomingA, () => ({ text: clip(request, 80), at: Date.now() }))
       requestAt = Date.now()
+      await sessionReport($, 'turn.start', { request: clip(request, 2000), reply: '' })
       void quickChart($, 'request', request)
-    }
+    } else await sessionReport($, 'turn.start')
     return next(e)
   })
 
@@ -2122,6 +2349,13 @@ export const register: Register = on => {
       tokensOut: s.tokensOut + (u?.output_tokens ?? 0),
       tokensCached: s.tokensCached + (u?.cache_read_input_tokens ?? 0),
     }))
+    let reply = ''
+    try {
+      reply = latestReply(await $.session.messages())
+    } catch {
+      // the report keeps the last reply it had
+    }
+    await sessionReport($, 'turn.complete', reply ? { reply } : {})
     if (!e.isAborted) {
       wantRefresh()
       void quickChart($, 'turn')
@@ -2165,6 +2399,12 @@ export const register: Register = on => {
     } else if (e.tool === 'TaskCreate') {
       await update($, agentTodosA, (list): CompassAgentTodo[] => [...list, { text: e.subject, status: 'pending' }])
     }
+    await sessionReport($, 'tool.done')
+    // a brief that moved while Claude works rides the main loop's next tool result, so it never goes stale
+    if (!e.agentId && typeof ran.deny !== 'string') {
+      const fresh = await briefIfChanged($)
+      if (fresh) return { ...ran, context: [...(ran.context ?? []), fresh] }
+    }
     return ran
   })
 
@@ -2176,7 +2416,7 @@ export const register: Register = on => {
     const steering = steers.length
       ? `\n\n# Compass steering\nThe user steered this session via the compass pane. Honor these directives (newest wins):\n${steers.slice(-6).map(s => `- ${s.text}`).join('\n')}`
       : ''
-    return { sections: [...composed.sections, { id: 'compass', scope: 'session' as const, text: `${GRILL_GUIDE}${steering}` }] }
+    return { sections: [...composed.sections, { id: 'compass', scope: 'session' as const, text: `${GRILL_GUIDE}\n\n${CONTRACT_GUIDE}${steering}` }] }
   })
 
   // ── the clickable compass in the hint line under the prompt ──
@@ -2290,6 +2530,7 @@ export const register: Register = on => {
       ])
     const [peers, peersAt, selfName, isRemote, chat, incoming, chatSeen] = await Promise.all([read($, peersA), read($, peersAtA), read($, selfNameA), read($, remoteA), read($, chatA), read($, incomingA), read($, chatSeenA)])
     const live = await read($, liveA)
+    const contract = { report: await read($, reportA), brief: await read($, briefA), sent: await read($, briefSentA) }
     const openPeer = tab === 'chat' && selected?.startsWith('p:') ? selected.slice(2) : null
     const unreadOf = (name: string) => (name === openPeer ? 0 : chat.filter(m => m.peer === name && m.dir === 'in' && m.at > (chatSeen[name] ?? 0)).length)
     const unreadAll = [...new Set(chat.map(m => m.peer))].reduce((n, p) => n + unreadOf(p), 0)
@@ -3306,7 +3547,7 @@ export const register: Register = on => {
                   round {round}
                 </Text>
                 <Text dimColor>
-                  {' '}· answers go to Claude together once every open question here is handled, or now with ↗ send
+                  {' '}· a blocking answer goes to Claude at once; the rest go together once every open question here is handled, or now with ↗ send
                 </Text>
               </Text>
               {confirm && (
@@ -3482,6 +3723,10 @@ export const register: Register = on => {
             </Text>
             <Text dimColor wrap="wrap">
               {own.calls ? `≈ ${Math.round((own.cacheRead / Math.max(1, own.input + own.cacheRead + own.cacheWrite)) * 100)}% served from cache` : 'no map calls yet'}
+            </Text>
+            <Text key="contract" dimColor wrap="wrap">
+              ⇄ contract: ◂ report r{contract.report.rev} ({contract.report.event}) · ▸ brief r{contract.brief.rev} · session has r{contract.sent}
+              {Object.keys(contract.report.extra ?? {}).length + Object.keys(contract.brief.extra ?? {}).length ? ` · notes ${Object.keys(contract.report.extra ?? {}).length}◂ ${Object.keys(contract.brief.extra ?? {}).length}▸` : ''}
             </Text>
           </Box>
         </Box>

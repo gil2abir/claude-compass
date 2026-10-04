@@ -132,6 +132,69 @@ export type CompassStats = {
   own: { calls: number; input: number; output: number; cacheRead: number; cacheWrite: number }
 }
 
+/**
+ * The two-way contract between the session and compass. Each side passes the other a fixed object,
+ * rebuilt whole at every step of the lifecycle, so no field is ever missing or stale; `extra` carries
+ * what only this session's workflow needs, outside the fixed fields.
+ */
+export type CompassEvent = 'session.start' | 'turn.start' | 'tool.done' | 'grill.post' | 'inbound' | 'turn.complete' | 'session.end'
+
+/** session → compass: what compass needs from the session to chart it, as of `event`. */
+export type CompassReport = {
+  /** bumped at every step */
+  rev: number
+  event: CompassEvent
+  at: number
+  /** completed main-loop turns */
+  turns: number
+  isBusy: boolean
+  /** the user's latest own request, whole ('' before the first) */
+  request: string
+  /** Claude's latest words, as of the last turn end or course check */
+  reply: string
+  /** finished tool calls since the chart was last confirmed, oldest first, a few words each */
+  calls: string[]
+  /** the agent's TodoWrite / TaskCreate list: ground truth for task status */
+  todos: CompassAgentTodo[]
+  /** messages from other agents and sessions, newest last ("sender: text") */
+  inbox: string[]
+  /** /btw side questions */
+  btw: string[]
+  /** grill ids the agent posted or settled in its latest grill call */
+  posted: string[]
+  /** the session's blocking questions still open: it stops work that depends on them until each is released */
+  blockedOn: string[]
+  /** the session's own notes for compass (the grill tool's `notes`), key → text */
+  extra: Record<string, string>
+}
+
+/** compass → session: what the session needs from compass now, until the next step. */
+export type CompassBrief = {
+  /** bumped only when the content changes */
+  rev: number
+  at: number
+  /** the chart's view of the course */
+  course: { goal: string; milestone: string; now: string; next: string }
+  /** steering directives in force, newest last */
+  steers: string[]
+  /** open questions work waits on: "Q<n> (<id>) <title>" */
+  blocking: string[]
+  /** open questions the session goes on without, on its recommendation */
+  open: string[]
+  /** parked: proceed on the recommendation, do not ask again now */
+  parked: string[]
+  /** tasks the user added that the chart has not adopted yet */
+  userTasks: string[]
+  /** the fork the user decided, '' when none */
+  fork: string
+  /** what still waits in the outbox, so the session knows it is coming */
+  outbox: string[]
+  /** a confirmation the session asked for and the user has not given, '' when none */
+  confirm: string
+  /** compass state for this session beyond the fixed fields (a branch on offer, failed sends, decided forks), key → text */
+  extra: Record<string, string>
+}
+
 declare module 'claude-code' {
   interface PluginState {
     compass: {
@@ -164,6 +227,12 @@ declare module 'claude-code' {
       lastError: string | null
       /** the live tab's feed, newest last, the last LIVE_KEEP calls */
       live: CompassPulse[]
+      /** session → compass, rebuilt at every lifecycle step */
+      report: CompassReport
+      /** compass → session, refreshed whenever it is read */
+      brief: CompassBrief
+      /** the brief rev the session last received */
+      briefSent: number
     }
   }
 }
