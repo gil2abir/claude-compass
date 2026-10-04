@@ -264,6 +264,27 @@ const withBriefText = async ($: EngineInterface, text: string) => {
   return brief ? `${text}\n\n${brief}` : text
 }
 
+/**
+ * A compass turn of its own. Claude Code draws a plugin's prompt row as stored and never offers it
+ * to a UserMessage hook, so what the model alone needs (the turn in full with its instructions, and
+ * the brief) goes first as a hidden row the model reads (session.append: stored isMeta, not drawn),
+ * and the prompt itself carries only what the user should see. If the hidden row is refused, the
+ * prompt carries it all, as before.
+ */
+async function submitTurn($: EngineInterface, text: string) {
+  const full = await withBriefText($, text)
+  const shown = compactRow(text) || text
+  if (full !== shown) {
+    try {
+      const r = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: `🧭 [compass — for the model: the compass turn that follows, in full]\n${full}` }] } })
+      if (!('deny' in r && r.deny)) return void (await $.prompt.submit({ text: shown }))
+    } catch {
+      // the prompt carries it all
+    }
+  }
+  await $.prompt.submit({ text: full })
+}
+
 /** A map from an older compass build counts as no map. */
 const isCurrent = (map: CompassMap | null): map is CompassMap =>
   !!map && Array.isArray(map.milestones) && Array.isArray(map.tasks)
@@ -805,7 +826,7 @@ async function forceAction($: EngineInterface, id: string) {
   try {
     const sentTurn: Partial<CompassAction> = { status: 'sent', route: 'new turn', at: Date.now() }
     await update($, actionsA, patched(a.id, sentTurn))
-    await $.prompt.submit({ text: await withBriefText($, a.text) })
+    await submitTurn($, a.text)
     $.ui.toast(`↗ sent now as a new turn · ${clip(a.label, 44)}`)
   } catch (err) {
     await reject($, a, err)
@@ -935,8 +956,8 @@ async function flushOutbox($: EngineInterface) {
   const ids = new Set(due.map(a => a.id))
   await update($, actionsA, list => list.map((a): CompassAction => (ids.has(a.id) ? { ...a, status: 'sent', route: 'new turn', at: Date.now() } : a)))
   try {
-    // compass's own turn skips its own prompt.submit hook: the brief rides in the text
-    await $.prompt.submit({ text: await withBriefText($, due.map(a => a.text).join('\n\n')) })
+    // compass's own turn skips its own prompt.submit hook: the brief rides a hidden row before it
+    await submitTurn($, due.map(a => a.text).join('\n\n'))
   } catch (err) {
     for (const a of due) await reject($, a, err)
   }
@@ -1371,7 +1392,10 @@ export const register: Register = on => {
     await update($, grillA, list =>
       mergeGrill(list, drafts, topic, 'agent', at).map((q): CompassGrillQ => (settle.includes(q.id) ? { ...q, state: 'settled', answer: q.answer || 'moot' } : q)),
     )
-    if (input.askConfirm === true) await update($, grillConfirmA, () => topic || 'the plan')
+    // a model may pass the summary to confirm as text in place of true: either asks for the confirmation
+    const confirmText = typeof input.askConfirm === 'string' ? str(input.askConfirm, 160) : ''
+    const isConfirm = input.askConfirm === true || !!confirmText
+    if (isConfirm) await update($, grillConfirmA, () => confirmText || topic || 'the plan')
     const prevReport = await read($, reportA)
     await sessionReport($, 'grill.post', { posted: [...drafts.map(d => d.id), ...settle], extra: mergeExtra(prevReport.extra ?? {}, input.notes) })
     const { ask, waiting } = frontierOf(await read($, grillA))
@@ -1382,7 +1406,7 @@ export const register: Register = on => {
     }
     // a plugin tool's result is a string (or blocks): the model reads it as the tool's answer. The
     // transcript shows it, so it stays short; the brief rides as context, which the user never sees.
-    const text = `Posted to the compass grill tab: ${ask.length} on the frontier, ${waiting.length} waiting${input.askConfirm === true ? ', plus a confirmation request' : ''}. Do not wait; go on as the grilling guide says.${holds.length ? `\nACK BLOCKING: ${holds.map(q => `Q${q.n} (${q.id})`).join(', ')}. Stop all work that depends on ${holds.length > 1 ? 'them' : 'it'} now; continue it only after compass releases ${holds.length > 1 ? 'each' : 'it'} (RELEASED).` : ''}`
+    const text = `Posted to the compass grill tab: ${ask.length} on the frontier, ${waiting.length} waiting${isConfirm ? ', plus a confirmation request' : ''}. Do not wait; go on as the grilling guide says.${holds.length ? `\nACK BLOCKING: ${holds.map(q => `Q${q.n} (${q.id})`).join(', ')}. Stop all work that depends on ${holds.length > 1 ? 'them' : 'it'} now; continue it only after compass releases ${holds.length > 1 ? 'each' : 'it'} (RELEASED).` : ''}`
     const brief = await briefFor($)
     return { result: text as never, text, ...(brief ? { context: [brief] } : {}) }
   })
@@ -1726,12 +1750,14 @@ export const register: Register = on => {
         $.clock.after(0, () => update($, liveA, all => all.map(p => (p.id === hit.id ? { ...p, status: settled, end: at } : p))))
       }
     }
-    // compass's own turns draw without the brief and the model-only instructions; ctrl+o shows all
+    // compass's own turns draw without the brief and the model-only instructions. Always: a plugin's
+    // row under its speaker label also comes with isExpanded set, so that flag cannot tell ctrl+o
+    // apart; the model reads the stored text whole either way
     const origin = e.props.origin
     // the user's own words (typed, from the phone, the SDK) are never cut, whatever they start with
     const isTyped = origin.kind === 'composer' || origin.kind === 'bridge' || origin.kind === 'sdk'
     const isOwn = (origin.kind === 'plugin' && origin.name === 'compass') || (!isTyped && e.props.text.trimStart().startsWith('🧭 [compass'))
-    if (isOwn && !e.props.isExpanded) {
+    if (isOwn) {
       const text = compactRow(e.props.text)
       if (text && text !== e.props.text) return next({ ...e, props: { ...e.props, text } })
     }

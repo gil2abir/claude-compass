@@ -420,7 +420,7 @@ test('parking or dismissing a blocking question releases the session at once; a 
   await ui.unmount()
 })
 
-test('the UserMessage row of a compass turn draws compact; ctrl+o, the user\'s own prompt and other rows draw as stored', async ($, on) => {
+test('the UserMessage row of a compass turn draws compact, expanded or not; the user\'s own prompt and other rows draw as stored', async ($, on) => {
   const drawn: string[] = []
   on('ui.render', { component: 'UserMessage' }, (_$, e) => {
     drawn.push((e.props as { text: string }).text)
@@ -431,8 +431,9 @@ test('the UserMessage row of a compass turn draws compact; ctrl+o, the user\'s o
     $.ui.render({ component: 'UserMessage', props: { text, origin, isExpanded } } as never)
   await row(stored, { kind: 'plugin', name: 'compass' })
   expect(drawn.pop()).toBe('🧭 [compass — steering from the user] use sqlite')
+  // a plugin row under its speaker label comes expanded too: still compact
   await row(stored, { kind: 'plugin', name: 'compass' }, true)
-  expect(drawn.pop()).toBe(stored)
+  expect(drawn.pop()).toBe('🧭 [compass — steering from the user] use sqlite')
   await row('build the cache', { kind: 'composer' })
   expect(drawn.pop()).toBe('build the cache')
   // a prompt the user typed is drawn as typed, even one that starts like a compass turn

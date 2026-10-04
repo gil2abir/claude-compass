@@ -49,7 +49,7 @@ export const briefOf = (o: {
   const alt = o.map?.alt
   const fork = alt && o.map?.altPick ? (o.map.altPick === 'branch' ? `took the branch: ${alt.label}` : `stays on the planned course, not: ${alt.label}`) : ''
   return {
-    course: { goal: o.map?.goal ?? '', milestone: milestone?.label ?? '', now: o.doing?.now || step?.label || '', next: (o.doing ? o.doing.next || upcoming : upcoming) ?? '' },
+    course: { goal: o.map?.goal ?? '', milestone: milestone?.label ?? '', now: o.doing?.now || step?.label || (o.map?.milestones.length && o.map.milestones.every(m => m.state === 'done' || m.state === 'abandoned') ? 'all done' : ''), next: (o.doing ? o.doing.next || upcoming : upcoming) ?? '' },
     steers: o.steers.slice(-6).map(x => x.text),
     blocking: front.ask.filter(q => q.blocking).map(qRef),
     open: [...front.ask.filter(q => !q.blocking), ...front.waiting].map(qRef),

@@ -67,6 +67,9 @@ test('todoCourse: the TodoWrite item in progress is "now", the next pending one 
   const course = (chips: ReturnType<typeof hintChips>) => chips.find(c => c.key === 'course')!.parts.map(p => p.text ?? '').join('')
   expect(course(hintChips(map, 0, 0, 200, null, 0, true, { now: 'run the suite', next: 'fix lint' }))).toBe('✓ read docs │ ● run the suite │ ○ fix lint'.replace('✓ read docs │ ', ''))
   expect(course(hintChips(map, 0, 0, 200, 'ship it', 0, true, { now: 'run the suite', next: '' }))).toMatch(/● ship it/)
+  // every milestone done: the course says so, not the last milestone as "now"
+  const done = parseMap(JSON.stringify({ ...MAP, milestones: MAP.milestones.map(m => ({ ...m, state: 'done', steps: m.steps.map(st => ({ ...st, state: 'done' })) })) }), 1)
+  expect(course(hintChips(done, 0, 0, 200, null, 0, true))).toMatch(/✓ all done$/)
 })
 
 test('the brief rev ignores the course: the course alone moving changes no rev', async () => {
@@ -318,5 +321,45 @@ test("compass marks its own questions, and holds them back while Claude's questi
   expect(await ui.find({ text: /◈ compass · work/ })).toBeDefined()
   await $.prompt.submit({ text: 'next' } as never)
   expect(context.join('\n')).toMatch(/Keep the cache warm → recommended: yes \[asked by compass\]/)
+  await ui.unmount()
+})
+
+test('a compass turn whose hidden row is refused still carries everything in its prompt', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  base(on)
+  mock.env(on, { HOME: '/nonexistent' })
+  on('model.fork', () => ({ value: { isAnswered: false, reason: 'busy' } }) as never)
+  on('model.complete', () => ({ value: { isAnswered: false, reason: 'busy' } }) as never)
+  on('ui.panes', () => ({ value: [] }))
+  const submitted: string[] = []
+  on('prompt.submit', (_$, e) => {
+    submitted.push(e.text)
+    return { text: e.text } as never
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  await $.tool.call({ tool: 'mcp__compass__grill', topic: 'cli', questions: [{ id: 'db', title: 'Pick the database', body: 'Which?', options: ['sqlite', 'postgres'], recommendation: 'sqlite', blocking: true }] } as never)
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  await tap(ui, 'tab:grill')
+  await tap(ui, 'gopt:db:1')
+  await clock.advance(8100)
+  // the kit has no session.append: the prompt itself carries the instructions and the brief
+  expect(submitted.length).toBe(1)
+  expect(submitted[0]).toMatch(/RELEASED: this was blocking/)
+  expect(submitted[0]).toMatch(/compass brief · rev/)
+  await ui.unmount()
+})
+
+test('askConfirm given as text still asks for the confirmation, with that text', async ($, on) => {
+  mock.clock(on, { now: 1_000_000 })
+  base(on)
+  on('model.fork', () => ({ value: { isAnswered: false, reason: 'busy' } }) as never)
+  on('model.complete', () => ({ value: { isAnswered: false, reason: 'busy' } }) as never)
+  on('ui.panes', () => ({ value: [] }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  const r = await $.tool.call({ tool: 'mcp__compass__grill', askConfirm: 'Add a module docstring. Confirm?' } as never)
+  expect(String(r.text)).toMatch(/plus a confirmation request/)
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  await tap(ui, 'tab:grill')
+  expect(await ui.find({ text: /Add a module docstring/ })).toBeDefined()
   await ui.unmount()
 })

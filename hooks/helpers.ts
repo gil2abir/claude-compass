@@ -387,13 +387,15 @@ export const hintChips = (map: CompassMap | null, asks: number, queued: number, 
   const done = steps.filter(s => s.state === 'done').length
   const past = incoming ? plain(step?.label ?? '') : plain([...steps].reverse().find(s => s.state === 'done')?.label ?? '')
   const isBlocked = step?.state === 'blocked'
+  // every milestone done and nothing new: the course says so, not the last milestone's name as "now"
+  const isAllDone = !incoming && !doing && !step && !!map && map.milestones.length > 0 && map.milestones.every(m => m.state === 'done' || m.state === 'abandoned')
   // the agent's TodoWrite item in progress is "now" with no model call; a new request comes first
-  const nowText = plain(incoming ?? doing?.now ?? step?.label ?? milestone?.label ?? '')
+  const nowText = isAllDone ? 'all done' : plain(incoming ?? doing?.now ?? step?.label ?? milestone?.label ?? '')
   const ahead = plain(incoming ? 'updating…' : (doing ? doing.next || upcoming : upcoming) ?? '')
   const course = (withPast: boolean, withNext: boolean) => {
     const parts: HintPart[] = []
     if (withPast && past) parts.push({ text: `✓ ${past}`, color: TONE.green.fg }, SEP)
-    parts.push({ text: `${isBlocked ? '!' : '●'} ${nowText}`, color: isBlocked ? TONE.red.fg : '#e6e6e6', isBold: true })
+    parts.push({ text: `${isBlocked ? '!' : isAllDone ? '✓' : '●'} ${nowText}`, color: isBlocked ? TONE.red.fg : isAllDone ? TONE.green.fg : '#e6e6e6', isBold: true })
     if (withNext && ahead) parts.push(SEP, { text: `○ ${ahead}`, isDim: true })
     return chip('course', isBlocked ? 'red' : 'blue', parts)
   }
