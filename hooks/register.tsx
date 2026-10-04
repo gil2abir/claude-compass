@@ -568,6 +568,14 @@ export const parseMap = (text: string, at: number): (CompassMap & { grill: Grill
   return { goal: str(o.goal, 60), milestones: oneNow(milestones), tasks, recap: strs(o.recap, 7, 140), at, alt, grill: grillDrafts(o.grill, 'work'), moot: strs(o.moot, 12, 32) }
 }
 
+/** The agent's own course from its TodoWrite list: the item in progress, then the next pending one. */
+export const todoCourse = (todos: readonly CompassAgentTodo[]): { now: string; next: string } | null => {
+  const doing = todos.find(t => t.status === 'in_progress')
+  if (!doing) return null
+  const after = todos.slice(todos.indexOf(doing) + 1).find(t => t.status === 'pending') ?? todos.find(t => t.status === 'pending')
+  return { now: clip(plain(doing.text), 60), next: after ? clip(plain(after.text), 60) : '' }
+}
+
 /** The active milestone and its active (or blocked) step: the "you are here". */
 export const locate = (map: CompassMap | null) => {
   const ms = map?.milestones ?? []
@@ -701,7 +709,7 @@ const partWidth = (x: HintPart) => (x.bar !== undefined ? BAR_CELLS : glen(x.tex
  * short, parts leave from inside a chip first (last step, next step, long labels), then whole
  * chips by priority, so every chip stays one unit. `room` counts the panel's own padding.
  */
-export const hintChips = (map: CompassMap | null, asks: number, queued: number, room: number, incoming: string | null = null, blocking = 0, hasTurns = false): HintChip[] => {
+export const hintChips = (map: CompassMap | null, asks: number, queued: number, room: number, incoming: string | null = null, blocking = 0, hasTurns = false, doing: { now: string; next: string } | null = null): HintChip[] => {
   const SEP: HintPart = { text: ' │ ', isDim: true }
   const chip = (key: string, tone: Tone, parts: HintPart[]): HintChip => ({ key, tone, parts, width: 2 + parts.reduce((n, x) => n + partWidth(x), 0) })
   const BRAND = 11
@@ -715,8 +723,9 @@ export const hintChips = (map: CompassMap | null, asks: number, queued: number, 
   const done = steps.filter(s => s.state === 'done').length
   const past = incoming ? plain(step?.label ?? '') : plain([...steps].reverse().find(s => s.state === 'done')?.label ?? '')
   const isBlocked = step?.state === 'blocked'
-  const nowText = plain(incoming ?? step?.label ?? milestone?.label ?? '')
-  const ahead = plain(incoming ? 'updating…' : (upcoming ?? ''))
+  // the agent's TodoWrite item in progress is "now" with no model call; a new request comes first
+  const nowText = plain(incoming ?? doing?.now ?? step?.label ?? milestone?.label ?? '')
+  const ahead = plain(incoming ? 'updating…' : (doing ? doing.next || upcoming : upcoming) ?? '')
   const course = (withPast: boolean, withNext: boolean) => {
     const parts: HintPart[] = []
     if (withPast && past) parts.push({ text: `✓ ${past}`, color: TONE.green.fg }, SEP)
@@ -853,7 +862,7 @@ The user answers your questions in the compass pane's grill tab while you work. 
 - Keep a design tree of the decisions in play: when planning, and whenever several options are on the table for work in progress.
 - Work in rounds. The frontier is every decision whose prerequisites are settled. Post the whole frontier in one call: each question with a stable id, a short title, a body with the choices, and your recommended answer. A question that depends on another still-open one waits for a later round (or name it in dependsOn).
 - Facts are your job: read files, run tools, dispatch sub-agents rather than asking. Decisions are the user's: never answer them yourself.
-- Do not block: after posting, continue only with work that does not depend on the open answers, else end your turn. Answers arrive as a new user turn, one round at a time.
+- Do not block: after posting, continue only with work that does not depend on the open answers, else end your turn. Answers arrive as a user message (into the running turn, or as a new turn), one round at a time.
 - A follow-up keeps its question open: answer it, then re-ask the question with the same id and a clarified body.
 - When the frontier is empty, call the tool with askConfirm; do not act on a plan until the user confirms the shared understanding.
 - Mark each question blocking: true only when work truly waits on it; otherwise blocking: false and keep working on your recommendation, ready to adjust when the answer comes.
@@ -899,13 +908,14 @@ export const briefOf = (o: {
   actions: CompassAction[]
   confirm: string | null
   round?: number
+  doing?: { now: string; next: string } | null
 }): Omit<CompassBrief, 'rev' | 'at'> => {
   const { milestone, step, upcoming } = locate(o.map)
   const front = frontierOf(o.grill)
   const alt = o.map?.alt
   const fork = alt && o.map?.altPick ? (o.map.altPick === 'branch' ? `took the branch: ${alt.label}` : `stays on the planned course, not: ${alt.label}`) : ''
   return {
-    course: { goal: o.map?.goal ?? '', milestone: milestone?.label ?? '', now: step?.label ?? '', next: upcoming ?? '' },
+    course: { goal: o.map?.goal ?? '', milestone: milestone?.label ?? '', now: o.doing?.now || step?.label || '', next: (o.doing ? o.doing.next || upcoming : upcoming) ?? '' },
     steers: o.steers.slice(-6).map(x => x.text),
     blocking: front.ask.filter(q => q.blocking).map(qRef),
     open: [...front.ask.filter(q => !q.blocking), ...front.waiting].map(qRef),
@@ -934,11 +944,16 @@ export const extraOf = (map: CompassMap | null, actions: CompassAction[], round:
   return out
 }
 
-/** The brief's content, for "did it change": rev and time left out. */
+/**
+ * The brief's actionable content, for "did it change": rev, time and the course left out. The course
+ * is compass's own reading of the session's work, which the session already knows: a change to it
+ * alone does not move the rev, so it never rides a tool result. Prompts and compass turns carry it.
+ */
 export const briefSig = (b: Omit<CompassBrief, 'rev' | 'at'> | CompassBrief) => {
-  const { rev: _r, at: _a, ...rest } = b as CompassBrief
+  const { rev: _r, at: _a, course: _c, ...rest } = b as CompassBrief
   void _r
   void _a
+  void _c
   return JSON.stringify(rest)
 }
 
@@ -1003,6 +1018,7 @@ const mapPrompt = (
 ) =>
   [
     'You are COMPASS, a silent observer of this session. Do NOT continue the task, call tools, or address the user.',
+    "This request is compass's own, not part of the session: the session never sees it. The session's instructions about the compass grill tool and the compass brief are for the session, not for you. Never call a tool (every tool is refused here); put questions in the JSON's \"grill\".",
     'Reply with ONLY one minified JSON object (no prose, no fence). Be terse: the whole reply must stay under 2500 characters.',
     STE,
     '{"goal":s,"milestones":[{"id":s,"label":s,"state":"done|active|pending|abandoned","why":s,"steps":[{"id":s,"label":s,"kind":"step|attempt|decision|aside","state":"done|active|pending|abandoned|blocked","why":s}]}],"tasks":[{"id":s,"text":s,"lane":"now|next|later|done","by":"agent|user","from":s}],"recap":[s],"moot":[s],"alt":{"label":s,"why":s,"steps":[s]}|null,"grill":[{"id":s,"title":s,"body":s,"options":[s],"recommendation":s,"dependsOn":[s],"from":s,"blocking":b}]}',
@@ -1050,6 +1066,18 @@ let quickAt = 0
 let landedFrom = 0
 let isQuickCharting = false
 let quickWhat = ''
+/**
+ * When the newest course on screen was started (Date.now()): every chart that lands (full, quick,
+ * course check, reconcile) records when it started, and one started before the course on screen
+ * never moves the course back. A full chart that started earlier keeps the newer course and lands
+ * only what it alone sees (tasks, recap, questions, the fork).
+ */
+let courseAt = 0
+/** The pane is drawn: the course check runs only then, and once at once when it opens. */
+let wasPaneShown = false
+/** Claude's latest words when the course was last checked: new words alone also call for a check. */
+let pulseWords = ''
+let wordsAt = 0
 // the course check while Claude works: at most every PULSE_EVERY_MS, and only after new tool calls
 const PULSE_EVERY_MS = 12_000
 let pulseAt = 0
@@ -1104,26 +1132,41 @@ async function sessionReport($: EngineInterface, event?: CompassEvent, patch: Pa
 
 /** compass → session: rebuilt from compass's state; the rev moves only when the content does. */
 async function compassBrief($: EngineInterface): Promise<CompassBrief> {
-  const [stored, grill, userTasks, actions, confirm, prev, round] = await Promise.all([read($, mapA), read($, grillA), read($, userTasksA), read($, actionsA), read($, grillConfirmA), read($, briefA), read($, grillRoundA)])
-  const body = briefOf({ map: isCurrent(stored) ? stored : null, grill, steers: await sentSteers($), userTasks, actions, confirm, round })
+  const [stored, grill, userTasks, actions, confirm, prev, round, todos, isBusy] = await Promise.all([read($, mapA), read($, grillA), read($, userTasksA), read($, actionsA), read($, grillConfirmA), read($, briefA), read($, grillRoundA), read($, agentTodosA), read($, busyA)])
+  const body = briefOf({ map: isCurrent(stored) ? stored : null, grill, steers: await sentSteers($), userTasks, actions, confirm, round, doing: isBusy ? todoCourse(todos) : null })
   // rev 0 was never built: the first read always issues rev 1, so the session gets a whole brief first
-  if (prev.rev > 0 && briefSig(body) === briefSig(prev)) return prev
+  if (prev.rev > 0 && briefSig(body) === briefSig(prev)) {
+    if (JSON.stringify(body.course) === JSON.stringify(prev.course)) return prev
+    // the course alone moved: kept current for the next prompt, with the same rev
+    const moved: CompassBrief = { ...prev, course: body.course }
+    await update($, briefA, () => moved)
+    return moved
+  }
   const next: CompassBrief = { ...body, rev: prev.rev + 1, at: await $.clock.now() }
   await update($, briefA, () => next)
   return next
 }
 
-/** What the session gets of the brief at a handoff: all of it while it changed, else nothing ('') — the last one holds. */
-async function briefFor($: EngineInterface): Promise<string> {
+/** The course the session last got, so a prompt carries it again only when it moved. */
+let sentCourse = ''
+
+/**
+ * What the session gets of the brief at a handoff: all of it while its rev moved, else nothing ('')
+ * and the last one holds. `withCourse` (a prompt, a compass turn): also when only the course moved.
+ */
+async function briefFor($: EngineInterface, withCourse = false): Promise<string> {
   const b = await compassBrief($)
-  if (b.rev <= (await read($, briefSentA))) return ''
-  await update($, briefSentA, () => b.rev)
+  const course = JSON.stringify(b.course)
+  const isNew = b.rev > (await read($, briefSentA))
+  if (!isNew && !(withCourse && course !== sentCourse)) return ''
+  if (isNew) await update($, briefSentA, () => b.rev)
+  sentCourse = course
   return briefText(b)
 }
 
 /** A compass text with the brief after it, when there is one. */
 const withBriefText = async ($: EngineInterface, text: string) => {
-  const brief = await briefFor($)
+  const brief = await briefFor($, true)
   return brief ? `${text}\n\n${brief}` : text
 }
 
@@ -1394,6 +1437,7 @@ async function reconcile($: EngineInterface) {
   if (!isCurrent(stored) || inflight || isReconciling) return
   isReconciling = true
   const epoch = chartEpoch
+  const startedAt = Date.now()
   try {
     const grill = await read($, grillA)
     const acts = (await read($, actionsA)).filter(a => a.at > stored.at - 1000).map(a => `${a.status === 'queued' ? 'queued' : 'sent'}: ${a.label}`)
@@ -1407,9 +1451,10 @@ async function reconcile($: EngineInterface) {
     ].filter(Boolean).join('\n')
     const reply = await $.model.complete({ model: 'haiku', system: 'You are COMPASS. Reply with ONLY one minified JSON object, no prose.', prompt, maxTokens: 2500, effort: 'low' })
     await countOwn($, reply)
-    if (!reply.isAnswered || epoch !== chartEpoch) return
+    if (!reply.isAnswered || epoch !== chartEpoch || courseAt > startedAt) return
     const map = parseMap(reply.text, await $.clock.now())
     if (!map || !map.milestones.length) return
+    courseAt = Math.max(courseAt, startedAt)
     const { grill: _ignored, moot, ...charted } = map
     void _ignored
     const at = await $.clock.now()
@@ -1442,6 +1487,7 @@ async function quickChart($: EngineInterface, why: 'request' | 'pulse' | 'turn',
     pulseAt = await $.clock.now()
     // the report holds the calls since the chart; a course check also brings Claude's latest words in
     const r = why === 'request' ? await sessionReport($) : await sessionReport($, undefined, { reply: latestReply(await $.session.messages()) })
+    if (why !== 'request') pulseWords = r.reply
     const calls = r.calls
     const last = why === 'request' ? '' : r.reply
     const chart = `The chart: ${JSON.stringify({ goal: stored.goal, milestones: stored.milestones, tasks: stored.tasks, recap: stored.recap, alt: stored.alt ?? null })}`
@@ -1467,8 +1513,8 @@ async function quickChart($: EngineInterface, why: 'request' | 'pulse' | 'turn',
     ).filter(Boolean).join('\n')
     const reply = await $.model.complete({ model: 'haiku', system: 'You are COMPASS. Reply with ONLY one minified JSON object, no prose.', prompt, maxTokens: 2500, effort: 'low' })
     await countOwn($, reply)
-    // a full chart that started after this one already landed: it saw more, it counts
-    if (!reply.isAnswered || landedFrom > startedAt) return
+    // a chart that started after this one already landed: it saw more, it counts
+    if (!reply.isAnswered || landedFrom > startedAt || courseAt > startedAt) return
     if (why !== 'request' && /^\s*\{\s*"same"\s*:\s*true\s*\}\s*$/.test(reply.text)) {
       checkedAt = Date.now()
       return
@@ -1480,6 +1526,7 @@ async function quickChart($: EngineInterface, why: 'request' | 'pulse' | 'turn',
     void _moot
     const at = await $.clock.now()
     await update($, mapA, m => (m && isCurrent(m) ? { ...m, goal: charted.goal || m.goal, milestones: charted.milestones, tasks: charted.tasks, recap: charted.recap.length ? charted.recap : m.recap, reconciledAt: at } : m))
+    courseAt = Math.max(courseAt, startedAt)
     checkedAt = Date.now()
     if (why === 'request') {
       quickAt = Date.now()
@@ -1558,6 +1605,10 @@ async function refresh($: EngineInterface) {
     // started before the user's latest request, landing after its quick chart: that chart is newer
     if (startedAt < requestAt && quickAt > startedAt) return
     landedFrom = startedAt
+    // a course check moved the course while this chart ran: that course is newer, so it stays;
+    // this chart lands what only it sees (tasks, recap, questions, the fork)
+    const isBehind = courseAt > startedAt
+    courseAt = Math.max(courseAt, startedAt)
     const { grill: inferred, moot, ...charted } = map
     const prevMap = isCurrent(stored) ? stored : null
     const latest = await read($, mapA)
@@ -1568,7 +1619,7 @@ async function refresh($: EngineInterface) {
     const picked = isCurrent(latest) && latest.altPick
     const kept = !charted.alt && sameMilestone && prevMap.alt && !prevMap.altPick && !picked && !isDecided(prevMap.alt, declined) ? prevMap.alt : null
     const alt = (charted.alt && !isDecided(charted.alt, declined) ? charted.alt : null) ?? kept
-    await update($, mapA, () => ({ ...charted, alt, declined, turns: turnsAt }))
+    await update($, mapA, m => ({ ...charted, ...(isBehind && isCurrent(m) ? { milestones: m.milestones, at: m.at, reconciledAt: m.reconciledAt } : {}), alt, declined, turns: turnsAt }))
     // the chart now includes the request the turn started on
     await update($, incomingA, inc => (inc && (isAfterTurn || inc.at <= startedAt) ? null : inc))
     // the chart's own suggestions: not from the quick first chart (it saw no conversation), not
@@ -1599,16 +1650,18 @@ const ROUTE_GLYPH = { queued: '⋯', sent: '↗', rejected: '✗' } as const
 /** The outbox list with one action changed: what `update` writes when an action moves on. */
 const patched = (id: string, patch: Partial<CompassAction>) => (list: CompassAction[]) => list.map((a): CompassAction => (a.id === id ? { ...a, ...patch } : a))
 
-/** Writes into the running turn now; the model reads it at its next step. */
-async function appendNow($: EngineInterface, a: CompassAction) {
+/** Writes into the running turn now, as one message; the model reads it at its next step. */
+async function appendNow($: EngineInterface, items: CompassAction[]) {
+  if (!items.length) return
+  const ids = new Set(items.map(a => a.id))
+  // marked sent first, so the brief that rides along no longer lists them in the outbox
+  await update($, actionsA, list => list.map((a): CompassAction => (ids.has(a.id) ? { ...a, status: 'sent', route: 'running turn', at: Date.now() } : a)))
   try {
-    const r = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: await withBriefText($, a.text) }] } })
+    const r = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: await withBriefText($, items.map(a => a.text).join('\n\n')) }] } })
     if ('deny' in r && r.deny) throw new Error(r.deny)
-    const sentNow: Partial<CompassAction> = { status: 'sent', route: 'running turn', at: Date.now() }
-    await update($, actionsA, patched(a.id, sentNow))
-    $.ui.toast(`↗ sent into the running turn · ${clip(a.label, 50)}`)
+    $.ui.toast(items.length === 1 ? `↗ sent into the running turn · ${clip(items[0]!.label, 50)}` : `↗ ${items.length} sent into the running turn`)
   } catch (err) {
-    await reject($, a, err)
+    for (const a of items) await reject($, a, err)
   }
 }
 
@@ -1633,10 +1686,10 @@ async function enqueue($: EngineInterface, kind: CompassAction['kind'], label: s
   if (kind === 'note') {
     const withPrompt: Partial<CompassAction> = { route: 'next prompt' }
     await update($, actionsA, patched(a.id, withPrompt))
-    $.ui.toast(`⋯ queued for your next prompt · ${clip(a.label, 44)}`)
+    $.ui.toast(`⋯ rides your next prompt, or the running turn · ${clip(a.label, 40)}`)
     return
   }
-  const routed: Partial<CompassAction> = { route: kind === 'steer' && isBusy ? 'running turn' : 'new turn' }
+  const routed: Partial<CompassAction> = { route: isBusy ? 'running turn' : 'new turn' }
   await update($, actionsA, patched(a.id, routed))
   $.ui.toast(`⋯ sends in ${SEND_GRACE_MS / 1000}s · ${clip(a.label, 44)} · ✕ in the pane cancels`)
 }
@@ -1646,7 +1699,7 @@ async function forceAction($: EngineInterface, id: string) {
   const a = (await read($, actionsA)).find(x => x.id === id)
   if (!a || a.status !== 'queued') return
   if (a.kind === 'message') return sendMessage($, a)
-  if (await read($, busyA)) return appendNow($, a)
+  if (await read($, busyA)) return appendNow($, [a])
   try {
     const sentTurn: Partial<CompassAction> = { status: 'sent', route: 'new turn', at: Date.now() }
     await update($, actionsA, patched(a.id, sentTurn))
@@ -1772,16 +1825,22 @@ async function removeAction($: EngineInterface, id: string) {
   $.ui.toast(`✕ removed · ${clip(a.label, 50)}`)
 }
 
-/** The poller's job: queued steers and turns go out together once the session is idle. */
+/**
+ * The poller's job. Nothing waits for a turn to end, so nothing goes stale: while Claude works,
+ * every item whose wait is over (steers, grill rounds, task changes, notes) goes into the running
+ * turn as one message; once the session is idle, steers and rounds go out together as a new turn,
+ * and notes wait for the user's next prompt.
+ */
 async function flushOutbox($: EngineInterface) {
   const t = await $.clock.now()
-  const queued = (await read($, actionsA)).filter(a => a.status === 'queued' && a.kind !== 'note')
-  if (queued.some(a => t - a.at < SEND_GRACE_MS) || isReconciling || isQuickCharting || (await read($, refreshingA))) await update($, tickA, n => n + 1)
+  const all = (await read($, actionsA)).filter(a => a.status === 'queued')
+  const queued = all.filter(a => a.kind !== 'note')
+  if (all.some(a => t - a.at < SEND_GRACE_MS) || isReconciling || isQuickCharting || (await read($, refreshingA))) await update($, tickA, n => n + 1)
   // messages to other agents go when their wait is over, whether or not Claude is working
   for (const a of queued) if (a.kind === 'message' && t - a.at >= SEND_GRACE_MS) await sendMessage($, a)
   const waiting = queued.filter(a => a.kind !== 'message')
   if (await read($, busyA)) {
-    for (const a of waiting) if (a.route === 'running turn' && t - a.at >= SEND_GRACE_MS) await appendNow($, a)
+    await appendNow($, all.filter(a => a.kind !== 'message' && t - a.at >= SEND_GRACE_MS))
     return
   }
   const due = waiting.filter(a => t - a.at >= SEND_GRACE_MS)
@@ -2055,6 +2114,15 @@ function toggleIn($: EngineInterface, key: string) {
   return update($, unfoldedA, list => (list.includes(key) ? list.filter(k => k !== key) : [...list, key]))
 }
 
+/** Whether the pane is drawn now; a host that cannot say counts as drawn, so the course stays checked. */
+async function isPaneShown($: EngineInterface) {
+  try {
+    return (await $.ui.panes()).some(p => p.id === PANE && p.isShown)
+  } catch {
+    return true
+  }
+}
+
 async function togglePane($: EngineInterface) {
   const isShown = (await $.ui.panes()).some(p => p.id === PANE)
   if (isShown) {
@@ -2079,7 +2147,7 @@ export const register: Register = on => {
       await $.tool.register({
       name: 'grill',
       description:
-        "Post a round of grilling questions to the user's compass grill tab without blocking. Post the whole frontier (decisions whose prerequisites are settled), each with your recommended answer. Re-posting an id re-asks it. Answers arrive later as a new user turn. Use for planning and for open choices in the work in progress; never for facts you can look up.",
+        "Post a round of grilling questions to the user's compass grill tab without blocking. Post the whole frontier (decisions whose prerequisites are settled), each with your recommended answer. Re-posting an id re-asks it. Answers arrive later as a user message. Use for planning and for open choices in the work in progress; never for facts you can look up.",
       inputSchema: {
         type: 'object',
         properties: {
@@ -2150,11 +2218,29 @@ export const register: Register = on => {
       void quietly($, 'flush')
       void quietly($, 'contract')
       if ((await read($, liveA)).some(p => p.status === 'running' || p.status === 'bg') && ['flow', 'live'].includes(await read($, tabA))) await update($, tickA, n => n + 1)
-      // while Claude works: once new tool calls have finished, check the course with haiku
+      // while Claude works and the pane is drawn: once new tool calls finished or Claude wrote new
+      // words, check the course with haiku; opening the pane checks it at once
       const clockNow = await $.clock.now()
-      if (!isQuickCharting && (await read($, busyA)) && clockNow - pulseAt > PULSE_EVERY_MS && clockNow - turnStartedAt > PULSE_EVERY_MS) {
+      const isBusyNow = await read($, busyA)
+      const isShown = isBusyNow ? await isPaneShown($) : false
+      if (isShown && !wasPaneShown) {
+        // the pane just opened on a course not checked for a while: check it at once
+        const m = await read($, mapA)
+        if (isCurrent(m) && clockNow - Math.max(m.at, m.reconciledAt ?? 0) > PULSE_EVERY_MS) {
+          pulseAt = 0
+          pulseSeen = -1
+        }
+      }
+      wasPaneShown = isShown
+      if (isShown && !isQuickCharting && clockNow - pulseAt > PULSE_EVERY_MS && (pulseSeen < 0 || clockNow - turnStartedAt > PULSE_EVERY_MS)) {
         const done = (await read($, liveA)).filter(p => p.status !== 'running').length
         if (done > pulseSeen) void quickChart($, 'pulse')
+        else if (clockNow - wordsAt > PULSE_EVERY_MS) {
+          // reading the transcript for new words is throttled on its own, so a tool call still checks at once
+          wordsAt = clockNow
+          const words = latestReply(await $.session.messages())
+          if (words && words !== pulseWords) void quickChart($, 'pulse')
+        }
       }
       if (inflight) return
       // during a long turn: chart once the new prompt is in, then every few minutes
@@ -2180,6 +2266,8 @@ export const register: Register = on => {
 
   // the agent posts grilling rounds here and keeps working
   on('tool.call', { tool: GRILL_TOOL }, async ($, e) => {
+    // the chart's own fork reads the session's system prompt too: its questions go in its JSON
+    if (e.agentId && inflight) return { deny: 'compass chart: no tools here; put questions in the JSON "grill" field' }
     const input = e as unknown as Record<string, unknown>
     const mode = input.mode === 'plan' ? 'plan' : 'work'
     const drafts = grillDrafts(input.questions, mode)
@@ -2345,7 +2433,7 @@ export const register: Register = on => {
       : []
     // the brief, built after the notes went out, so its outbox no longer lists them; a turn that
     // already carries one (compass's own) gets no second copy
-    const brief = e.text.includes('[compass brief · rev') ? '' : await briefFor($)
+    const brief = e.text.includes('[compass brief · rev') ? '' : await briefFor($, true)
     const withBrief = brief ? [brief] : []
     return next({ ...e, context: [...(e.context ?? []), ...note, ...withBrief] })
   })
@@ -2354,6 +2442,12 @@ export const register: Register = on => {
 
   on('turn.start', async ($, e, next) => {
     turnStartedAt = await $.clock.now()
+    // words from before this turn are no news to the course check
+    try {
+      pulseWords = latestReply(await $.session.messages())
+    } catch {
+      pulseWords = ''
+    }
     await update($, busyA, () => true)
     // instant and free: the new request shows as "now" before any model call
     const request = plain(e.text.replace(/<[^>]+>/g, ' ').replace(/^🧭\s*\[compass[^\]]*\]\s*/u, ''))
@@ -2478,7 +2572,8 @@ export const register: Register = on => {
     const panes = paneCols > 0 ? await $.ui.panes() : []
     const isDocked = panes.some(p => p.id === PANE)
     const room = Math.max(24, (e.viewport?.columns ?? 100) + (isDocked ? paneCols + 1 : 0) - glen(e.props.hint ?? '') - 6)
-    const chips = hintChips(map, asks, queued, room, incoming?.text ?? null, blocking, (await read($, statsA)).turns > 0)
+    const doing = (await read($, busyA)) ? todoCourse(await read($, agentTodosA)) : null
+    const chips = hintChips(map, asks, queued, room, incoming?.text ?? null, blocking, (await read($, statsA)).turns > 0, doing)
     const gap = (key: string) => (
       <Text key={key} backgroundColor={PANEL}>
         {' '}
@@ -3133,7 +3228,10 @@ export const register: Register = on => {
         </Box>
       )
     } else if (tab === 'live') {
-      const { step: here, upcoming } = locate(map)
+      const charted = locate(map)
+      const doing = isBusy ? todoCourse(await read($, agentTodosA)) : null
+      const here = doing ? { label: doing.now, state: 'active' as const } : charted.step
+      const upcoming = doing ? doing.next || charted.upcoming : charted.upcoming
       const ok = live.filter(p => p.status === 'ok' || p.status === 'bgdone').length
       const bad = live.filter(p => p.status === 'error' || p.status === 'bgfail').length
       // calls per slice of the last 10 minutes, as a one-row sparkline: the session's pulse

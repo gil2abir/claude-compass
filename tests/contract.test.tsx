@@ -303,9 +303,10 @@ test('the contract does not drift: a pane action moves the brief at once, and th
   await $.prompt.submit({ text: 'build the cache' } as never)
   await $.turn.start({ text: 'build the cache', turnId: 't1' } as never)
   await clock.advance(5000)
-  // the chart landed while Claude works: the course moved, so the next tool result carries the brief once
+  // the chart landed while Claude works: the course alone moved, which the session already knows,
+  // so no tool result carries it; the next prompt does
   const first = await $.tool.call({ tool: 'Read', file_path: '/a.ts' } as never)
-  expect((first.context ?? []).join('\n')).toMatch(/now "Write the store" · next "Add the tests"/)
+  expect((first.context ?? []).join('\n')).not.toMatch(/compass brief/)
   const quiet = await $.tool.call({ tool: 'Read', file_path: '/b.ts' } as never)
   expect((quiet.context ?? []).join('\n')).not.toMatch(/compass brief/)
 
