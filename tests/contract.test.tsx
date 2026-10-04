@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { EMPTY_BRIEF, EMPTY_REPORT, briefOf, briefSig, briefText, extraOf, mergeExtra, parseMap, reportLines } from '../hooks/register'
+import { EMPTY_BRIEF, EMPTY_REPORT, briefOf, briefSig, briefText, compactRow, extraOf, mergeExtra, parseMap, reportLines, roundMessage } from '../hooks/register'
 
 const MAP = {
   goal: 'Ship the cache',
@@ -47,11 +47,34 @@ test('mergeExtra keeps short notes, drops a key on an empty text, and ignores wh
   expect(Object.keys(mergeExtra({}, many)).length).toBe(12)
 })
 
-test('the brief has every field, always: an empty compass names each one as none', async () => {
+test('the brief has every field, always: an empty compass names each one as none, on one line', async () => {
   const b = briefOf({ map: null, grill: [], steers: [], userTasks: [], actions: [], confirm: null })
   expect(Object.keys(b).sort()).toEqual(Object.keys(EMPTY_BRIEF).filter(k => k !== 'rev' && k !== 'at').sort())
   const text = briefText({ ...b, rev: 1, at: 0 })
-  for (const head of ['course', 'steering in force', 'BLOCKING questions: stop all work', 'open questions', 'parked', 'user tasks', 'fork decided', 'outbox', 'confirmation', 'more from compass']) expect(text).toContain(head)
+  expect(text.split('\n')).toEqual([
+    '🧭 [compass brief · rev 1]',
+    '- course: milestone "?" · now "?" · next "?"',
+    '- none: steering, BLOCKING, open, parked, user tasks, fork, outbox, confirm, extra',
+  ])
+})
+
+test('a brief with content lists each full field on its own, questions as a list, and folds the empty ones', async () => {
+  const text = briefText({ ...EMPTY_BRIEF, rev: 3, at: 0, steers: ['keep it in memory'], blocking: ['Q1 (ttl) Expiry → recommended: 1h'], fork: 'took the branch: Use redis' })
+  expect(text).toMatch(/^- steering: keep it in memory$/m)
+  expect(text).toMatch(/^- BLOCKING:\n {2}- Q1 \(ttl\) Expiry → recommended: 1h$/m)
+  expect(text).toMatch(/^- fork: took the branch: Use redis$/m)
+  expect(text).toMatch(/^- none: open, parked, user tasks, outbox, confirm, extra$/m)
+})
+
+test('the transcript draws a compass turn without the brief or the model-only lines; the model text stays whole', async () => {
+  const ans = { id: 'db', n: 1, title: 'Pick the database', body: '', options: [], rec: '', dependsOn: [], topic: '', mode: 'work', source: 'agent', from: '', state: 'answered', blocking: true, answer: 'postgres', followups: [], at: 0 } as never
+  const stored = `${roundMessage(1, [ans])}\n\n${briefText({ ...EMPTY_BRIEF, rev: 4, at: 0 })}`
+  expect(stored).toMatch(/RELEASED: this was blocking/)
+  expect(stored).toMatch(/compass brief · rev 4/)
+  expect(compactRow(stored)).toBe('🧭 [compass grill · round 1 — answers from the user]\n❓ Q1 (db) Pick the database → postgres · released')
+  expect(compactRow('🧭 [compass grill — from the user] Parked Q1 · BLOCKING again: stop the work that depends on it until its answer comes.')).toBe('🧭 [compass grill — from the user] Parked Q1 · holds')
+  // a turn with no brief and nothing model-only draws as it is
+  expect(compactRow('🧭 [compass — steering from the user] use sqlite')).toBe('🧭 [compass — steering from the user] use sqlite')
 })
 
 test('the brief carries what the session needs from compass: course, steers, questions by kind, fork, outbox, notes', async () => {
@@ -150,7 +173,7 @@ test('across a session lifecycle each side gets the other its contract: the char
 
   // turn 1: the request, a todo list, a grill post with the session's own notes, an inbound message
   await $.prompt.submit({ text: 'build the cache' } as never)
-  expect(context.join('\n')).toMatch(/compass brief · rev 1\] What compass holds/)
+  expect(context.join('\n')).toMatch(/compass brief · rev 1\]\n- course:/)
   await $.turn.start({ text: 'build the cache', turnId: 't1' } as never)
   await $.tool.call({ tool: 'TodoWrite', todos: [{ content: 'write store', status: 'in_progress', activeForm: 'writing' }] } as never)
   await $.tool.call({ tool: 'Bash', command: 'npm test' } as never)
@@ -160,9 +183,13 @@ test('across a session lifecycle each side gets the other its contract: the char
     questions: [{ id: 'ttl', title: 'Expiry', body: 'How long?', recommendation: '1h', blocking: true }],
     notes: { target: 'node 22', ticket: 'CACHE-12' },
   } as never)
-  // the grill answer carries the brief, now with the blocking question in it
-  expect(String(posted.text)).toMatch(/compass brief · rev 2\]/)
-  expect(String(posted.text)).toMatch(/BLOCKING questions: stop all work[^\n]*:\n {2}- Q1 \(ttl\) Expiry → recommended: 1h/)
+  // the grill answer carries the brief as context (the model reads it, the transcript does not
+  // show it), now with the blocking question in it; the visible result stays short
+  const postedCtx = (posted.context ?? []).join('\n')
+  expect(postedCtx).toMatch(/compass brief · rev 2\]/)
+  expect(postedCtx).toMatch(/- BLOCKING:\n {2}- Q1 \(ttl\) Expiry → recommended: 1h/)
+  expect(String(posted.text)).not.toMatch(/compass brief/)
+  expect(String(posted.text).length).toBeLessThan(260)
   // and compass acknowledges the hold explicitly
   expect(String(posted.text)).toMatch(/ACK BLOCKING: Q1 \(ttl\)\. Stop all work that depends on it now/)
   await $.session.receive({ origin: { kind: 'peer' }, text: '<cross-session-message from="uds:/x.sock" from-name="Docs agent">please keep the API stable</cross-session-message>' })
@@ -179,12 +206,12 @@ test('across a session lifecycle each side gets the other its contract: the char
   // and that the session holds on the blocking question
   expect(chart).toMatch(/stopped work that waits on blocking questions: \["ttl"\]/)
 
-  // the brief went whole once; with nothing new it is one line
+  // the brief went whole once; with nothing new nothing rides the prompt
   await $.prompt.submit({ text: 'go on' } as never)
   const second = context.join('\n')
   expect(second).toMatch(/compass brief · rev \d+\]/)
   await $.prompt.submit({ text: 'and again' } as never)
-  expect(context.join('\n')).toMatch(/compass brief · rev \d+\] unchanged\./)
+  expect(context.join('\n')).not.toMatch(/compass brief/)
 
   // a session note can be dropped with an empty text
   await $.tool.call({ tool: 'mcp__compass__grill', notes: { ticket: '' } } as never)
@@ -289,8 +316,8 @@ test('the contract does not drift: a pane action moves the brief at once, and th
   await clock.advance(1100)
   const after = await $.tool.call({ tool: 'Read', file_path: '/c.ts' } as never)
   const ctx = (after.context ?? []).join('\n')
-  expect(ctx).toMatch(/user tasks not yet on your list:\n {2}- add a metrics page/)
-  expect(ctx).toMatch(/still in the outbox, on its way to you:\n {2}- next prompt: /)
+  expect(ctx).toMatch(/^- user tasks: add a metrics page$/m)
+  expect(ctx).toMatch(/^- outbox: next prompt: /m)
   // the stats line shows the session holds the newest brief
   await tap(ui, 'tab:stats')
   const line = JSON.stringify(await ui.find({ text: /contract:/ }))
@@ -352,8 +379,8 @@ test('a blocking answer releases the session at once, without waiting for the op
   expect(h.submitted[0]!.split('[compass brief')[0]).not.toMatch(/Name the CLI/)
   // the brief that rides the release no longer lists db as blocking; name stays open
   const ctx = h.submitted[0]!
-  expect(ctx).toMatch(/BLOCKING questions[^\n]*: none/)
-  expect(ctx).toMatch(/open questions, go on with the recommendation:\n {2}- Q2 \(name\)/)
+  expect(ctx).toMatch(/- none: [^\n]*BLOCKING/)
+  expect(ctx).toMatch(/- open:\n {2}- Q2 \(name\)/)
   await ui.unmount()
 })
 
@@ -390,4 +417,26 @@ test('parking or dismissing a blocking question releases the session at once; a 
   await $.prompt.submit({ text: 'go on' } as never)
   expect(h.context()).toMatch(/Parked grill question Q2 "Name the CLI"/)
   await ui.unmount()
+})
+
+test('the UserMessage row of a compass turn draws compact; ctrl+o, the user\'s own prompt and other rows draw as stored', async ($, on) => {
+  const drawn: string[] = []
+  on('ui.render', { component: 'UserMessage' }, (_$, e) => {
+    drawn.push((e.props as { text: string }).text)
+    return { type: 'Box', props: {}, children: [] } as never
+  })
+  const stored = `🧭 [compass — steering from the user] use sqlite\n\n${briefText({ ...EMPTY_BRIEF, rev: 2, at: 0 })}`
+  const row = (text: string, origin: Record<string, unknown>, isExpanded = false) =>
+    $.ui.render({ component: 'UserMessage', props: { text, origin, isExpanded } } as never)
+  await row(stored, { kind: 'plugin', name: 'compass' })
+  expect(drawn.pop()).toBe('🧭 [compass — steering from the user] use sqlite')
+  await row(stored, { kind: 'plugin', name: 'compass' }, true)
+  expect(drawn.pop()).toBe(stored)
+  await row('build the cache', { kind: 'composer' })
+  expect(drawn.pop()).toBe('build the cache')
+  // a prompt the user typed is drawn as typed, even one that starts like a compass turn
+  await row(stored, { kind: 'composer' })
+  expect(drawn.pop()).toBe(stored)
+  await row('a note with [compass brief · rev 1] in it', { kind: 'plugin', name: 'other' })
+  expect(drawn.pop()).toBe('a note with [compass brief · rev 1] in it')
 })

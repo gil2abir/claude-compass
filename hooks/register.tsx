@@ -803,6 +803,10 @@ export const mergeGrill = (items: CompassGrillQ[], drafts: GrillDraft[], topic: 
   return list.slice(-60)
 }
 
+const ROUND_TAIL = 'These settle the decisions above.'
+const RELEASE_TAIL = ' · RELEASED: this was blocking; continue the work that waited on it.'
+const HOLD_TAIL = ' · BLOCKING again: stop the work that depends on it until its answer comes.'
+
 /** One round's answers, in the grilling shape the agent reads back. */
 export const roundMessage = (round: number, handled: CompassGrillQ[]) =>
   [
@@ -810,10 +814,25 @@ export const roundMessage = (round: number, handled: CompassGrillQ[]) =>
     ...handled.map(q =>
       q.state === 'followup'
         ? `❓ Q${q.n} (${q.id}) ${q.title} → FOLLOW-UP from the user: "${q.followups[q.followups.length - 1] ?? ''}". Keep it open: answer the follow-up, then re-ask it with ${GRILL_TOOL} (same id) with a clarified body.`
-        : `❓ Q${q.n} (${q.id}) ${q.title} → ${q.answer}${q.blocking ? ' · RELEASED: this was blocking; continue the work that waited on it.' : ''}`,
+        : `❓ Q${q.n} (${q.id}) ${q.title} → ${q.answer}${q.blocking ? RELEASE_TAIL : ''}`,
     ),
-    'These settle the decisions above. Recompute the frontier and post the next round with the grill tool, or askConfirm when the frontier is empty. Look facts up yourself; do not act on a plan before the user confirms.',
+    `${ROUND_TAIL} Recompute the frontier and post the next round with the grill tool, or askConfirm when the frontier is empty. Look facts up yourself; do not act on a plan before the user confirms.`,
   ].join('\n')
+
+/**
+ * A compass turn as the transcript draws it: the brief and the instructions meant for the model
+ * left out, the release marks short. Display only: the model reads the stored text whole.
+ */
+export const compactRow = (text: string) => {
+  const cut = text.indexOf('🧭 [compass brief · rev')
+  return (cut >= 0 ? text.slice(0, cut) : text)
+    .split('\n')
+    .filter(l => !l.startsWith(ROUND_TAIL))
+    .join('\n')
+    .split(RELEASE_TAIL).join(' · released')
+    .split(HOLD_TAIL).join(' · holds')
+    .trim()
+}
 
 /**
  * Compact ASD-STE100 (Simplified Technical English) for every word compass writes with a model:
@@ -923,22 +942,35 @@ export const briefSig = (b: Omit<CompassBrief, 'rev' | 'at'> | CompassBrief) => 
   return JSON.stringify(rest)
 }
 
-/** The brief as the session reads it: every field named, an empty one said so. */
+/**
+ * The brief as the session reads it, compact: a field with content gets its own line, the empty ones
+ * are named together on one "none:" line, so every field is still named. What each label means is
+ * in CONTRACT_GUIDE (the system prompt), not repeated in every brief.
+ */
+const QUESTION_FIELDS = new Set(['BLOCKING', 'open', 'parked'])
+
 export const briefText = (b: CompassBrief) => {
-  const list = (xs: string[]) => (xs.length ? xs.map(x => `\n  - ${x}`).join('') : ' none')
   const c = b.course
+  const extra = Object.entries(b.extra).map(([k, v]) => `${k}: ${v}`)
+  const fields: [string, string[]][] = [
+    ['steering', b.steers],
+    ['BLOCKING', b.blocking],
+    ['open', b.open],
+    ['parked', b.parked],
+    ['user tasks', b.userTasks],
+    ['fork', b.fork ? [b.fork] : []],
+    ['outbox', b.outbox],
+    ['confirm', b.confirm ? [b.confirm] : []],
+    ['extra', extra],
+  ]
+  const full = fields.filter(([, xs]) => xs.length)
+  const empty = fields.filter(([, xs]) => !xs.length).map(([k]) => k)
   return [
-    `🧭 [compass brief · rev ${b.rev}] What compass holds for this session now; it replaces any earlier brief.`,
+    `🧭 [compass brief · rev ${b.rev}]`,
     `- course: ${c.goal ? `goal "${c.goal}" · ` : ''}milestone "${c.milestone || '?'}" · now "${c.now || '?'}" · next "${c.next || '?'}"`,
-    `- steering in force, newest last:${list(b.steers)}`,
-    `- BLOCKING questions: stop all work that depends on them; do other work only if it does not; if nothing is left, end your turn. Their answers come back as a message that releases them:${list(b.blocking)}`,
-    `- open questions, go on with the recommendation:${list(b.open)}`,
-    `- parked, go on with the recommendation, do not ask again now:${list(b.parked)}`,
-    `- user tasks not yet on your list:${list(b.userTasks)}`,
-    `- fork decided by the user: ${b.fork || 'none'}`,
-    `- still in the outbox, on its way to you:${list(b.outbox)}`,
-    `- confirmation you asked for, not given yet: ${b.confirm || 'none'}`,
-    `- more from compass for this session:${list(Object.entries(b.extra).map(([k, v]) => `${k}: ${v}`))}`,
+    // questions always as a list, so each one reads on its own line; any other single entry inline
+    ...full.map(([k, xs]) => (xs.length === 1 && !QUESTION_FIELDS.has(k) ? `- ${k}: ${xs[0]}` : `- ${k}:${xs.map(x => `\n  - ${x}`).join('')}`)),
+    ...(empty.length ? [`- none: ${empty.join(', ')}`] : []),
   ].join('\n')
 }
 
@@ -958,7 +990,8 @@ export const reportLines = (r: CompassReport) =>
 
 /** The contract in the system prompt: fixed text, so the prompt cache holds. */
 const CONTRACT_GUIDE = `# Compass brief and report
-Compass keeps a contract with this session. With each user prompt, compass turn, steer and grill answer you get a "🧭 [compass brief · rev N]": the course as compass charts it, the steering in force, the questions work waits on, open and parked questions, user tasks not yet on your list, the fork the user decided, what is still in the outbox, a pending confirmation, and more that only this session needs (a branch on offer, sends that failed, forks already decided). The newest brief replaces any earlier one; "unchanged" means the last one still holds. While you work, a brief that changed also arrives with a tool result. Act on it; do not repeat it back.
+Compass keeps a contract with this session. With each user prompt, compass turn, steer and grill answer you get a "🧭 [compass brief · rev N]": the course as compass charts it, the steering in force, the questions work waits on, open and parked questions, user tasks not yet on your list, the fork the user decided, what is still in the outbox, a pending confirmation, and more that only this session needs (a branch on offer, sends that failed, forks already decided). The newest brief replaces any earlier one; no brief means the last one still holds. While you work, a brief that changed also arrives with a tool result. Act on it; do not repeat it back, and do not mention the brief, its rev or compass acknowledgements to the user.
+Brief labels: steering = the user's steers in force, newest last · BLOCKING = questions work waits on: stop all work that depends on them, do other work only if it does not, if nothing is left end your turn; a message releases each one · open = go on with the recommendation · parked = go on with the recommendation, do not ask again now · user tasks = user tasks not yet on your list · fork = the fork the user decided · outbox = still in the outbox, on its way to you · confirm = a confirmation you asked for, not given yet · extra = more from compass for this session · none = the fields that are empty now.
 Compass reads your side from the session itself: your requests, tool calls, TodoWrite list and words. To give compass facts that only this session's workflow needs (a target, a constraint, an external id), pass them as notes (key → short text) to ${GRILL_TOOL}; questions may be left out.`
 
 const mapPrompt = (
@@ -1080,18 +1113,18 @@ async function compassBrief($: EngineInterface): Promise<CompassBrief> {
   return next
 }
 
-/** What the session gets of the brief at a handoff: all of it while it changed, else one line. */
+/** What the session gets of the brief at a handoff: all of it while it changed, else nothing ('') — the last one holds. */
 async function briefFor($: EngineInterface): Promise<string> {
   const b = await compassBrief($)
-  if (b.rev <= (await read($, briefSentA))) return `🧭 [compass brief · rev ${b.rev}] unchanged.`
+  if (b.rev <= (await read($, briefSentA))) return ''
   await update($, briefSentA, () => b.rev)
   return briefText(b)
 }
 
-/** The brief, only when it moved since the session last got it; '' otherwise. */
-async function briefIfChanged($: EngineInterface): Promise<string> {
-  const b = await compassBrief($)
-  return b.rev > (await read($, briefSentA)) ? briefFor($) : ''
+/** A compass text with the brief after it, when there is one. */
+const withBriefText = async ($: EngineInterface, text: string) => {
+  const brief = await briefFor($)
+  return brief ? `${text}\n\n${brief}` : text
 }
 
 /** A map from an older compass build counts as no map. */
@@ -1569,7 +1602,7 @@ const patched = (id: string, patch: Partial<CompassAction>) => (list: CompassAct
 /** Writes into the running turn now; the model reads it at its next step. */
 async function appendNow($: EngineInterface, a: CompassAction) {
   try {
-    const r = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: `${a.text}\n\n${await briefFor($)}` }] } })
+    const r = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: await withBriefText($, a.text) }] } })
     if ('deny' in r && r.deny) throw new Error(r.deny)
     const sentNow: Partial<CompassAction> = { status: 'sent', route: 'running turn', at: Date.now() }
     await update($, actionsA, patched(a.id, sentNow))
@@ -1617,7 +1650,7 @@ async function forceAction($: EngineInterface, id: string) {
   try {
     const sentTurn: Partial<CompassAction> = { status: 'sent', route: 'new turn', at: Date.now() }
     await update($, actionsA, patched(a.id, sentTurn))
-    await $.prompt.submit({ text: `${a.text}\n\n${await briefFor($)}` })
+    await $.prompt.submit({ text: await withBriefText($, a.text) })
     $.ui.toast(`↗ sent now as a new turn · ${clip(a.label, 44)}`)
   } catch (err) {
     await reject($, a, err)
@@ -1757,7 +1790,7 @@ async function flushOutbox($: EngineInterface) {
   await update($, actionsA, list => list.map((a): CompassAction => (ids.has(a.id) ? { ...a, status: 'sent', route: 'new turn', at: Date.now() } : a)))
   try {
     // compass's own turn skips its own prompt.submit hook: the brief rides in the text
-    await $.prompt.submit({ text: `${due.map(a => a.text).join('\n\n')}\n\n${await briefFor($)}` })
+    await $.prompt.submit({ text: await withBriefText($, due.map(a => a.text).join('\n\n')) })
   } catch (err) {
     for (const a of due) await reject($, a, err)
   }
@@ -1948,7 +1981,7 @@ async function sendRound($: EngineInterface) {
  */
 async function grillNotice($: EngineInterface, q: CompassGrillQ, text: string, release: boolean) {
   if (!q.blocking) return queueNote($, text)
-  const tail = release ? ' · RELEASED: this was blocking; continue the work that waited on it.' : ' · BLOCKING again: stop the work that depends on it until its answer comes.'
+  const tail = release ? RELEASE_TAIL : HOLD_TAIL
   await enqueue($, 'steer', `${clip(text, 60)}${release ? ' · released' : ' · holds'}`, `🧭 [compass grill — from the user] ${text}${tail}`)
 }
 
@@ -2165,9 +2198,11 @@ export const register: Register = on => {
       await update($, selectedA, s => (s?.startsWith('g:') ? s : `g:${ask[0]!.id}`))
       $.ui.toast(`? ${ask.length} question${ask.length > 1 ? 's' : ''} in the grill tab`)
     }
-    // a plugin tool's result is a string (or blocks): the model reads it as the tool's answer
-    const text = `Posted to the user's compass grill tab: ${ask.length} on the frontier, ${waiting.length} waiting on prerequisites${input.askConfirm === true ? ', plus a confirmation request' : ''}. Do not wait: for blocking ones, continue only with work that does not depend on them; for the others, go on with your recommendation. The user answers when they choose, in any order, and may park or dismiss; answers arrive as a new user turn; parks and dismissals of non-blocking ones as notes.${holds.length ? `\nACK BLOCKING: ${holds.map(q => `Q${q.n} (${q.id})`).join(', ')}. Stop all work that depends on ${holds.length > 1 ? 'them' : 'it'} now. Compass releases each one with its answer, a park or a dismissal, sent to you at once (into this turn if you still work, else as a new turn); continue that work only after the release.` : ''}\n\n${await briefFor($)}`
-    return { result: text as never, text }
+    // a plugin tool's result is a string (or blocks): the model reads it as the tool's answer. The
+    // transcript shows it, so it stays short; the brief rides as context, which the user never sees.
+    const text = `Posted to the compass grill tab: ${ask.length} on the frontier, ${waiting.length} waiting${input.askConfirm === true ? ', plus a confirmation request' : ''}. Do not wait; go on as the grilling guide says.${holds.length ? `\nACK BLOCKING: ${holds.map(q => `Q${q.n} (${q.id})`).join(', ')}. Stop all work that depends on ${holds.length > 1 ? 'them' : 'it'} now; continue it only after compass releases ${holds.length > 1 ? 'each' : 'it'} (RELEASED).` : ''}`
+    const brief = await briefFor($)
+    return { result: text as never, text, ...(brief ? { context: [brief] } : {}) }
   })
 
   on('command.run', { command: 'compass' }, async ($, e) => {
@@ -2310,7 +2345,8 @@ export const register: Register = on => {
       : []
     // the brief, built after the notes went out, so its outbox no longer lists them; a turn that
     // already carries one (compass's own) gets no second copy
-    const withBrief = e.text.includes('[compass brief · rev') ? [] : [await briefFor($)]
+    const brief = e.text.includes('[compass brief · rev') ? '' : await briefFor($)
+    const withBrief = brief ? [brief] : []
     return next({ ...e, context: [...(e.context ?? []), ...note, ...withBrief] })
   })
 
@@ -2402,7 +2438,7 @@ export const register: Register = on => {
     await sessionReport($, 'tool.done')
     // a brief that moved while Claude works rides the main loop's next tool result, so it never goes stale
     if (!e.agentId && typeof ran.deny !== 'string') {
-      const fresh = await briefIfChanged($)
+      const fresh = await briefFor($)
       if (fresh) return { ...ran, context: [...(ran.context ?? []), fresh] }
     }
     return ran
@@ -2500,6 +2536,15 @@ export const register: Register = on => {
         const settled = task.status === 'killed' ? 'stopped' : isOk ? 'bgdone' : 'bgfail'
         $.clock.after(0, () => update($, liveA, all => all.map(p => (p.id === hit.id ? { ...p, status: settled, end: at } : p))))
       }
+    }
+    // compass's own turns draw without the brief and the model-only instructions; ctrl+o shows all
+    const origin = e.props.origin
+    // the user's own words (typed, from the phone, the SDK) are never cut, whatever they start with
+    const isTyped = origin.kind === 'composer' || origin.kind === 'bridge' || origin.kind === 'sdk'
+    const isOwn = (origin.kind === 'plugin' && origin.name === 'compass') || (!isTyped && e.props.text.trimStart().startsWith('🧭 [compass'))
+    if (isOwn && !e.props.isExpanded) {
+      const text = compactRow(e.props.text)
+      if (text && text !== e.props.text) return next({ ...e, props: { ...e.props, text } })
     }
     return next(e)
   })
