@@ -108,7 +108,8 @@ export type CompassAction = {
 /** A session or agent ListAgents reports, this one excluded. */
 export type CompassPeer = { name: string; id: string; group: string; kind: string; status: string; since: string }
 
-export type CompassChatMsg = { peer: string; dir: 'in' | 'out'; text: string; at: number; status: 'sent' | 'rejected' | 'received'; addr?: string }
+/** `gist`: a long inbound message's one-line summary, written by haiku after it lands */
+export type CompassChatMsg = { peer: string; dir: 'in' | 'out'; text: string; at: number; status: 'sent' | 'rejected' | 'received'; addr?: string; gist?: string }
 
 export type CompassSteer = { text: string; at: number }
 

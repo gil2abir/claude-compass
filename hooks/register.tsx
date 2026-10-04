@@ -228,6 +228,8 @@ const SEND_GRACE_MS = 8000
 let splashAt = 0
 /** The docked pane's width, as its last render saw it: the row under the prompt spans it too. */
 let paneCols = 0
+/** The agent row whose ✉ opened the thread: several sessions may share its name. */
+let threadAt: string | null = null
 /** The user's latest request, whole: the first chart is drawn from it before the turn ends. */
 let lastRequest = ''
 
@@ -378,6 +380,7 @@ const clipLeft = (text: string, n: number) => {
 /** Model text made safe for one terminal row: no emoji, controls, zero-width or replacement chars. */
 export const plain = (text: string) =>
   text
+    .replace(/\s+/g, ' ')
     .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufe00-\ufe0f\ufffd]/g, '')
     .replace(/\p{Extended_Pictographic}/gu, '')
     .replace(/\s+/g, ' ')
@@ -1619,7 +1622,9 @@ export const parsePeers = (text: string) => {
     }
     const row = /^\s+(.+?) \[([0-9a-z_-]+)\]\s+·\s+(.*)$/i.exec(line)
     if (!row) continue
-    const parts = row[3]!.split('·').map(x => x.trim())
+    // a renamed session adds "says it was <old name> until <when>" before its kind
+    const parts = row[3]!.split('·').map(x => x.trim()).filter(x => !/^says it was /i.test(x))
+    if (peers.some(p => p.id === row[2])) continue
     peers.push({ name: row[1]!.trim(), id: row[2]!, group, kind: parts[0] ?? '', status: parts[1] ?? '', since: parts.slice(2).join(' · ') })
   }
   const isRemote = /remote control/i.test(text) && !/remote control is (not|off|disconnected)/i.test(text)
@@ -1662,8 +1667,12 @@ async function chatSend($: EngineInterface, peer: string, text: string) {
   const t = text.trim()
   if (!t) return
   const at = Date.now()
+  const to = peer
+  const chat = await read($, chatA)
+  // "Name [id]" picks one of several sessions that share a name; the thread is the name's
+  peer = peerKey(to, chat)
   try {
-    const addr = (await read($, chatA)).findLast(m => m.peer === peer && m.addr)?.addr
+    const addr = to.trim() !== peer ? to : chat.findLast(m => m.peer === peer && m.addr)?.addr
     const r = await $.session.send({ to: addr ?? peer, text: t })
     const isOk = r.isDelivered === true
     await update($, chatA, list => [...list, { peer, dir: 'out' as const, text: t, at, status: isOk ? ('sent' as const) : ('rejected' as const) }].slice(-200))
@@ -1681,6 +1690,30 @@ async function queueMessage($: EngineInterface, peer: string, text: string) {
   const a: CompassAction = { id: `a${Date.now()}${Math.floor(Math.random() * 1e4)}`, kind: 'message', label: clip(`✉ ${peer}: ${t}`, 80), text: t, status: 'queued', route: 'agent', reason: '', at: await $.clock.now(), ref: '', prev: '', to: peer }
   await update($, actionsA, list => [...list, a].slice(-40))
   $.ui.toast(`⋯ to ${clip(peer, 24)} in ${SEND_GRACE_MS / 1000}s · ✕ in the pane cancels`)
+}
+
+/** A message too long to read at a glance: more than 160 characters or more than two sentences. */
+export const needsGist = (text: string) => {
+  const flat = plain(text)
+  return graphemes(flat).length > 160 || (flat.match(/[.!?](\s|$)/g)?.length ?? 0) > 2
+}
+
+/** One summary line for a long inbound message (haiku, compact STE); the thread shows it until opened. */
+async function gistOf($: EngineInterface, peer: string, at: number, text: string) {
+  try {
+    const reply = await $.model.complete({
+      model: 'haiku',
+      system: 'You are COMPASS. Reply with ONLY the summary line: no quotes, no preface.',
+      prompt: `Another Claude session sent the user this message. Write one line of at most 20 words: what it reports, and what it asks the user to decide or do, if anything.\n${STE}\nThe message:\n${text}`,
+      maxTokens: 120,
+      effort: 'low',
+    })
+    await countOwn($, reply)
+    const gist = reply.isAnswered ? clip(plain(reply.text).replace(/^["'“]+|["'”]+$/g, ''), 160) : ''
+    if (gist) await update($, chatA, list => list.map(m => (m.peer === peer && m.at === at && m.dir === 'in' ? { ...m, gist } : m)))
+  } catch {
+    // no summary: the thread shows the message's first sentence
+  }
 }
 
 /** Sends a queued message now; the thread records it either way. */
@@ -1976,7 +2009,10 @@ export const register: Register = on => {
       const from = senderOf(e.text)
       const peer = ('teammate' in e.origin ? e.origin.teammate : '') || from.name || (kind === 'bridge' ? 'remote control' : 'peer')
       const addr = from.addr && from.addr !== peer ? from.addr : undefined
-      await update($, chatA, list => [...list, { peer, dir: 'in' as const, text: clip(bodyOf(e.text), 600), at: Date.now(), status: 'received' as const, addr }].slice(-200))
+      const text = clip(bodyOf(e.text), 4000)
+      const at = Date.now()
+      await update($, chatA, list => [...list, { peer, dir: 'in' as const, text, at, status: 'received' as const, addr }].slice(-200))
+      if (kind !== 'bridge' && needsGist(text)) void gistOf($, peer, at, text)
       if (kind !== 'bridge' || from.name) $.ui.toast(`◂ inbound from ${peer}`)
     }
     return next(e)
@@ -3009,64 +3045,39 @@ export const register: Register = on => {
           </Box>
         )
       }
-      const openThread = (name: string) => async () => {
+      const openThread = (name: string, id: string | null = null) => async () => {
         const latest = (await read($, chatA)).reduce((t, m) => (m.peer === name ? Math.max(t, m.at) : t), 0)
         await update($, chatSeenA, seen => ({ ...seen, [name]: Math.max(seen[name] ?? 0, latest) }))
-        await update($, selectedA, s => (s === `p:${name}` ? null : `p:${name}`))
+        // another row of the same name moves the open thread there; the same row closes it
+        const isMove = selected === `p:${name}` && id !== threadAt
+        threadAt = id
+        await update($, selectedA, s => (s === `p:${name}` && !isMove ? null : `p:${name}`))
       }
-      const lastLine = (name: string) => {
+      const lastLine = (name: string, id: string | null = null) => {
         const m = tally(name).last
-        return m ? (
-          <Text dimColor wrap="wrap">
-            {'  '}
-            {m.dir === 'in' ? '◂ ' : '▸ '}
-            {leadOf(m.text, 80).lead}
-          </Text>
-        ) : null
+        if (!m) return null
+        const open = async () => {
+          const k = `m:${name}:${m.at}:${m.dir}`
+          await update($, unfoldedA, l => (l.includes(k) ? l : [...l, k]))
+          if (selected !== `p:${name}` || id !== threadAt) await openThread(name, id)()
+        }
+        const say = m.gist ? `≈ ${m.gist}` : leadOf(m.text, 80).lead
+        return (
+          <Box paddingLeft={2}>
+            <Button key={`last:${id ?? `x:${name}`}`} plain dimColor label={clip(`${m.dir === 'in' ? '◂ ' : '▸ '}${say}`, width - 3)} onPress={() => void open()} />
+          </Box>
+        )
       }
       const others = [...new Set(chat.map(m => m.peer))].filter(n => !peers.some(p => p.name === n))
       const dot = (status: string) => (/busy|running|working/i.test(status) ? 'green' : /idle/i.test(status) ? 'yellow' : 'red')
       const thread = sel ? chat.filter(m => m.peer === sel).slice(-30) : []
-      body = (
-        <Box flexDirection="column" key="chat">
-          <Box justifyContent="space-between">
-            {pill('rc', `● remote control ${isRemote ? 'online' : 'offline'}`, isRemote ? 'green' : 'red', true)}
-            <Box columnGap={1}>
-              <Text dimColor>{peersAt ? `◷ ${span(now - peersAt)}` : ''}</Text>
-              {pillBtn('peers-refresh', '↻', 'dim', () => refreshPeers($))}
-            </Box>
-          </Box>
-          {selfName ? <Text dimColor wrap="wrap">this session: {selfName}</Text> : null}
-          {!isRemote && <Text dimColor>local sessions only · run /remote-control to reach your other machines</Text>}
-          {rule}
-          {peers.length === 0 && others.length === 0 && art('chat', 'no other agents or sessions right now')}
-          {peers.map(p => (
-            <Box flexDirection="column" key={`peer:${p.id}`}>
-              <Box>
-                <Text color={dot(p.status) === 'green' ? TONE.green.fg : dot(p.status) === 'yellow' ? TONE.yellow.fg : TONE.red.fg}>● </Text>
-                <Box flexShrink={1}>
-                  <Button key={`peer:${p.name}`} plain label={p.name} onPress={openThread(p.name)} />
-                </Box>
-                <Box flexGrow={1} />
-                {pill(`pk:${p.id}`, `${p.kind}${p.status ? ` · ${p.status}` : ''}`, 'dim')}
-                {counts(p.name)}
-                <Box marginLeft={1} flexShrink={0}>{pillBtn(`msg:${p.name}`, '✉ message', sel === p.name ? 'cyan' : 'blue', openThread(p.name), sel === p.name)}</Box>
-              </Box>
-              {p.group && /remote/i.test(p.group) ? <Text dimColor>{'  '}{p.group}</Text> : null}
-              {lastLine(p.name)}
-            </Box>
-          ))}
-          {others.map(n => (
-            <Box flexDirection="column" key={`peerx:${n}`}>
-              <Box>
-                <Text dimColor>○ </Text>
-                <Button key={`peer:${n}`} plain dimColor label={n} onPress={openThread(n)} />
-                {counts(n)}
-              </Box>
-              {lastLine(n)}
-            </Box>
-          ))}
-          {sel && (
+      // the open thread draws under its agent's row (the first with that name), so it shows where the click was
+      const namesakes = sel ? peers.filter(p => p.name === sel) : []
+      const threadRow = sel ? (namesakes.find(p => p.id === threadAt) ?? namesakes[0])?.id ?? (others.includes(sel) ? `x:${sel}` : null) : null
+      // several sessions share the name: the message goes to the one whose row is open
+      const sendTo = sel && namesakes.length > 1 && threadRow ? `${sel} [${threadRow}]` : sel
+      const hasRow = threadRow !== null
+      const threadBox = sel ? (
             <Box flexDirection="column" key="thread" borderStyle="round" borderColor="cyan" paddingX={1} marginTop={1}>
               <Text color="cyan" bold wrap="wrap">
                 ⇄ {selfName ? `${selfName} ⇄ ` : ''}
@@ -3091,11 +3102,14 @@ export const register: Register = on => {
                 const isNew = m.dir === 'in' && m.at > (chatSeen[sel] ?? 0)
                 const arrow = m.dir === 'in' ? '◂ in ' : m.status === 'rejected' ? '✗ out' : '▸ out'
                 const { lead, hasMore } = leadOf(m.text)
+                const canOpen = hasMore || !!m.gist
                 const stamp = `${isNew ? '●' : ' '}${arrow} ${ago(now - m.at).padStart(4)} `
-                const w = wrapped(`b:${key}`, `${isFull ? plain(m.text) : lead}${hasMore ? (isFull ? ' ▾' : ' ▸') : ''}`, width - glen(stamp) - 2, () => (hasMore ? toggleIn($, key) : undefined), {
-                  dim: m.dir === 'out',
-                  indent: glen(stamp),
-                })
+                // the thread box takes 4 columns: its border and padding
+                const room = Math.max(12, width - glen(stamp) - 4)
+                const lines = isFull ? m.text.split('\n').map(plain).filter(Boolean) : [m.gist ? `≈ ${m.gist}` : lead]
+                const rows = lines.flatMap(l => wordWrap(l, room))
+                if (canOpen) rows[rows.length - 1] += isFull ? ' ▾' : ' ▸'
+                const press = () => (canOpen ? void toggleIn($, key) : undefined)
                 return (
                   <Box key={key} flexDirection="column">
                     <Box>
@@ -3103,15 +3117,61 @@ export const register: Register = on => {
                         {stamp.slice(0, -6)}
                       </Text>
                       <Text dimColor>{stamp.slice(-6)}</Text>
-                      {w.head}
+                      <Button key={`b:${key}`} plain dimColor={m.dir === 'out'} label={rows[0] ?? ''} onPress={press} />
                     </Box>
-                    {w.tail}
+                    {rows.slice(1).map((r, i) => (
+                      <Box key={`b:${key}:r${i}`} paddingLeft={glen(stamp)}>
+                        <Button key={`b:${key}:r${i}:b`} plain dimColor={m.dir === 'out'} label={r} onPress={press} />
+                      </Box>
+                    ))}
                   </Box>
                 )
               })}
-              {input(`chat:${sel}`, `message ${clip(sel, 20)}… · waits 8 s in the outbox`, 'queue', v => void queueMessage($, sel, v))}
+              {input(`chat:${sel}`, `message ${clip(sel, 20)}… · waits 8 s in the outbox`, 'queue', v => void queueMessage($, sendTo ?? sel, v))}
             </Box>
-          )}
+      ) : null
+      body = (
+        <Box flexDirection="column" key="chat">
+          <Box justifyContent="space-between">
+            {pill('rc', `● remote control ${isRemote ? 'online' : 'offline'}`, isRemote ? 'green' : 'red', true)}
+            <Box columnGap={1}>
+              <Text dimColor>{peersAt ? `◷ ${span(now - peersAt)}` : ''}</Text>
+              {pillBtn('peers-refresh', '↻', 'dim', () => refreshPeers($))}
+            </Box>
+          </Box>
+          {selfName ? <Text dimColor wrap="wrap">this session: {selfName}</Text> : null}
+          {!isRemote && <Text dimColor>local sessions only · run /remote-control to reach your other machines</Text>}
+          {rule}
+          {peers.length === 0 && others.length === 0 && art('chat', 'no other agents or sessions right now')}
+          {peers.map(p => (
+            <Box flexDirection="column" key={`peer:${p.id}`}>
+              <Box>
+                <Text color={dot(p.status) === 'green' ? TONE.green.fg : dot(p.status) === 'yellow' ? TONE.yellow.fg : TONE.red.fg}>● </Text>
+                <Box flexShrink={1}>
+                  <Button key={`peer:${p.id}:name`} plain label={p.name} onPress={openThread(p.name, p.id)} />
+                </Box>
+                <Box flexGrow={1} />
+                {pill(`pk:${p.id}`, `${p.kind}${p.status ? ` · ${p.status}` : ''}`, 'dim')}
+                {counts(p.name)}
+                <Box marginLeft={1} flexShrink={0}>{pillBtn(`msg:${p.id}`, '✉ message', threadRow === p.id ? 'cyan' : 'blue', openThread(p.name, p.id), threadRow === p.id)}</Box>
+              </Box>
+              {p.group && /remote/i.test(p.group) ? <Text dimColor>{'  '}{p.group}</Text> : null}
+              {lastLine(p.name, p.id)}
+              {threadRow === p.id && threadBox}
+            </Box>
+          ))}
+          {others.map(n => (
+            <Box flexDirection="column" key={`peerx:${n}`}>
+              <Box>
+                <Text dimColor>○ </Text>
+                <Button key={`peer:${n}`} plain dimColor label={n} onPress={openThread(n)} />
+                {counts(n)}
+              </Box>
+              {lastLine(n)}
+              {threadRow === `x:${n}` && threadBox}
+            </Box>
+          ))}
+          {sel && !hasRow && threadBox}
         </Box>
       )
     } else if (tab === 'grill') {
