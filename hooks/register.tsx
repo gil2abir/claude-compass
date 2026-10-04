@@ -58,8 +58,10 @@ const SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 /** A level as a smooth bar `cells` wide: whole blocks, then an eighth-block edge. */
 export const barText = (frac: number, cells: number) => {
   const f = Math.max(0, Math.min(1, Number.isFinite(frac) ? frac : 0)) * cells
-  const full = Math.floor(f)
-  const part = Math.round((f - full) * 8)
+  // an edge that rounds up to a whole eighth is one more full block
+  const eighths = Math.round(f * 8)
+  const full = Math.floor(eighths / 8)
+  const part = eighths % 8
   const edge = full < cells ? (part ? ' ▏▎▍▌▋▊▉'[part]! : ' ') : ''
   return `${'█'.repeat(full)}${edge}${' '.repeat(Math.max(0, cells - full - 1))}`.slice(0, cells)
 }
@@ -497,6 +499,29 @@ const grillDrafts = (v: unknown, fallbackMode: 'plan' | 'work'): GrillDraft[] =>
     }))
 
 /** Coerces a fork reply into a CompassMap, plus any decisions it inferred for the grill. */
+/**
+ * Exactly one "now", whatever the model wrote: the first active milestone stays active and holds
+ * the one active step; any other milestone or step marked active waits as pending.
+ */
+export const oneNow = (milestones: CompassMilestone[]): CompassMilestone[] => {
+  // blocked steps (waiting on the user) may sit beside the active one; only "active" is limited
+  const live = (st: CompassState) => st === 'active'
+  const at = milestones.findIndex(m => live(m.state))
+  return milestones.map((m, i) => {
+    const isHere = i === at
+    let seen = false
+    const steps = m.steps.map((st): CompassStep => {
+      if (!live(st.state)) return st
+      if (isHere && !seen) {
+        seen = true
+        return st
+      }
+      return { ...st, state: 'pending' }
+    })
+    return { ...m, state: live(m.state) && !isHere ? 'pending' : m.state, steps }
+  })
+}
+
 export const parseMap = (text: string, at: number): (CompassMap & { grill: GrillDraft[]; moot: string[] }) | null => {
   const o = parseLoose(text)
   if (!o || !Array.isArray(o.milestones)) return null
@@ -529,7 +554,7 @@ export const parseMap = (text: string, at: number): (CompassMap & { grill: Grill
   const a = o.alt && typeof o.alt === 'object' ? (o.alt as Record<string, unknown>) : null
   const altSteps = a ? strs(a.steps, 4, 40) : []
   const alt: CompassAlt | null = a && str(a.label, 40) && altSteps.length ? { label: str(a.label, 40), why: str(a.why, 80), steps: altSteps } : null
-  return { goal: str(o.goal, 60), milestones, tasks, recap: strs(o.recap, 7, 140), at, alt, grill: grillDrafts(o.grill, 'work'), moot: strs(o.moot, 12, 32) }
+  return { goal: str(o.goal, 60), milestones: oneNow(milestones), tasks, recap: strs(o.recap, 7, 140), at, alt, grill: grillDrafts(o.grill, 'work'), moot: strs(o.moot, 12, 32) }
 }
 
 /** The active milestone and its active (or blocked) step: the "you are here". */
@@ -542,6 +567,40 @@ export const locate = (map: CompassMap | null) => {
   const nextStep = after.find(s => s.state === 'pending' && s.kind !== 'aside')
   const nextMilestone = milestone ? ms.slice(ms.indexOf(milestone) + 1).find(m => m.state === 'pending') : undefined
   return { milestone, step, upcoming: nextStep?.label ?? nextMilestone?.label }
+}
+
+/**
+ * What lies ahead on the planned course, as the fork's left card shows it: the active milestone's
+ * pending steps, then the milestones after it (so the card is never empty when the active milestone
+ * has no steps left).
+ */
+export const plannedAhead = (map: CompassMap, n = 4): string[] => {
+  const { milestone } = locate(map)
+  const steps = (milestone?.steps ?? []).filter(st => st.state === 'pending' && st.kind !== 'aside').map(st => `○ ${st.label}`)
+  const ms = map.milestones
+  const later = milestone ? ms.slice(ms.indexOf(milestone) + 1).filter(m => m.state === 'pending').map(m => `⚑ M${ms.indexOf(m) + 1} ${m.label}`) : []
+  return [...steps, ...later].slice(0, n)
+}
+
+/**
+ * Which option the recommendation names: the one whose text it starts with, the longest match
+ * winning ("GitHub rules + HTML ids" over "GitHub rules only"); -1 when it names none.
+ */
+export const recIndex = (rec: string, options: string[]): number => {
+  const r = rec.toLowerCase()
+  let best = -1
+  let bestLen = 0
+  options.forEach((o, i) => {
+    const t = o.toLowerCase()
+    let n = 0
+    while (n < t.length && n < r.length && t[n] === r[n]) n += 1
+    // the whole option, or at least its first 12 letters, opens the recommendation
+    if ((n === t.length || n >= 12) && n > bestLen) {
+      best = i
+      bestLen = n
+    }
+  })
+  return best
 }
 
 /** `goal › milestone › [step] → next`, clipped from the left so "now" survives. */
@@ -1276,7 +1335,10 @@ async function refresh($: EngineInterface) {
     const latest = await read($, mapA)
     const declined = (isCurrent(latest) ? latest.declined : null) ?? prevMap?.declined ?? []
     const sameMilestone = prevMap && locate(prevMap).milestone?.id === locate(charted).milestone?.id
-    const kept = !charted.alt && sameMilestone && prevMap.alt && !prevMap.altPick ? prevMap.alt : null
+    // the fork on screen stays while the new chart offers none, unless the user decided it meanwhile
+    // (this chart may have started before the pick: its own copy of the map still shows the fork open)
+    const picked = isCurrent(latest) && latest.altPick
+    const kept = !charted.alt && sameMilestone && prevMap.alt && !prevMap.altPick && !picked && !isDecided(prevMap.alt, declined) ? prevMap.alt : null
     const alt = (charted.alt && !isDecided(charted.alt, declined) ? charted.alt : null) ?? kept
     await update($, mapA, () => ({ ...charted, alt, declined, turns: turnsAt }))
     // the chart now includes the request the turn started on
@@ -1414,8 +1476,8 @@ async function pickTrajectory($: EngineInterface, way: 'main' | 'branch') {
   if (way === 'main') {
     const planned = milestone?.steps.filter(s => s.state === 'pending').map(s => s.label).join(' ') ?? ''
     await editMap($, mp => ({ ...mp, altPick: 'main', declined: [...(mp.declined ?? []), alt.label, alt.steps.join(' '), ...(planned ? [planned] : [])].slice(-16) }))
-    const pending = milestone?.steps.filter(s => s.state === 'pending').map(s => s.label) ?? []
-    await queueNote($, `Stay on the planned course${pending.length ? `: ${pending.join(' → ')}` : ''}; not "${alt.label}"`)
+    const ahead = plannedAhead(map).map(x => x.replace(/^[○⚑]\s*/u, ''))
+    await queueNote($, `Stay on the planned course${ahead.length ? `: ${ahead.join(' → ')}` : ''}; not "${alt.label}"`)
     return
   }
   const before = JSON.stringify({ id: milestone?.id ?? '', steps: milestone?.steps ?? [], declined: map.declined ?? [] })
@@ -2151,8 +2213,9 @@ export const register: Register = on => {
   // a background task's notification row settles its call in the live tab
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
     const task = e.props.task
-    if (task && (task.id || task.toolUseId)) {
-      const isOk = !task.status || task.status === 'completed'
+    // a notification that says how the task ended closes its row; a monitor's event (no status) does not
+    if (task && (task.id || task.toolUseId) && task.status) {
+      const isOk = task.status === 'completed'
       const list = await read($, liveA)
       const hit = list.find(p => (p.status === 'bg' || p.status === 'running') && ((task.toolUseId && p.id === task.toolUseId) || (task.id && p.bgId === task.id)))
       if (hit) {
@@ -2557,7 +2620,7 @@ export const register: Register = on => {
                   ))
                 : null}
               {items.flatMap((it, i) =>
-                wordWrap(`${mark} ${it}`, colW - 4).map((l, j) => (
+                wordWrap(mark ? `${mark} ${it}` : it, colW - 4).map((l, j) => (
                   <Text key={`${key}:s${i}:${j}`}>{j ? `  ${l}` : l}</Text>
                 )),
               )}
@@ -2571,7 +2634,7 @@ export const register: Register = on => {
                 {pill(`forkp:${m.id}`, '⑂ two ways on', 'purple', true)}
               </Box>
               <Box columnGap={1}>
-                {card('main', 'as planned', 'dim', '', future.slice(0, FUTURE_KEEP + 1).map(s => s.label), '○', () => pickTrajectory($, 'main'), '▶ keep')}
+                {card('main', 'as planned', 'dim', '', map ? plannedAhead(map, FUTURE_KEEP + 1) : [], '', () => pickTrajectory($, 'main'), '▶ keep')}
                 {card('branch', alt.label, 'cyan', alt.why, alt.steps, '◇', () => pickTrajectory($, 'branch'), '⤴ take')}
               </Box>
             </Box>,
@@ -3088,7 +3151,7 @@ export const register: Register = on => {
           ))}
           <Box flexDirection="column" marginTop={1}>
             {q.options.map((o, i) => {
-              const isRec = q.rec !== '' && q.rec.toLowerCase().startsWith(o.toLowerCase().slice(0, 12))
+              const isRec = i === recIndex(q.rec, q.options)
               return (
                 <Box key={`opt:${q.id}:${i}`}>
                   <Button key={`gopt:${q.id}:${i}`} plain hotkey={`${i + 1}`} label={o} onPress={() => void answerGrill($, q.id, o)} />

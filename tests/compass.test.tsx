@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { barText, bgIdOf, pulseWhat, bodyOf, dotsText, hintChips, isDecided, span, transcriptDigest, leadOf, moveIn, wordWrap, boardOf, crumb, gist, peerKey, plain, frontierOf, mergeGrill, parseLoose, parseMap, senderOf } from '../hooks/register'
+import { barText, bgIdOf, oneNow, plannedAhead, recIndex, pulseWhat, bodyOf, dotsText, hintChips, isDecided, span, transcriptDigest, leadOf, moveIn, wordWrap, boardOf, crumb, gist, peerKey, plain, frontierOf, mergeGrill, parseLoose, parseMap, senderOf } from '../hooks/register'
 
 /** Clicks a control by key: a Button is pressed, a pill (a Client region) gets a pointer click. */
 const tap = async (mounted: unknown, key: string) => {
@@ -1101,6 +1101,10 @@ test('the live tab shows a call running the moment it starts, settles it, and fo
   // a monitor Claude stops with TaskStop leaves the running strip
   await $.tool.call({ tool: 'Monitor', tool_use_id: 'm1', command: 'tail -f log', description: 'watch the log' } as never)
   expect(await ui.find({ key: 'strip:m1' })).toBeDefined()
+  // a monitor's event notification (no status) leaves it running
+  await $.ui.mount({ plugin: 'compass', surface: 'terminal', component: 'UserMessage', props: { task: { id: 'mon_9x' } } } as never)
+  await clock.advance(10)
+  expect(await ui.find({ key: 'strip:m1' })).toBeDefined()
   await $.tool.call({ tool: 'TaskStop', tool_use_id: 'k1', task_id: 'mon_9x' } as never)
   expect(await ui.find({ key: 'strip:m1' })).toBeUndefined()
   expect(await ui.find({ key: 'pulse:m1' })).toBeDefined()
@@ -1289,4 +1293,84 @@ test('every prompt compass sends a model carries the compact ASD-STE100 rules', 
   await clock.advance(3000)
   expect(prompts.length).toBeGreaterThan(2)
   for (const p of prompts) expect(p).toMatch(/ASD-STE100 Simplified Technical English/)
+})
+
+test('the fork\'s planned card lists the next steps, then the milestones after, so it is never empty', async () => {
+  const map = parseMap(JSON.stringify(MAP), 1)!
+  expect(plannedAhead(map)).toEqual(['○ run tests', '⚑ M3 Ship'])
+  const noSteps = { ...map, milestones: map.milestones.map(m => (m.id === 'm2' ? { ...m, steps: m.steps.filter(st => st.state !== 'pending') } : m)) }
+  expect(plannedAhead(noSteps)).toEqual(['⚑ M3 Ship'])
+})
+
+test('the recommendation marks one option: the longest that opens it', async () => {
+  const opts = ['GitHub rules + HTML ids', 'GitHub rules only', 'simple rule']
+  expect(recIndex('GitHub rules + HTML ids. This matches what readers see on GitHub.', opts)).toBe(0)
+  expect(recIndex('GitHub rules only, ids are rare', opts)).toBe(1)
+  expect(recIndex('httpx async. Tests need no network', ['httpx async', 'aiohttp'])).toBe(0)
+  expect(recIndex('something else', opts)).toBe(-1)
+})
+
+test('taking a branch while a full chart is in flight: the chart that lands after does not bring the decided fork back', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+  const ALT = { ...MAP, alt: { label: 'ship as a skill', why: 'simpler install', steps: ['write SKILL md', 'drop the plugin'] } }
+  let forks = 0
+  let release: () => void = () => {}
+  on('model.fork', async () => {
+    forks += 1
+    // the second chart is slow and offers no branch: it started before the pick and lands after it
+    if (forks === 2) {
+      await new Promise<void>(r => (release = r))
+      return { value: { isAnswered: true, text: JSON.stringify(MAP), usage } } as never
+    }
+    return { value: { isAnswered: true, text: JSON.stringify(ALT), usage } } as never
+  })
+  on('model.complete', () => ({ value: { isAnswered: true, text: '{"same":true}', usage } }) as never)
+  on('session.id', () => ({ value: 'sess' }))
+  on('session.messages', () => ({ value: [] }) as never)
+  on('session.usage', () => ({ value: { startedAt: 1_000_000, context: { window: 1000, percent: 1 }, rateLimits: [], cost: { usd: 0 } } }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }) as never)
+  on('turn.complete', (_$, e) => ({ text: e.answer }) as never)
+  on('prompt.submit', (_$, e) => ({ text: e.text }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('ui.toast', () => ({ value: undefined }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', () => ({ value: { tool: 'mcp__compass__grill' } }) as never)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  await $.turn.start({ text: 'turn 1', turnId: 't1' } as never)
+  await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+  await clock.advance(1500)
+  const ui = await $.ui.mount({ plugin: 'compass', surface: 'terminal', ...PANE })
+  expect(await ui.find({ text: /two ways on/ })).toBeDefined()
+  // the next turn ends: its (slow) chart starts, then the user takes the branch
+  await $.turn.start({ text: 'turn 2', turnId: 't2' } as never)
+  await $.turn.complete({ answer: 'ok', durationMs: 10, isAborted: false, turnId: 't2', reason: 'answer' } as never)
+  await clock.advance(1500)
+  expect(forks).toBe(2)
+  await tap(ui, 'pick:branch')
+  expect(await ui.find({ text: /two ways on/ })).toBeUndefined()
+  expect(await ui.find({ text: /write SKILL md/ })).toBeDefined()
+  release()
+  await clock.advance(1000)
+  expect(await ui.find({ text: /two ways on/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a level bar never draws past its eighth-blocks: an edge that rounds up becomes a full block', async () => {
+  for (let i = 0; i <= 200; i++) {
+    const bar = barText(i / 200, 63)
+    expect(bar).not.toMatch(/undefined/)
+    expect([...bar].length).toBe(63)
+  }
+  expect(barText(4 / 23, 63)).not.toMatch(/undefined/)
+})
+
+test('a chart always has one "now": extra active milestones and steps wait as pending', async () => {
+  const many = { ...MAP, milestones: MAP.milestones.map(m => (m.id === 'm2' ? { ...m, steps: m.steps.map(st => ({ ...st, state: st.state === 'pending' ? 'active' : st.state })) } : m.id === 'm3' ? { ...m, state: 'active' } : m)) }
+  const map = parseMap(JSON.stringify(many), 1)!
+  const active = map.milestones.flatMap(m => m.steps).filter(st => st.state === 'active')
+  expect(active.map(st => st.id)).toEqual(['s4'])
+  expect(map.milestones.filter(m => m.state === 'active').map(m => m.id)).toEqual(['m2'])
+  expect(oneNow(map.milestones)).toEqual(map.milestones)
 })
